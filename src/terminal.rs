@@ -29,45 +29,51 @@ impl Dimensions for Size {
 pub struct TerminalView {
     pub focus: FocusHandle,
     term: Arc<FairMutex<Term<Proxy>>>,
-    tx: EventLoopSender,
+    tx: Option<EventLoopSender>,
     cols: usize,
     lines: usize,
     cell_w: f32,
     cell_h: f32,
     pub exited: bool,
+    pub error: Option<String>,
 }
 
 impl TerminalView {
-    pub fn new(cwd: &str, cx: &mut Context<Self>) -> Result<Self, String> {
+    pub fn new(cwd: &str, cx: &mut Context<Self>) -> Self {
         let (ev_tx, ev_rx) = async_channel::unbounded();
         let proxy = Proxy(ev_tx);
         let (cols, lines) = (100usize, 14usize);
         let term = Arc::new(FairMutex::new(Term::new(Config::default(), &Size { cols, lines }, proxy.clone())));
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-        let mut env = std::collections::HashMap::new();
-        env.insert("TERM".to_string(), "xterm-256color".to_string());
-        env.insert("COLORTERM".to_string(), "truecolor".to_string());
-        let opts = PtyOptions { shell: Some(tty::Shell::new(shell, vec!["-l".into()])), working_directory: Some(cwd.into()), drain_on_exit: false, env };
-        let ws = WindowSize { num_lines: lines as u16, num_cols: cols as u16, cell_width: 8, cell_height: 16 };
-        let pty = tty::new(&opts, ws, 0).map_err(|e| e.to_string())?;
-        let ev_loop = EventLoop::new(term.clone(), proxy, pty, false, false).map_err(|e| e.to_string())?;
-        let tx = ev_loop.channel();
-        ev_loop.spawn();
-        let tx2 = tx.clone();
-        cx.spawn(async move |this, cx| {
-            while let Ok(ev) = ev_rx.recv().await {
-                match ev {
-                    TermEvent::PtyWrite(s) => { let _ = tx2.send(Msg::Input(s.into_bytes().into())); }
-                    TermEvent::Exit | TermEvent::ChildExit(_) => { let _ = this.update(cx, |t, cx| { t.exited = true; cx.notify(); }); }
-                    TermEvent::Wakeup => { if this.update(cx, |_, cx| cx.notify()).is_err() { break; } }
-                    _ => {}
+        let started: Result<EventLoopSender, String> = (|| {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+            let mut env = std::collections::HashMap::new();
+            env.insert("TERM".to_string(), "xterm-256color".to_string());
+            env.insert("COLORTERM".to_string(), "truecolor".to_string());
+            let opts = PtyOptions { shell: Some(tty::Shell::new(shell, vec!["-l".into()])), working_directory: Some(cwd.into()), drain_on_exit: false, env };
+            let ws = WindowSize { num_lines: lines as u16, num_cols: cols as u16, cell_width: 8, cell_height: 16 };
+            let pty = tty::new(&opts, ws, 0).map_err(|e| e.to_string())?;
+            let ev_loop = EventLoop::new(term.clone(), proxy, pty, false, false).map_err(|e| e.to_string())?;
+            let tx = ev_loop.channel();
+            ev_loop.spawn();
+            Ok(tx)
+        })();
+        let tx = started.as_ref().ok().cloned();
+        if let Some(tx2) = tx.clone() {
+            cx.spawn(async move |this, cx| {
+                while let Ok(ev) = ev_rx.recv().await {
+                    match ev {
+                        TermEvent::PtyWrite(s) => { let _ = tx2.send(Msg::Input(s.into_bytes().into())); }
+                        TermEvent::Exit | TermEvent::ChildExit(_) => { let _ = this.update(cx, |t, cx| { t.exited = true; cx.notify(); }); }
+                        TermEvent::Wakeup => { if this.update(cx, |_, cx| cx.notify()).is_err() { break; } }
+                        _ => {}
+                    }
                 }
-            }
-        }).detach();
-        Ok(Self { focus: cx.focus_handle(), term, tx, cols, lines, cell_w: 8.0, cell_h: 17.0, exited: false })
+            }).detach();
+        }
+        Self { focus: cx.focus_handle(), term, tx, cols, lines, cell_w: 8.0, cell_h: 17.0, exited: started.is_err(), error: started.err() }
     }
 
-    fn write(&self, bytes: Vec<u8>) { let _ = self.tx.send(Msg::Input(bytes.into())); }
+    fn write(&self, bytes: Vec<u8>) { if let Some(tx) = &self.tx { let _ = tx.send(Msg::Input(bytes.into())); } }
 
     fn resize_to(&mut self, w: f32, h: f32) {
         if self.cell_w < 1.0 || self.cell_h < 1.0 { return; }
@@ -77,7 +83,7 @@ impl TerminalView {
             self.cols = cols;
             self.lines = lines;
             self.term.lock().resize(Size { cols, lines });
-            let _ = self.tx.send(Msg::Resize(WindowSize { num_lines: lines as u16, num_cols: cols as u16, cell_width: self.cell_w as u16, cell_height: self.cell_h as u16 }));
+            if let Some(tx) = &self.tx { let _ = tx.send(Msg::Resize(WindowSize { num_lines: lines as u16, num_cols: cols as u16, cell_width: self.cell_w as u16, cell_height: self.cell_h as u16 })); }
         }
     }
 
@@ -183,7 +189,7 @@ impl Render for TerminalView {
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, _| window.focus(&this.focus)))
             .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _, cx| {
                 let d = ev.delta.pixel_delta(px(this.cell_h));
-                let lines = (d.y.0 / this.cell_h).round() as i32;
+                let lines = (f32::from(d.y) / this.cell_h).round() as i32;
                 if lines != 0 { this.term.lock().scroll_display(Scroll::Delta(lines)); cx.notify(); }
             }))
             .child(
@@ -193,8 +199,8 @@ impl Render for TerminalView {
                         let f = font(MONO_FONT);
                         let run = TextRun { len: 1, font: f, color: hsla(0., 0., 1., 1.), background_color: None, underline: None, strikethrough: None };
                         let sh = window.text_system().shape_line("M".into(), px(12.5), &[run], None);
-                        let (cw, ch) = (sh.width.0, 17.0);
-                        entity.update(cx, |t, _| { t.cell_w = cw; t.cell_h = ch; t.resize_to(bounds.size.width.0 - 14.0, bounds.size.height.0 - 2.0); });
+                        let (cw, ch) = (f32::from(sh.width), 17.0);
+                        entity.update(cx, |t, _| { t.cell_w = cw; t.cell_h = ch; t.resize_to(f32::from(bounds.size.width) - 14.0, f32::from(bounds.size.height) - 2.0); });
                         bounds
                     },
                     move |bounds, _, window, cx| {

@@ -8,6 +8,7 @@ use crate::palette::{CommandItem, Palette, PaletteEvent, PaletteMode};
 use crate::settings_view::{SettingsEvent, SettingsView};
 use crate::inline::{InlineAssist as InlineView, InlineEvent};
 use crate::syntax;
+use crate::terminal::TerminalView;
 use crate::theme::{ActiveTheme, MONO_FONT, Theme, UI_FONT};
 use crate::tree::{self, Hit, TreeRow};
 use crate::ui::{btn, file_icon, icon, icon_button, kbd};
@@ -20,7 +21,7 @@ use std::time::Duration;
 enum SideView { Files, Search, Git }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Resize { Side, Agent }
+enum Resize { Side, Agent, Term }
 
 struct Tab {
     path: String,
@@ -108,6 +109,10 @@ pub struct Workspace {
     overlay: Overlay,
     menu: Option<ContextMenu>,
     agent: Entity<AgentPanel>,
+    terminal: Option<Entity<TerminalView>>,
+    term_open: bool,
+    term_h: f32,
+    term_t: f32,
     search_input: Entity<Editor>,
     search_hits: Vec<Hit>,
     search_scroll: UniformListScrollHandle,
@@ -157,7 +162,7 @@ impl Workspace {
         let mut this = Self {
             focus: cx.focus_handle(), root: None, files: vec![], tabs: vec![], active: None, expanded: HashSet::new(), rows: vec![], tree_scroll: UniformListScrollHandle::new(),
             selected: None, side_view: SideView::Files, sidebar: true, agent_open: true, side_w: 264.0, agent_w: 440.0, side_t: 1.0, agent_t: 1.0, resizing: None,
-            overlay: Overlay::None, menu: None, agent, search_input, search_hits: vec![], search_scroll: UniformListScrollHandle::new(), find_input, find_open: false,
+            overlay: Overlay::None, menu: None, agent, terminal: None, term_open: false, term_h: 280.0, term_t: 0.0, search_input, search_hits: vec![], search_scroll: UniformListScrollHandle::new(), find_input, find_open: false,
             inline: None, changes: vec![], branch: None, settings, toasts: vec![], toast_seq: 0, recents: load_recents(), _subs: subs,
         };
         this.apply_theme(window, cx);
@@ -205,6 +210,8 @@ impl Workspace {
     pub fn open_root(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.tabs.clear();
         self.active = None;
+        self.terminal = None;
+        self.term_open = false;
         self.expanded.clear();
         self.root = Some(path.clone());
         let s = path.to_string_lossy().to_string();
@@ -389,7 +396,7 @@ impl Workspace {
             CommandItem { title: "切换侧栏", keys: "⌘B" }, CommandItem { title: "切换 AI 对话", keys: "⇧⌘A" }, CommandItem { title: "聚焦对话输入框", keys: "⌘L" },
             CommandItem { title: "在项目中搜索", keys: "⇧⌘F" }, CommandItem { title: "查看 Git 改动", keys: "" }, CommandItem { title: "就地改写（Inline Assist）", keys: "⌘K" },
             CommandItem { title: "在文件中查找", keys: "⌘F" }, CommandItem { title: "新建对话", keys: "" }, CommandItem { title: "打开设置", keys: "⌘," },
-            CommandItem { title: "切换深色 / 浅色", keys: "" }, CommandItem { title: "关闭当前标签页", keys: "⌘W" }, CommandItem { title: "应用最近的代码块", keys: "⇧⌘↵" },
+            CommandItem { title: "切换深色 / 浅色", keys: "" }, CommandItem { title: "关闭当前标签页", keys: "⌘W" }, CommandItem { title: "应用最近的代码块", keys: "⇧⌘↵" }, CommandItem { title: "切换终端", keys: "⌘J" },
         ]
     }
 
@@ -429,8 +436,24 @@ impl Workspace {
             12 => self.toggle_theme(window, cx),
             13 => { if let Some(a) = self.active { self.close_tab(a, window, cx); } }
             14 => self.agent.update(cx, |a, cx| a.apply_latest(cx)),
+            15 => self.toggle_terminal(window, cx),
             _ => {}
         }
+    }
+
+    fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.root.is_none() { return; }
+        self.term_open = !self.term_open;
+        if self.term_open {
+            if self.terminal.is_none() {
+                let cwd = self.root.as_ref().unwrap().to_string_lossy().to_string();
+                let t = cx.new(|cx| TerminalView::new(&cwd, cx));
+                if let Some(e) = t.read(cx).error.clone() { self.term_open = false; self.toast(format!("无法启动终端：{e}"), true, cx); return; }
+                self.terminal = Some(t);
+            }
+            if let Some(t) = &self.terminal { window.focus(&t.read(cx).focus); }
+        } else if let Some(e) = self.active_editor() { window.focus(&e.read(cx).focus); }
+        cx.notify();
     }
 
     fn focus_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -546,6 +569,7 @@ impl Workspace {
                     .child(icon("search", 14., t.faint)).child("搜索文件、运行命令").child(div().flex_1()).child(kbd("⌘P", cx)),
             )
             .child(div().flex_1())
+            .child(icon_button("tb-term", "terminal", self.term_open, cx).on_click(cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx))))
             .child(icon_button("tb-agent", "agent", self.agent_open, cx).on_click(cx.listener(|this, _, _, cx| { this.agent_open = !this.agent_open; cx.notify(); })))
             .child(icon_button("tb-set", "settings", false, cx).on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx))))
     }
@@ -753,6 +777,13 @@ impl Workspace {
         )
     }
 
+    fn handle_h(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = cx.theme().clone();
+        div().id("h-term").h(px(1.)).flex_none().relative().bg(t.border).cursor_row_resize()
+            .child(div().absolute().left_0().right_0().top(px(-3.)).h(px(7.)))
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, _, cx| { this.resizing = Some((Resize::Term, f32::from(ev.position.y), this.term_h)); cx.notify(); }))
+    }
+
     fn handle(&self, id: &'static str, which: Resize, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.theme().clone();
         let active = self.resizing.map(|r| r.0 == which).unwrap_or(false);
@@ -760,8 +791,8 @@ impl Workspace {
             .child(div().absolute().top_0().bottom_0().left(px(-3.)).w(px(7.)).when(active, |d| d.child(div().absolute().top_0().bottom_0().left(px(3.)).w(px(2.)).bg(t.accent)))
                 .hover(|s| s.bg(t.accent_soft)))
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                let w = if which == Resize::Side { this.side_w } else { this.agent_w };
-                this.resizing = Some((which, f32::from(ev.position.x), w));
+                let (pos, w) = match which { Resize::Side => (f32::from(ev.position.x), this.side_w), Resize::Agent => (f32::from(ev.position.x), this.agent_w), Resize::Term => (f32::from(ev.position.y), this.term_h) };
+                this.resizing = Some((which, pos, w));
                 cx.notify();
             }))
     }
@@ -773,7 +804,8 @@ impl Render for Workspace {
         // 面板开合动画：每帧向目标靠近
         let (st, at) = (if self.sidebar && self.root.is_some() { 1.0 } else { 0.0 }, if self.agent_open { 1.0 } else { 0.0 });
         let mut animating = false;
-        for (cur, target) in [(&mut self.side_t, st), (&mut self.agent_t, at)] {
+        let tt = if self.term_open { 1.0 } else { 0.0 };
+        for (cur, target) in [(&mut self.side_t, st), (&mut self.agent_t, at), (&mut self.term_t, tt)] {
             let d = target - *cur;
             if d.abs() > 0.003 { *cur += d * 0.28; animating = true; } else { *cur = target; }
         }
@@ -790,6 +822,12 @@ impl Render for Workspace {
                     Some(e) => div().flex_1().min_h_0().relative().child(e.clone()).when(self.find_open, |d| d.child(self.find_bar(cx))).children(review).when_some(self.inline.clone(), |d, i| d.child(i)).into_any_element(),
                     None => div().flex_1().flex().items_center().justify_center().flex_col().gap(px(6.)).child(div().text_size(px(26.)).font_weight(FontWeight::BOLD).child("选一个文件开始")).child(div().text_color(t.dim).child("⌘P 跳转文件 · ⌘L 和 AI 对话")).into_any_element(),
                 })
+                .when(self.term_t > 0.01, |d| d
+                    .child(self.handle_h(cx))
+                    .child(div().flex_none().h(px(self.term_h * self.term_t)).overflow_hidden().bg(t.bg).flex().flex_col()
+                        .child(div().h(px(30.)).flex_none().px(px(14.)).flex().items_center().gap(px(8.)).text_color(t.dim).text_size(px(12.)).font_weight(FontWeight::MEDIUM).child(icon("terminal", 14., t.dim)).child("终端").child(div().flex_1())
+                            .child(icon_button("term-x", "x", false, cx).size(px(22.)).on_click(cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx)))))
+                        .child(div().flex_1().min_h_0().children(self.terminal.clone()))))
                 .into_any_element()
         };
 
@@ -808,6 +846,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &QuickOpen, window, cx| this.open_palette(PaletteMode::Files, window, cx)))
             .on_action(cx.listener(|this, _: &CommandPalette, window, cx| this.open_palette(PaletteMode::Commands, window, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| { this.sidebar = !this.sidebar; cx.notify(); }))
+            .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| this.toggle_terminal(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleAgent, _, cx| { this.agent_open = !this.agent_open; cx.notify(); }))
             .on_action(cx.listener(|this, _: &FocusAgent, window, cx| this.focus_agent(window, cx)))
             .on_action(cx.listener(|this, _: &ProjectSearch, window, cx| { this.sidebar = true; this.side_view = SideView::Search; window.focus(&this.search_input.read(cx).focus); cx.notify(); }))
@@ -824,8 +863,10 @@ impl Render for Workspace {
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
                 if let Some((which, x0, w0)) = this.resizing {
                     let dx = f32::from(ev.position.x) - x0;
+                    let dy = f32::from(ev.position.y) - x0;
                     let total = f32::from(window.viewport_size().width);
                     match which {
+                        Resize::Term => this.term_h = (w0 - dy).clamp(120.0, 620.0),
                         Resize::Side => this.side_w = (w0 + dx).clamp(180.0, 520.0),
                         Resize::Agent => this.agent_w = (w0 - dx).clamp(320.0, (total * 0.6).max(360.0)),
                     }

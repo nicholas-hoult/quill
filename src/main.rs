@@ -16,6 +16,7 @@ mod palette;
 mod settings_view;
 mod shot;
 mod syntax;
+mod terminal;
 mod theme;
 mod tree;
 mod ui;
