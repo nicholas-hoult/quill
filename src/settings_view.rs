@@ -11,6 +11,7 @@ pub enum SettingsEvent {
 }
 
 pub struct SettingsView {
+    focus: FocusHandle,
     s: Settings,
     key: Entity<Editor>,
     model: Entity<Editor>,
@@ -34,8 +35,9 @@ impl SettingsView {
                 _ => {}
             }));
         }
-        if s.provider != "mock" { window.focus(&key.read(cx).focus); }
-        Self { s, key, model, base, _subs: subs }
+        let focus = cx.focus_handle();
+        if s.provider != "mock" { window.focus(&key.read(cx).focus); } else { window.focus(&focus); }
+        Self { focus, s, key, model, base, _subs: subs }
     }
 
     fn save(&mut self, cx: &mut Context<Self>) {
@@ -62,7 +64,7 @@ impl Render for SettingsView {
         let t = cx.theme().clone();
         let field = |label: &str, e: &Entity<Editor>| div().flex().items_center().gap(px(10.)).child(div().w(px(80.)).text_color(t.dim).child(label.to_string())).child(div().flex_1().h(px(32.)).px(px(10.)).flex().items_center().rounded(px(8.)).bg(t.bg).border_1().border_color(t.border).child(div().flex_1().child(e.clone())));
         let mock = self.s.provider == "mock";
-        div().id("settings-scrim").absolute().inset_0().flex().justify_center().items_center().bg(t.scrim).occlude()
+        div().id("settings-scrim").track_focus(&self.focus).on_key_down(cx.listener(|_, ev: &KeyDownEvent, _, cx| { if ev.keystroke.key == "escape" { cx.emit(SettingsEvent::Close); } })).absolute().inset_0().flex().justify_center().items_center().bg(t.scrim).occlude()
             .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::Close)))
             .child(
                 div().w(px(500.)).p(px(22.)).flex().flex_col().gap(px(14.)).rounded(px(16.)).bg(t.elev).border_1().border_color(t.border_strong)

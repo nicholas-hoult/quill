@@ -42,6 +42,7 @@ enum Overlay {
 struct ContextMenu { pos: Point<Pixels>, path: String, is_dir: bool }
 
 pub struct PromptView {
+    focus: FocusHandle,
     title: String,
     input: Entity<Editor>,
     kind: PromptKind,
@@ -59,13 +60,14 @@ impl PromptView {
         let confirm = matches!(kind, PromptKind::ConfirmDelete(_));
         let input = cx.new(|cx| Editor::new(EditorMode::input(""), cx));
         input.update(cx, |e, cx| { e.set_text(initial, cx); });
-        if !confirm { window.focus(&input.read(cx).focus); }
+        let focus = cx.focus_handle();
+        if !confirm { window.focus(&input.read(cx).focus); } else { window.focus(&focus); }
         let sub = cx.subscribe(&input, |this, _, ev: &EditorEvent, cx| match ev {
             EditorEvent::Submit => { let t = this.input.read(cx).text(); cx.emit(PromptEvent::Submit(this.kind.clone(), t)); }
             EditorEvent::Cancel => cx.emit(PromptEvent::Close),
             _ => {}
         });
-        Self { title: title.to_string(), input, kind, _sub: sub }
+        Self { focus, title: title.to_string(), input, kind, _sub: sub }
     }
 }
 
@@ -73,7 +75,7 @@ impl Render for PromptView {
     fn render(&mut self, _w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.theme().clone();
         let confirm = matches!(self.kind, PromptKind::ConfirmDelete(_));
-        div().id("prompt-scrim").absolute().inset_0().flex().justify_center().items_start().pt(px(160.)).bg(t.scrim).occlude()
+        div().id("prompt-scrim").track_focus(&self.focus).on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| { match ev.keystroke.key.as_str() { "escape" => cx.emit(PromptEvent::Close), "enter" if matches!(this.kind, PromptKind::ConfirmDelete(_)) => { let t = this.input.read(cx).text(); cx.emit(PromptEvent::Submit(this.kind.clone(), t)); } _ => {} } })).absolute().inset_0().flex().justify_center().items_start().pt(px(160.)).bg(t.scrim).occlude()
             .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.emit(PromptEvent::Close)))
             .child(
                 div().w(px(420.)).p(px(18.)).flex().flex_col().gap(px(12.)).rounded(px(14.)).bg(t.elev).border_1().border_color(t.border_strong)
@@ -737,8 +739,9 @@ impl Workspace {
                         .on_click(cx.listener(move |this, _, window, cx| this.open_root(p.clone(), window, cx)))
                         .child(div().child(name)).child(div().text_color(t.faint).truncate().child(r.replacen(&home, "~", 1)))
                 })))
-                .child(div().mt(px(20.)).grid().grid_cols(2).gap(px(6.)).text_color(t.dim)
-                    .child(kbd("⌘P", cx)).child("跳转到文件").child(kbd("⇧⌘P", cx)).child("命令面板").child(kbd("⌘L", cx)).child("呼出对话").child(kbd("⌘K", cx)).child("就地改写选中代码")),
+                .child(div().mt(px(20.)).flex().flex_col().gap(px(8.)).text_color(t.dim).children([("⌘P", "跳转到文件"), ("⇧⌘P", "命令面板"), ("⌘L", "呼出对话"), ("⌘K", "就地改写选中代码"), ("⌘J", "终端")].into_iter().map(|(k, d)| {
+                    div().flex().items_center().gap(px(12.)).child(div().w(px(56.)).flex().child(kbd(k, cx))).child(d)
+                }))),
         )
     }
 
