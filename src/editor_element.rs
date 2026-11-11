@@ -1,0 +1,606 @@
+//! 编辑器绘制：只排版可见行（gpui 内部按文本+样式缓存排版结果），自己画选区、光标、行号、审阅高亮。
+use crate::actions::*;
+use crate::editor::{Editor, EditorEvent, RowKind};
+use crate::theme::{ActiveTheme, MONO_FONT, UI_FONT};
+use gpui::{prelude::*, *};
+use std::ops::Range;
+
+#[derive(Default)]
+pub struct LastLayout {
+    pub bounds: Bounds<Pixels>,
+    pub text_left: Pixels,
+    pub rows: Vec<VisRow>,
+    pub hunk_buttons: Vec<HunkButton>,
+    pub total_h: f32,
+}
+
+pub struct VisRow {
+    pub y: Pixels,
+    pub h: Pixels,
+    pub kind: RowKind,
+    pub line_start: usize,
+    pub len: usize,
+    pub tabs: Vec<usize>,
+    pub shaped: Option<WrappedLine>,
+}
+
+pub struct HunkButton {
+    pub rect: Bounds<Pixels>,
+    pub hunk: usize,
+    pub accept: bool,
+}
+
+fn to_display(tabs: &[usize], i: usize) -> usize { i + 3 * tabs.iter().filter(|&&t| t < i).count() }
+
+fn from_display(tabs: &[usize], d: usize) -> usize {
+    let mut extra = 0;
+    for &t in tabs {
+        let dt = t + extra;
+        if d >= dt + 4 { extra += 3; } else if d > dt { return t + 1; } else { break; }
+    }
+    d.saturating_sub(extra)
+}
+
+impl LastLayout {
+    /// 某字节偏移在窗口中的坐标（用于输入法候选框定位）
+    pub fn position_of(&self, offset: usize, lh: f32) -> Option<(Pixels, Pixels)> {
+        for r in &self.rows {
+            if let RowKind::Line(_) = r.kind {
+                if offset >= r.line_start && offset <= r.line_start + r.len {
+                    let p = match &r.shaped {
+                        Some(s) => s.position_for_index(to_display(&r.tabs, offset - r.line_start), px(lh)).unwrap_or(point(px(0.), px(0.))),
+                        None => point(px(0.), px(0.)),
+                    };
+                    return Some((self.text_left + p.x, r.y + p.y));
+                }
+            }
+        }
+        None
+    }
+
+    /// 窗口坐标 → 字节偏移
+    pub fn offset_at(&self, p: Point<Pixels>, lh: f32, doc_len: usize) -> Option<usize> {
+        let first = self.rows.first()?;
+        if p.y < first.y { return Some(self.first_line_offset()); }
+        let mut last_line_end = doc_len;
+        for (i, r) in self.rows.iter().enumerate() {
+            if p.y >= r.y && p.y < r.y + r.h {
+                return Some(match &r.kind {
+                    RowKind::Line(_) => match &r.shaped {
+                        Some(s) => {
+                            let idx = match s.closest_index_for_position(point(p.x - self.text_left, p.y - r.y), px(lh)) { Ok(i) | Err(i) => i };
+                            r.line_start + from_display(&r.tabs, idx).min(r.len)
+                        }
+                        None => r.line_start,
+                    },
+                    RowKind::Removed { .. } => self.rows[i..].iter().find_map(|n| if let RowKind::Line(_) = n.kind { Some(n.line_start) } else { None }).unwrap_or(doc_len),
+                });
+            }
+            if let RowKind::Line(_) = r.kind { last_line_end = r.line_start + r.len; }
+        }
+        Some(last_line_end.max(if p.y > first.y { last_line_end } else { 0 }))
+    }
+
+    fn first_line_offset(&self) -> usize { self.rows.iter().find_map(|r| if let RowKind::Line(_) = r.kind { Some(r.line_start) } else { None }).unwrap_or(0) }
+}
+
+impl Render for Editor {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let key = if self.review.is_some() { "Editor Review" } else { "Editor" };
+        let root = div()
+            .id("editor")
+            .key_context(key)
+            .track_focus(&self.focus)
+            .on_action(cx.listener(Self::move_left))
+            .on_action(cx.listener(Self::move_right))
+            .on_action(cx.listener(Self::move_up))
+            .on_action(cx.listener(Self::move_down))
+            .on_action(cx.listener(Self::select_left))
+            .on_action(cx.listener(Self::select_right))
+            .on_action(cx.listener(Self::select_up))
+            .on_action(cx.listener(Self::select_down))
+            .on_action(cx.listener(Self::move_word_left))
+            .on_action(cx.listener(Self::move_word_right))
+            .on_action(cx.listener(Self::select_word_left))
+            .on_action(cx.listener(Self::select_word_right))
+            .on_action(cx.listener(Self::move_to_line_start))
+            .on_action(cx.listener(Self::move_to_line_end))
+            .on_action(cx.listener(Self::select_to_line_start))
+            .on_action(cx.listener(Self::select_to_line_end))
+            .on_action(cx.listener(Self::move_to_doc_start))
+            .on_action(cx.listener(Self::move_to_doc_end))
+            .on_action(cx.listener(Self::select_to_doc_start))
+            .on_action(cx.listener(Self::select_to_doc_end))
+            .on_action(cx.listener(Self::page_up))
+            .on_action(cx.listener(Self::page_down))
+            .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::backspace))
+            .on_action(cx.listener(Self::delete))
+            .on_action(cx.listener(Self::delete_word_left))
+            .on_action(cx.listener(Self::delete_to_line_start))
+            .on_action(cx.listener(Self::delete_to_line_end))
+            .on_action(cx.listener(Self::enter))
+            .on_action(cx.listener(Self::newline_action))
+            .on_action(cx.listener(Self::tab))
+            .on_action(cx.listener(Self::outdent))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
+            .on_action(cx.listener(|e, _: &Copy, w, cx| e.copy(&Copy, w, cx)))
+            .on_action(cx.listener(|e, _: &Cut, w, cx| e.cut(w, cx)))
+            .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::toggle_comment))
+            .on_action(cx.listener(Self::duplicate_line))
+            .on_action(cx.listener(Self::delete_line))
+            .on_action(cx.listener(Self::move_line_up))
+            .on_action(cx.listener(Self::move_line_down))
+            .on_action(cx.listener(Self::escape))
+            .on_action(cx.listener(Self::find_next))
+            .on_action(cx.listener(Self::find_prev))
+            .on_action(cx.listener(|_, _: &ShowCharacterPalette, w, _| w.show_character_palette()))
+            .on_action(cx.listener(|_, _: &InlineAssist, _, cx| cx.emit(EditorEvent::InlineAssist)));
+        let lh = self.mode.line_height;
+        match self.mode.max_lines {
+            Some(max) => {
+                let content = if self.mode.wrap { self.layout.total_h.max(lh) } else { (self.buffer.line_count() as f32 * lh).max(lh) };
+                root.w_full().h(px(content.min(max as f32 * lh) + self.mode.padding * 2.0)).child(EditorElement { editor: cx.entity() })
+            }
+            None => root.size_full().child(EditorElement { editor: cx.entity() }),
+        }
+    }
+}
+
+pub trait PxF { fn f(self) -> f32; }
+impl PxF for Pixels { fn f(self) -> f32 { f32::from(self) } }
+
+pub struct EditorElement {
+    pub editor: Entity<Editor>,
+}
+
+impl IntoElement for EditorElement {
+    type Element = Self;
+    fn into_element(self) -> Self::Element { self }
+}
+
+pub struct Prepaint {
+    hitbox: Hitbox,
+    gutter_w: f32,
+    numbers: Vec<(Pixels, ShapedLine, bool)>,
+    cursor: Option<Bounds<Pixels>>,
+    marks: Vec<(Bounds<Pixels>, Hsla)>,
+    row_bgs: Vec<(Bounds<Pixels>, Hsla)>,
+    thumb: Option<Bounds<Pixels>>,
+    buttons: Vec<(Bounds<Pixels>, ShapedLine, bool)>,
+    placeholder: Option<ShapedLine>,
+    focused: bool,
+    eol_marks: Vec<Bounds<Pixels>>,
+}
+
+impl Element for EditorElement {
+    type RequestLayoutState = ();
+    type PrepaintState = Prepaint;
+
+    fn id(&self) -> Option<ElementId> { None }
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> { None }
+
+    fn request_layout(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, window: &mut Window, cx: &mut App) -> (LayoutId, ()) {
+        let mut style = Style::default();
+        style.size.width = relative(1.).into();
+        style.size.height = relative(1.).into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, bounds: Bounds<Pixels>, _: &mut (), window: &mut Window, cx: &mut App) -> Prepaint {
+        let theme = cx.theme().clone();
+        let focused = self.editor.read(cx).focus.is_focused(window);
+        let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+        let editor = self.editor.clone();
+        editor.update(cx, |ed, cx| {
+            let mode = ed.mode.clone();
+            let lh = px(mode.line_height);
+            let fsize = px(mode.font_size);
+            let base_font = font(if mode.ui_font { UI_FONT } else { MONO_FONT });
+            let num_font = font(MONO_FONT);
+            let pad = px(mode.padding);
+            ed.refresh_review();
+            ed.spans();
+            if ed.search.is_some() { ed.matches(); }
+            let head_hunks: Vec<crate::diff::Hunk> = if mode.gutter && ed.review.is_none() { ed.head_hunks().to_vec() } else { vec![] };
+
+            // 行号栏宽度
+            let digits = ed.buffer.line_count().to_string().len().max(2);
+            let digit_w = {
+                let l = window.text_system().shape_line("0".into(), px(mode.font_size - 1.0), &[TextRun { len: 1, font: num_font.clone(), color: theme.faint, background_color: None, underline: None, strikethrough: None }], None);
+                l.width.f()
+            };
+            let gutter_w = if mode.gutter { digits as f32 * digit_w + 36.0 } else { 0.0 };
+            let text_left = bounds.left() + px(gutter_w) + if mode.gutter { px(6.) } else { pad };
+            let wrap_w = if mode.wrap { Some((bounds.right() - text_left - pad - px(6.)).max(px(40.))) } else { None };
+            let view_h = bounds.size.height - pad * 2.0;
+            let top = bounds.top() + pad;
+
+            // ---- 行模型 ----
+            let review_rows: Option<Vec<RowKind>> = ed.review.as_ref().map(|r| r.rows.clone());
+            let row_count = review_rows.as_ref().map(|r| r.len()).unwrap_or_else(|| ed.buffer.line_count());
+            let kind_at = |i: usize| -> RowKind { review_rows.as_ref().map(|r| r[i].clone()).unwrap_or(RowKind::Line(i)) };
+
+            let total_h: f32;
+            let mut heights: Vec<f32> = vec![];
+            let mut shaped_all: Vec<Option<(WrappedLine, Vec<usize>)>> = vec![];
+            if mode.wrap {
+                // 自动换行只用于小文本（聊天输入框）：整体排版以得到每行高度
+                for i in 0..row_count {
+                    let (sh, tabs) = shape_row(ed, &theme, &base_font, fsize, wrap_w, &kind_at(i), &mode.placeholder, window);
+                    let h = sh.as_ref().map(|s: &WrappedLine| s.size(lh).height.f()).unwrap_or(mode.line_height).max(mode.line_height);
+                    heights.push(h);
+                    shaped_all.push(sh.map(|s| (s, tabs)));
+                }
+                total_h = heights.iter().sum();
+            } else {
+                total_h = row_count as f32 * mode.line_height;
+            }
+            let max_scroll = (total_h - view_h.f()).max(0.0);
+
+            // ---- 光标可见 ----
+            let cursor = ed.cursor();
+            let cur_line = ed.buffer.line_of(cursor);
+            let cur_row = ed.review.as_ref().and_then(|r| r.line_row.get(cur_line).copied()).unwrap_or(cur_line);
+            let row_y = |i: usize| -> f32 { if mode.wrap { heights[..i.min(heights.len())].iter().sum() } else { i as f32 * mode.line_height } };
+            if ed.reveal && !(mode.wrap && heights.is_empty()) {
+                let y0 = row_y(cur_row);
+                let hh = if mode.wrap { heights.get(cur_row).copied().unwrap_or(mode.line_height) } else { mode.line_height };
+                let margin = if mode.max_lines.is_some() { 0.0 } else { mode.line_height * 2.0 };
+                if y0 - margin < ed.scroll_y { ed.scroll_y = (y0 - margin).max(0.0); }
+                if y0 + hh + margin > ed.scroll_y + view_h.f() { ed.scroll_y = y0 + hh + margin - view_h.f(); }
+            }
+            ed.scroll_y = ed.scroll_y.clamp(0.0, max_scroll);
+
+            // ---- 可见行 ----
+            let first = if mode.wrap {
+                let mut acc = 0.0; let mut f = 0;
+                for (i, h) in heights.iter().enumerate() { if acc + h > ed.scroll_y { f = i; break; } acc += h; f = i; }
+                f
+            } else { (ed.scroll_y / mode.line_height) as usize };
+            let mut rows: Vec<VisRow> = vec![];
+            let mut y_off = row_y(first);
+            let mut i = first;
+            let sel = ed.sel.clone();
+            while i < row_count && y_off - ed.scroll_y < view_h.f() + mode.line_height {
+                let kind = kind_at(i);
+                let (shaped, tabs) = if mode.wrap {
+                    match shaped_all[i].take() { Some((s, t)) => (Some(s), t), None => (None, vec![]) }
+                } else {
+                    let (s, t) = shape_row(ed, &theme, &base_font, fsize, wrap_w, &kind, &mode.placeholder, window);
+                    (s, t)
+                };
+                let h = if mode.wrap { heights[i] } else { mode.line_height };
+                let (ls, len) = match kind { RowKind::Line(l) => (ed.buffer.line_start(l), ed.buffer.line_end(l) - ed.buffer.line_start(l)), _ => (0, 0) };
+                rows.push(VisRow { y: top + px(y_off - ed.scroll_y), h: px(h), kind, line_start: ls, len, tabs, shaped });
+                y_off += h;
+                i += 1;
+            }
+
+            // ---- 水平滚动：保持光标可见 ----
+            if !mode.wrap {
+                if let Some(r) = rows.iter().find(|r| matches!(r.kind, RowKind::Line(l) if l == cur_line)) {
+                    let cx_px = r.shaped.as_ref().and_then(|s| s.position_for_index(to_display(&r.tabs, cursor.saturating_sub(r.line_start)), lh)).map(|p| p.x.f()).unwrap_or(0.0);
+                    let vis_w = (bounds.right() - text_left).f() - 24.0;
+                    if ed.reveal {
+                        if cx_px - ed.scroll_x > vis_w { ed.scroll_x = cx_px - vis_w + 40.0; }
+                        if cx_px - ed.scroll_x < 0.0 { ed.scroll_x = (cx_px - 40.0).max(0.0); }
+                    }
+                }
+                if ed.scroll_x < 0.0 { ed.scroll_x = 0.0; }
+            }
+            ed.reveal = false;
+            let scroll_x = px(ed.scroll_x);
+            let text_origin_x = text_left - scroll_x;
+
+            // ---- 行背景（当前行、审阅）----
+            let mut row_bgs: Vec<(Bounds<Pixels>, Hsla)> = vec![];
+            let mut marks: Vec<(Bounds<Pixels>, Hsla)> = vec![];
+            let mut numbers: Vec<(Pixels, ShapedLine, bool)> = vec![];
+            let mut eol_marks: Vec<Bounds<Pixels>> = vec![];
+            let hunks_new: Vec<std::ops::Range<usize>> = ed.review.as_ref().map(|r| r.hunks.iter().map(|h| h.new.clone()).collect()).unwrap_or_default();
+            let in_review = ed.review.is_some();
+            for r in &rows {
+                let full = Bounds::new(point(bounds.left(), r.y), size(bounds.size.width, r.h));
+                match &r.kind {
+                    RowKind::Line(l) => {
+                        let is_cur = *l == cur_line;
+                        if mode.highlight_active_line && is_cur && sel.is_empty() && !in_review { row_bgs.push((full, theme.line_active)); }
+                        if in_review && hunks_new.iter().any(|h| h.contains(l)) {
+                            row_bgs.push((full, theme.add_bg));
+                            marks.push((Bounds::new(point(bounds.left() + px(gutter_w - 6.0), r.y), size(px(3.), r.h)), theme.add));
+                        }
+                        if !in_review {
+                            for h in &head_hunks {
+                                if h.new.contains(l) {
+                                    let c = if h.old.is_empty() { theme.add } else { theme.modified };
+                                    marks.push((Bounds::new(point(bounds.left() + px(gutter_w - 6.0), r.y), size(px(3.), r.h)), c));
+                                } else if h.new.is_empty() && h.new.start == *l {
+                                    marks.push((Bounds::new(point(bounds.left() + px(gutter_w - 8.0), r.y - px(1.)), size(px(7.), px(2.))), theme.del));
+                                }
+                            }
+                        }
+                        if mode.gutter {
+                            let s = (l + 1).to_string();
+                            let color = if is_cur { theme.dim } else { theme.faint };
+                            let shaped = window.text_system().shape_line(s.clone().into(), px(mode.font_size - 1.0), &[TextRun { len: s.len(), font: num_font.clone(), color, background_color: None, underline: None, strikethrough: None }], None);
+                            numbers.push((r.y, shaped, is_cur));
+                        }
+                        // 选区跨过行尾时，在行尾补一小块表示换行被选中
+                        if !sel.is_empty() && sel.start <= r.line_start + r.len && sel.end > r.line_start + r.len && *l + 1 < ed.buffer.line_count() {
+                            let x = r.shaped.as_ref().map(|s| s.size(lh).width).unwrap_or(px(0.));
+                            eol_marks.push(Bounds::new(point(text_origin_x + x, r.y), size(px(7.), r.h.min(lh))));
+                        }
+                    }
+                    RowKind::Removed { .. } => {
+                        row_bgs.push((full, theme.del_bg));
+                        marks.push((Bounds::new(point(bounds.left() + px(gutter_w - 6.0), r.y), size(px(3.), r.h)), theme.del));
+                    }
+                }
+            }
+
+            // ---- 审阅按钮 ----
+            let mut buttons: Vec<(Bounds<Pixels>, ShapedLine, bool)> = vec![];
+            let mut hunk_buttons: Vec<HunkButton> = vec![];
+            if in_review {
+                let mut seen = std::collections::HashSet::new();
+                for r in &rows {
+                    let hunk = match &r.kind {
+                        RowKind::Removed { hunk, .. } => Some(*hunk),
+                        RowKind::Line(l) => hunks_new.iter().position(|h| h.contains(l) || (h.is_empty() && h.start == *l)),
+                    };
+                    if let Some(hk) = hunk {
+                        if seen.insert(hk) {
+                            let mut x = bounds.right() - px(14.);
+                            for (label, accept) in [("拒绝", false), ("接受", true)] {
+                                let sh = window.text_system().shape_line(label.into(), px(11.5), &[TextRun { len: label.len(), font: font(UI_FONT), color: if accept { theme.accent_ink } else { theme.text }, background_color: None, underline: None, strikethrough: None }], None);
+                                let w = sh.width + px(18.);
+                                x -= w;
+                                let rect = Bounds::new(point(x, r.y + px(1.)), size(w, px(mode.line_height - 3.)));
+                                buttons.push((rect, sh, accept));
+                                hunk_buttons.push(HunkButton { rect, hunk: hk, accept });
+                                x -= px(5.);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---- 光标（带平滑移动）----
+            let mut cursor_box = None;
+            if let Some((x, y)) = ed.layout_position(&rows, text_left, scroll_x, cursor, lh) {
+                let target = point(x, y);
+                let cur = ed.cursor_anim.unwrap_or(target);
+                let (dx, dy) = ((target.x - cur.x).f(), (target.y - cur.y).f());
+                let next = if dx.abs() < 0.4 && dy.abs() < 0.4 || dy.abs() > 200.0 { target } else { point(cur.x + px(dx * 0.55), cur.y + px(dy * 0.55)) };
+                if next != target { window.request_animation_frame(); }
+                ed.cursor_anim = Some(next);
+                cursor_box = Some(Bounds::new(next, size(px(2.), px(mode.line_height - 2.))));
+                let _ = cursor_box;
+                cursor_box = Some(Bounds::new(point(next.x, next.y + px(1.)), size(px(2.), px(mode.line_height - 2.))));
+            }
+            if ed.blink_on || !focused { /* 保持 */ }
+            let show_cursor = focused && ed.sel.is_empty() || (focused && ed.marked.is_some());
+            let cursor_out = if show_cursor && ed.blink_on { cursor_box } else { None };
+
+            // ---- 滚动条 ----
+            let thumb = if total_h > view_h.f() + 1.0 && !mode.single_line && mode.gutter {
+                let ratio = view_h.f() / total_h;
+                let th = (view_h.f() * ratio).max(28.0);
+                let ty = (ed.scroll_y / max_scroll.max(1.0)) * (view_h.f() - th);
+                Some(Bounds::new(point(bounds.right() - px(8.), top + px(ty)), size(px(5.), px(th))))
+            } else { None };
+
+            // ---- 占位提示 ----
+            let placeholder = if ed.buffer.is_empty() && !mode.placeholder.is_empty() {
+                Some(window.text_system().shape_line(mode.placeholder.clone(), fsize, &[TextRun { len: mode.placeholder.len(), font: base_font.clone(), color: theme.faint, background_color: None, underline: None, strikethrough: None }], None))
+            } else { None };
+
+            if (ed.layout.total_h - total_h).abs() > 0.5 && mode.max_lines.is_some() { cx.notify(); }
+            ed.layout = LastLayout { bounds, text_left: text_origin_x, rows, hunk_buttons, total_h };
+            Prepaint { hitbox, gutter_w, numbers, cursor: cursor_out, marks, row_bgs, thumb, buttons, placeholder, focused, eol_marks }
+        })
+    }
+
+    fn paint(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, bounds: Bounds<Pixels>, _: &mut (), pre: &mut Prepaint, window: &mut Window, cx: &mut App) {
+        let theme = cx.theme().clone();
+        let editor = self.editor.clone();
+        let (lh, mode_gutter, single, padding) = { let e = editor.read(cx); (e.mode.line_height, e.mode.gutter, e.mode.single_line, e.mode.padding) };
+        let lhp = px(lh);
+        window.set_cursor_style(CursorStyle::IBeam, &pre.hitbox);
+        let focus = editor.read(cx).focus.clone();
+        window.handle_input(&focus, ElementInputHandler::new(bounds, editor.clone()), cx);
+
+        let (rows, text_left, font_size) = editor.update(cx, |e, _| (std::mem::take(&mut e.layout.rows), e.layout.text_left, e.mode.font_size));
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            if mode_gutter { window.paint_quad(fill(bounds, theme.bg)); }
+            for (b, c) in &pre.row_bgs { window.paint_quad(fill(*b, *c)); }
+            for r in &rows {
+                let origin = point(text_left, r.y);
+                match (&r.kind, &r.shaped) {
+                    (_, Some(s)) => {
+                        let _ = s.paint_background(origin, lhp, TextAlign::Left, None, window, cx);
+                        let _ = s.paint(origin, lhp, TextAlign::Left, None, window, cx);
+                    }
+                    _ => {}
+                }
+            }
+            for b in &pre.eol_marks { window.paint_quad(fill(*b, theme.selection)); }
+            if let Some(p) = &pre.placeholder {
+                let _ = p.paint(point(text_left, bounds.top() + px(padding) + px((lh - font_size * 1.25) / 2.0)), lhp, window, cx);
+            }
+            if let Some(c) = pre.cursor { window.paint_quad(fill(c, theme.accent)); }
+            // 行号栏盖在滚动后的文本之上
+            if mode_gutter {
+                window.paint_quad(fill(Bounds::new(bounds.origin, size(px(pre.gutter_w), bounds.size.height)), theme.bg));
+                for (y, s, _) in &pre.numbers {
+                    let x = bounds.left() + px(pre.gutter_w) - px(16.) - s.width;
+                    let _ = s.paint(point(x, *y + px(0.5)), lhp, window, cx);
+                }
+                for (b, c) in &pre.marks { window.paint_quad(fill(*b, *c)); }
+            } else {
+                for (b, c) in &pre.marks { window.paint_quad(fill(*b, *c)); }
+            }
+            for (rect, sh, accept) in &pre.buttons {
+                window.paint_quad(quad(*rect, px(6.), if *accept { theme.accent } else { theme.elev }, px(1.), if *accept { theme.accent } else { theme.border_strong }, BorderStyle::default()));
+                let _ = sh.paint(point(rect.left() + px(9.), rect.top() + px((rect.size.height.f() - 14.0) / 2.0)), px(14.), window, cx);
+            }
+            if let Some(t) = pre.thumb { window.paint_quad(quad(t, px(3.), theme.border_strong, px(0.), theme.border_strong, BorderStyle::default())); }
+        });
+        editor.update(cx, |e, _| e.layout.rows = rows);
+        let _ = (pre.focused, single);
+
+        // ---- 鼠标 ----
+        let hitbox_id = pre.hitbox.id;
+        {
+            let editor = editor.clone();
+            window.on_mouse_event(move |ev: &MouseDownEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble || ev.button != MouseButton::Left || !bounds.contains(&ev.position) { return; }
+                let _ = hitbox_id;
+                editor.update(cx, |ed, cx| {
+                    window.focus(&ed.focus);
+                    // 审阅按钮
+                    if let Some(b) = ed.layout.hunk_buttons.iter().find(|b| b.rect.contains(&ev.position)) {
+                        let (k, accept) = (b.hunk, b.accept);
+                        if accept { ed.accept_hunk(k, cx) } else { ed.reject_hunk(k, cx) }
+                        return;
+                    }
+                    let lh = ed.mode.line_height;
+                    let len = ed.buffer.len();
+                    let Some(o) = ed.layout.offset_at(ev.position, lh, len) else { return };
+                    ed.dragging = true;
+                    match ev.click_count {
+                        2 => { let r = ed.buffer.word_range(o); ed.sel = r; ed.reversed = false; cx.notify(); }
+                        3 => {
+                            let l = ed.buffer.line_of(o);
+                            let e = if l + 1 < ed.buffer.line_count() { ed.buffer.line_start(l + 1) } else { len };
+                            ed.sel = ed.buffer.line_start(l)..e; ed.reversed = false; cx.notify();
+                        }
+                        _ => if ev.modifiers.shift { ed.select_to(o, cx) } else { ed.move_to(o, cx) },
+                    }
+                });
+            });
+        }
+        {
+            let editor = editor.clone();
+            window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _window, cx| {
+                if phase != DispatchPhase::Capture && phase != DispatchPhase::Bubble { return; }
+                editor.update(cx, |ed, cx| {
+                    if !ed.dragging || ev.pressed_button != Some(MouseButton::Left) { return; }
+                    let lh = ed.mode.line_height;
+                    // 拖到边缘外时自动滚动
+                    let b = ed.layout.bounds;
+                    if ev.position.y < b.top() { ed.scroll_y = (ed.scroll_y - 14.0).max(0.0); }
+                    if ev.position.y > b.bottom() { ed.scroll_y += 14.0; }
+                    let len = ed.buffer.len();
+                    if let Some(o) = ed.layout.offset_at(ev.position, lh, len) { ed.select_to(o, cx); }
+                    cx.notify();
+                });
+            });
+        }
+        {
+            let editor = editor.clone();
+            window.on_mouse_event(move |ev: &MouseUpEvent, _phase, _window, cx| {
+                if ev.button == MouseButton::Left { editor.update(cx, |ed, _| ed.dragging = false); }
+            });
+        }
+        {
+            let editor = editor.clone();
+            window.on_mouse_event(move |ev: &ScrollWheelEvent, phase, _window, cx| {
+                if phase != DispatchPhase::Bubble || !bounds.contains(&ev.position) { return; }
+                editor.update(cx, |ed, cx| {
+                    let d = ev.delta.pixel_delta(px(ed.mode.line_height));
+                    if ed.mode.single_line { return; }
+                    let max = (ed.layout.total_h - (ed.layout.bounds.size.height.f() - ed.mode.padding * 2.0)).max(0.0);
+                    if d.y.f().abs() >= d.x.f().abs() || ed.mode.wrap { ed.scroll_y = (ed.scroll_y - d.y.f()).clamp(0.0, max); }
+                    else { ed.scroll_x = (ed.scroll_x - d.x.f()).max(0.0); }
+                    cx.notify();
+                });
+            });
+        }
+    }
+}
+
+impl Editor {
+    fn layout_position(&self, rows: &[VisRow], text_left: Pixels, scroll_x: Pixels, offset: usize, lh: Pixels) -> Option<(Pixels, Pixels)> {
+        let _ = scroll_x;
+        for r in rows {
+            if let RowKind::Line(_) = r.kind {
+                if offset >= r.line_start && offset <= r.line_start + r.len {
+                    let p = match &r.shaped {
+                        Some(s) => s.position_for_index(to_display(&r.tabs, offset - r.line_start), lh).unwrap_or(point(px(0.), px(0.))),
+                        None => point(px(0.), px(0.)),
+                    };
+                    return Some((text_left + p.x, r.y + p.y));
+                }
+            }
+        }
+        None
+    }
+}
+
+/// 把一行排版成可绘制的文本（含语法高亮、选区背景、查找高亮、输入法下划线）
+#[allow(clippy::too_many_arguments)]
+fn shape_row(ed: &Editor, theme: &crate::theme::Theme, base_font: &Font, fsize: Pixels, wrap_w: Option<Pixels>, kind: &RowKind, _placeholder: &SharedString, window: &mut Window) -> (Option<WrappedLine>, Vec<usize>) {
+    match kind {
+        RowKind::Removed { text, .. } => {
+            if text.is_empty() { return (None, vec![]); }
+            let (disp, tabs) = expand_tabs(text);
+            let run = TextRun { len: disp.len(), font: base_font.clone(), color: theme.dim, background_color: None, underline: None, strikethrough: Some(StrikethroughStyle { thickness: px(1.), color: Some(theme.del.opacity(0.5)) }) };
+            (window.text_system().shape_text(disp.into(), fsize, &[run], wrap_w, None).ok().and_then(|mut v| v.pop()), tabs)
+        }
+        RowKind::Line(l) => {
+            let ls = ed.buffer.line_start(*l);
+            let le = ed.buffer.line_end(*l);
+            if le == ls { return (None, vec![]); }
+            let text = ed.buffer.line_text(*l);
+            let (disp, tabs) = expand_tabs(&text);
+            let runs = line_runs(ed, theme, base_font, ls, le, &tabs, &text);
+            (window.text_system().shape_text(disp.into(), fsize, &runs, wrap_w, None).ok().and_then(|mut v| v.pop()), tabs)
+        }
+    }
+}
+
+fn expand_tabs(s: &str) -> (String, Vec<usize>) {
+    if !s.contains('\t') { return (s.to_string(), vec![]); }
+    let tabs: Vec<usize> = s.match_indices('\t').map(|(i, _)| i).collect();
+    (s.replace('\t', "    "), tabs)
+}
+
+fn line_runs(ed: &Editor, theme: &crate::theme::Theme, font: &Font, ls: usize, le: usize, tabs: &[usize], text: &str) -> Vec<TextRun> {
+    let mut cuts: Vec<usize> = vec![ls, le];
+    let spans = &ed.spans_ref()[..];
+    let first = spans.partition_point(|(r, _)| r.end <= ls);
+    for (r, _) in spans[first..].iter().take_while(|(r, _)| r.start < le) { cuts.push(r.start.clamp(ls, le)); cuts.push(r.end.clamp(ls, le)); }
+    let sel = &ed.sel;
+    if sel.start < le && sel.end > ls { cuts.push(sel.start.clamp(ls, le)); cuts.push(sel.end.clamp(ls, le)); }
+    let matches = &ed.search_matches;
+    if !matches.is_empty() {
+        let f = matches.partition_point(|r| r.end <= ls);
+        for r in matches[f..].iter().take_while(|r| r.start < le) { cuts.push(r.start.clamp(ls, le)); cuts.push(r.end.clamp(ls, le)); }
+    }
+    if let Some(m) = &ed.marked { if m.start < le && m.end > ls { cuts.push(m.start.clamp(ls, le)); cuts.push(m.end.clamp(ls, le)); } }
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut runs = Vec::with_capacity(cuts.len());
+    let mut si = first;
+    for w in cuts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        while si < spans.len() && spans[si].0.end <= a { si += 1; }
+        let color = if si < spans.len() && spans[si].0.start <= a { theme.syntax(spans[si].1) } else { theme.text };
+        let in_sel = !sel.is_empty() && a >= sel.start && b <= sel.end;
+        let cur_match = ed.search_matches.get(ed.search_current);
+        let bg = if in_sel { Some(theme.selection) }
+            else if ed.search_matches.iter().any(|r| r.start <= a && b <= r.end) {
+                Some(if cur_match.map(|r: &Range<usize>| r.start <= a && b <= r.end).unwrap_or(false) { theme.accent_line } else { theme.accent_soft })
+            } else { None };
+        let underline = ed.marked.as_ref().filter(|m| a >= m.start && b <= m.end).map(|_| UnderlineStyle { color: Some(theme.dim), thickness: px(1.), wavy: false });
+        // 排版文本里 tab 被展开成 4 个空格，长度要按展开后计算
+        let len_disp = to_display(tabs, b - ls) - to_display(tabs, a - ls);
+        let _ = text;
+        runs.push(TextRun { len: len_disp, font: font.clone(), color, background_color: bg, underline, strikethrough: None });
+    }
+    runs
+}

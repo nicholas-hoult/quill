@@ -1,7 +1,5 @@
 /private
-node_modules
-dist
-target
+/target
 .worktrees/
 .claude/
 .DS_Store

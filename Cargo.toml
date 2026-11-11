@@ -1,0 +1,46 @@
+[package]
+name = "quill"
+version = "0.1.0"
+edition = "2024"
+description = "Quill：Rust + GPUI 的对话式 AI 编辑器"
+
+[dependencies]
+alacritty_terminal = "0.26.0"
+async-channel = "2.5.0"
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+ignore = "0.4.34"
+ropey = "1.6.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+similar = "3.2.1"
+tree-sitter = "0.27.2"
+tree-sitter-bash = "0.25.1"
+tree-sitter-css = "0.25.0"
+tree-sitter-go = "0.25.0"
+tree-sitter-highlight = "0.27.2"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-json = "0.24.8"
+tree-sitter-python = "0.25.0"
+tree-sitter-rust = "0.24.2"
+tree-sitter-typescript = "0.23.2"
+unicode-segmentation = "1.13.3"
+ureq = { version = "3.5.1", features = ["json"] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = 3
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.24"
+core-foundation = "0.10"
+png = "0.17"
+
+[dev-dependencies]
+tempfile = "3.27.0"
