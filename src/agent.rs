@@ -23,6 +23,8 @@ pub enum AgentEvent {
     OpenSettings,
     /// 在对话面板里切换了模型：工作区据此同步并保存设置
     ModelChanged { model: String, models: Vec<String> },
+    /// 检查点回退：按计划还原 / 删除这些文件（路径相对项目根）
+    Restore(Vec<(String, crate::checkpoint::Action)>),
 }
 
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize, Debug)]
@@ -49,6 +51,9 @@ pub struct Message {
     pub refs: Vec<String>,
     pub status: Status,
     pub applied: HashSet<usize>,
+    /// 检查点（#5）：这一轮里 Agent 改动过的文件在改动前的内容。只在内存里，不写进 threads.json
+    #[serde(skip)]
+    pub snapshots: Vec<crate::checkpoint::Snapshot>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -103,6 +108,9 @@ pub struct AgentPanel {
     /// 模型选择器是否展开，以及键盘选中的项
     model_menu: bool,
     model_sel: usize,
+    /// 正在确认回退的那条用户消息；以及已经回退过的（只用来显示「已恢复」）
+    restoring: Option<u64>,
+    restored: HashSet<u64>,
     _sub: Subscription,
 }
 
@@ -120,13 +128,13 @@ impl AgentPanel {
         let sub = cx.subscribe(&composer, |this, _, ev: &EditorEvent, cx| match ev {
             EditorEvent::Submit => this.send(cx),
             EditorEvent::Changed => this.update_mention(cx),
-            EditorEvent::Cancel => { if this.model_menu { this.close_model_menu(cx); } else if this.awaiting.is_some() { this.decide(Decision::Deny, cx); } else if this.cancel.is_some() { this.stop(cx); } }
+            EditorEvent::Cancel => { if this.restoring.is_some() { this.cancel_restore(cx); } else if this.model_menu { this.close_model_menu(cx); } else if this.awaiting.is_some() { this.decide(Decision::Deny, cx); } else if this.cancel.is_some() { this.stop(cx); } }
             _ => {}
         });
         let threads = load_threads();
         let active = 0;
         let next_id = threads.iter().flat_map(|t| t.messages.iter().map(|m| m.id)).max().unwrap_or(0) + 1;
-        Self { workspace, composer, threads, active, cancel: None, scroll: ScrollHandle::new(), stick: true, files: vec![], active_file: None, dropped: vec![], extra: vec![], mention: None, menu: false, settings, next_id, rounds: 0, expanded: HashSet::new(), hl_cache: Default::default(), rules_file: None, rules_root: None, awaiting: None, running: None, always_allow: false, model_menu: false, model_sel: 0, _sub: sub }
+        Self { workspace, composer, threads, active, cancel: None, scroll: ScrollHandle::new(), stick: true, files: vec![], active_file: None, dropped: vec![], extra: vec![], mention: None, menu: false, settings, next_id, rounds: 0, expanded: HashSet::new(), hl_cache: Default::default(), rules_file: None, rules_root: None, awaiting: None, running: None, always_allow: false, model_menu: false, model_sel: 0, restoring: None, restored: HashSet::new(), _sub: sub }
     }
 
     pub fn focus_composer(&self, window: &mut Window, cx: &App) { window.focus(&self.composer.read(cx).focus); }
@@ -137,6 +145,132 @@ impl AgentPanel {
             let keep: Vec<&Thread> = self.threads.iter().take(40).collect();
             let _ = std::fs::write(p, serde_json::to_string(&keep).unwrap_or_default());
         }
+    }
+
+    // ---------- 检查点（#5） ----------
+
+    /// 这条回复属于哪一轮：它之前最近的一条用户消息（用户消息自己就是自己的一轮）
+    fn owner_user(&self, msg_id: u64) -> Option<u64> {
+        let t = self.threads.iter().find(|t| t.messages.iter().any(|m| m.id == msg_id))?;
+        let i = t.messages.iter().position(|m| m.id == msg_id)?;
+        t.messages[..=i].iter().rev().find(|m| m.role == Role::User).map(|m| m.id)
+    }
+
+    /// 应用 Agent 的改动前，先把目标文件现在的内容记到所属那一轮的检查点里，再发出 Apply
+    fn emit_apply(&mut self, msg_id: u64, path: Option<String>, code: String, cx: &mut Context<Self>) {
+        if let (Some(rel), Some(owner)) = (path.clone().or_else(|| self.active_file.clone()), self.owner_user(msg_id)) {
+            let before = self.workspace.update(cx, |w, cx| {
+                let root = w.root_path();
+                let text = w.file_text_rel(&rel, cx);
+                // 读不到内容但文件存在（不是文本 / 没权限）：不能当成「新建」记下，否则回退会把它删掉
+                let exists = root.as_ref().map(|r| r.join(rel.trim_start_matches("./").trim_start_matches('/')).exists()).unwrap_or(true);
+                (text, exists)
+            }).ok();
+            if let Some((text, exists)) = before {
+                if text.is_some() || !exists {
+                    if let Some(m) = self.threads.iter_mut().flat_map(|t| t.messages.iter_mut()).find(|m| m.id == owner) {
+                        crate::checkpoint::record(&mut m.snapshots, &rel, text);
+                    }
+                }
+            }
+        }
+        cx.emit(AgentEvent::Apply { path, code });
+    }
+
+    /// 回退到某条用户消息之前要做的事：这条消息及之后各轮改过的文件，每个取最早的改动前内容
+    fn restore_plan(&self, user_id: u64) -> Vec<(String, crate::checkpoint::Action)> {
+        let Some(t) = self.threads.iter().find(|t| t.messages.iter().any(|m| m.id == user_id)) else { return vec![] };
+        let Some(start) = t.messages.iter().position(|m| m.id == user_id) else { return vec![] };
+        let turns: Vec<&[crate::checkpoint::Snapshot]> = t.messages[start..].iter().filter(|m| m.role == Role::User).map(|m| m.snapshots.as_slice()).collect();
+        crate::checkpoint::plan(&turns)
+    }
+
+    fn busy(&self) -> bool { self.cancel.is_some() || self.awaiting.is_some() }
+
+    fn begin_restore(&mut self, user_id: u64, cx: &mut Context<Self>) {
+        if self.busy() || self.restore_plan(user_id).is_empty() { return; }
+        self.model_menu = false;
+        self.mention = None;
+        self.restoring = Some(user_id);
+        self.composer.update(cx, |c, _| c.intercept = true);
+        cx.notify();
+    }
+
+    /// 命令面板：对最近一条改过文件的用户消息展开回退确认
+    pub fn restore_latest(&mut self, cx: &mut Context<Self>) {
+        let last = self.threads[self.active].messages.iter().rev().find(|m| m.role == Role::User && !m.snapshots.is_empty()).map(|m| m.id);
+        if let Some(id) = last { self.begin_restore(id, cx); }
+    }
+
+    fn cancel_restore(&mut self, cx: &mut Context<Self>) {
+        self.restoring = None;
+        self.composer.update(cx, |c, _| c.intercept = false);
+        cx.notify();
+    }
+
+    fn confirm_restore(&mut self, cx: &mut Context<Self>) {
+        let Some(uid) = self.restoring.take() else { return };
+        self.composer.update(cx, |c, _| c.intercept = false);
+        let plan = self.restore_plan(uid);
+        if plan.is_empty() { cx.notify(); return; }
+        // 回退之后，这条消息及之后各轮的快照描述的状态已不存在，清掉
+        if let Some(t) = self.threads.iter_mut().find(|t| t.messages.iter().any(|m| m.id == uid)) {
+            if let Some(start) = t.messages.iter().position(|m| m.id == uid) { for m in t.messages[start..].iter_mut() { m.snapshots.clear(); } }
+        }
+        self.restored.insert(uid);
+        cx.emit(AgentEvent::Restore(plan));
+        cx.notify();
+    }
+
+    /// 用户消息下方：「恢复到这条消息之前」按钮 / 确认卡片 / 「已恢复」标记
+    fn restore_row(&self, m: &Message, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if m.role != Role::User { return None; }
+        let t = cx.theme().clone();
+        let uid = m.id;
+        if self.restoring == Some(uid) {
+            let plan = self.restore_plan(uid);
+            let n = plan.len();
+            let rows = plan.iter().take(6).map(|(p, a)| {
+                let delete = matches!(a, crate::checkpoint::Action::Delete);
+                div().flex().items_center().gap(px(8.)).h(px(22.))
+                    .child(div().flex_none().px(px(6.)).h(px(17.)).flex().items_center().rounded(px(5.)).text_size(px(10.5)).bg(if delete { t.del_bg } else { t.press }).text_color(if delete { t.del } else { t.dim }).child(if delete { "删除" } else { "还原" }))
+                    .child(div().flex_1().min_w_0().truncate().font_family(MONO_FONT).text_size(px(12.)).text_color(t.text).child(p.clone()))
+            }).collect::<Vec<_>>();
+            return Some(
+                div().w_full().flex().flex_col().rounded(px(11.)).border_1().border_color(t.accent_line).bg(t.bg).overflow_hidden()
+                    .child(
+                        div().h(px(32.)).px(px(10.)).flex().items_center().gap(px(8.)).bg(t.elev).border_b_1().border_color(t.border).text_size(px(12.))
+                            .child(icon("undo", 14., t.accent))
+                            .child(div().text_color(t.text).font_weight(FontWeight::MEDIUM).child("恢复到这条消息之前"))
+                            .child(div().flex_1())
+                            .child(div().text_color(t.faint).child(format!("{n} 个文件"))),
+                    )
+                    .child(div().flex().flex_col().px(px(11.)).pt(px(8.)).children(rows).when(n > 6, |d| d.child(div().h(px(22.)).flex().items_center().text_size(px(12.)).text_color(t.faint).child(format!("…还有 {} 个", n - 6)))))
+                    .child(div().px(px(11.)).pt(px(6.)).pb(px(9.)).text_size(px(12.)).line_height(px(18.)).text_color(t.dim).child("这些文件会被还原并保存，包括你之后手动改过的部分；新建的文件会被删除。编辑器里可以用 ⌘Z 撤销。"))
+                    .child(
+                        div().flex().items_center().justify_end().gap(px(8.)).px(px(10.)).py(px(8.)).border_t_1().border_color(t.border).bg(t.elev)
+                            .child(btn(("restore-no", uid as usize), "取消  Esc", false, cx).h(px(26.)).px(px(12.)).on_click(cx.listener(|this, _, _, cx| this.cancel_restore(cx))))
+                            .child(btn(("restore-yes", uid as usize), "恢复  ↵", true, cx).h(px(26.)).px(px(12.)).on_click(cx.listener(|this, _, _, cx| this.confirm_restore(cx)))),
+                    )
+                    .into_any_element(),
+            );
+        }
+        if !m.snapshots.is_empty() && !self.busy() {
+            let n = self.restore_plan(uid).len();
+            let (faint, dim, hover) = (t.faint, t.dim, t.hover);
+            return Some(
+                div().id(("restore", uid as usize)).flex().items_center().gap(px(5.)).h(px(22.)).px(px(7.)).rounded(px(6.)).cursor_pointer().text_size(px(11.5)).text_color(faint)
+                    .hover(move |s| s.bg(hover).text_color(dim))
+                    .on_click(cx.listener(move |this, _, _, cx| this.begin_restore(uid, cx)))
+                    .child(icon("undo", 12., faint))
+                    .child(format!("恢复到这条消息之前 · {n} 个文件"))
+                    .into_any_element(),
+            );
+        }
+        if self.restored.contains(&uid) {
+            return Some(div().flex().items_center().gap(px(5.)).h(px(22.)).px(px(7.)).text_size(px(11.5)).text_color(t.faint).child(icon("check", 12., t.faint)).child("已恢复到这条消息之前").into_any_element());
+        }
+        None
     }
 
     fn model_choices(&self) -> Vec<crate::models::ModelChoice> {
@@ -248,7 +382,7 @@ impl AgentPanel {
         self.composer.update(cx, |c, cx| { c.clear(cx); c.intercept = false; });
         self.mention = None;
         self.extra.clear();
-        let user = Message { id: self.next_id, calls: vec![], role: Role::User, content: build_user_message(&text, &files), refs: files.iter().map(|f| f.0.clone()).collect(), status: Status::Done, applied: HashSet::new() };
+        let user = Message { id: self.next_id, calls: vec![], role: Role::User, content: build_user_message(&text, &files), refs: files.iter().map(|f| f.0.clone()).collect(), status: Status::Done, applied: HashSet::new(), snapshots: vec![] };
         self.next_id += 1;
         let first = self.threads[self.active].messages.is_empty();
         if first { self.thread().title = text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(26).collect(); }
@@ -262,7 +396,7 @@ impl AgentPanel {
     fn start_round(&mut self, cx: &mut Context<Self>) {
         let ai_id = self.next_id;
         self.next_id += 1;
-        self.thread().messages.push(Message { id: ai_id, calls: vec![], role: Role::Assistant, content: String::new(), refs: vec![], status: Status::Streaming, applied: HashSet::new() });
+        self.thread().messages.push(Message { id: ai_id, calls: vec![], role: Role::Assistant, content: String::new(), refs: vec![], status: Status::Streaming, applied: HashSet::new(), snapshots: vec![] });
         let msgs = &self.threads[self.active].messages;
         let last_user = msgs.iter().rposition(|m| m.role == Role::User);
         let hist: Vec<HistMsg> = msgs.iter().enumerate()
@@ -328,7 +462,7 @@ impl AgentPanel {
             let Some((i, name, input)) = next else { break };
             let result = match name.as_str() {
                 "edit_file" => match (input["path"].as_str(), input["content"].as_str()) {
-                    (Some(p), Some(c)) => { cx.emit(AgentEvent::Apply { path: Some(p.to_string()), code: c.to_string() }); "修改已放进编辑器，等待用户审阅（接受或拒绝）。".to_string() }
+                    (Some(p), Some(c)) => { self.emit_apply(msg_id, Some(p.to_string()), c.to_string(), cx); "修改已放进编辑器，等待用户审阅（接受或拒绝）。".to_string() }
                     _ => "错误：edit_file 需要 path 和 content".to_string(),
                 },
                 "diagnostics" => match &root {
@@ -415,15 +549,14 @@ impl AgentPanel {
     /// 应用最近一条回复里还没应用的代码块（⌘⇧↵）
     pub fn apply_latest(&mut self, cx: &mut Context<Self>) {
         let Some(m) = self.threads[self.active].messages.iter_mut().rev().find(|m| m.role == Role::Assistant && m.status == Status::Done) else { return };
+        let mid = m.id;
         let segs = blocks::parse_segments(&m.content);
         let mut todo = vec![];
         for (i, s) in segs.iter().enumerate() {
             if let Segment::Code { block, closed: true } = s { if !m.applied.contains(&i) && (block.path.is_some() || todo.is_empty()) { todo.push((i, block.clone())); } }
         }
-        for (i, b) in todo {
-            m.applied.insert(i);
-            cx.emit(AgentEvent::Apply { path: b.path.clone(), code: b.code.clone() });
-        }
+        for (i, _) in &todo { m.applied.insert(*i); }
+        for (_, b) in todo { self.emit_apply(mid, b.path.clone(), b.code.clone(), cx); }
         cx.notify();
     }
 
@@ -501,7 +634,7 @@ impl AgentPanel {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if !closed { return; }
                                 for m in this.threads.iter_mut().flat_map(|t| t.messages.iter_mut()) { if m.id == msg_id { m.applied.insert(ix); } }
-                                cx.emit(AgentEvent::Apply { path: apply_block.path.clone(), code: apply_block.code.clone() });
+                                this.emit_apply(msg_id, apply_block.path.clone(), apply_block.code.clone(), cx);
                                 cx.notify();
                             })).into_any_element()
                     }),
@@ -637,6 +770,7 @@ impl AgentPanel {
             Role::User => div().flex().flex_col().items_end().gap(px(6.)).mb(px(18.))
                 .when(!m.refs.is_empty(), |d| d.child(div().flex().flex_wrap().gap(px(5.)).justify_end().children(m.refs.iter().map(|r| chip(r, cx)))))
                 .child(div().max_w(px(340.)).px(px(13.)).py(px(9.)).rounded_tl(px(14.)).rounded_tr(px(14.)).rounded_bl(px(14.)).rounded_br(px(4.)).bg(t.elev).border_1().border_color(t.border).child(strip_context(&m.content).to_string()))
+                .when_some(self.restore_row(m, cx), |d, row| d.child(row))
                 .into_any_element(),
             Role::Assistant => {
                 let streaming = m.status == Status::Streaming;
@@ -661,7 +795,7 @@ impl AgentPanel {
                                     .child(btn(("apply-all", mid as usize), "全部应用", true, cx).h(px(24.)).on_click(cx.listener(move |this, _, _, cx| {
                                         for (i, b) in pending.clone() {
                                             for mm in this.threads.iter_mut().flat_map(|t| t.messages.iter_mut()) { if mm.id == mid { mm.applied.insert(i); } }
-                                            cx.emit(AgentEvent::Apply { path: b.path.clone(), code: b.code.clone() });
+                                            this.emit_apply(mid, b.path.clone(), b.code.clone(), cx);
                                         }
                                         cx.notify();
                                     }))),
@@ -702,7 +836,7 @@ impl Render for AgentPanel {
                 // ⌘↵：有命令在等确认就允许运行；否则交给后面的处理者（接受审阅）
                 if this.awaiting.is_some() { this.decide(Decision::Once, cx); } else { cx.propagate(); }
             }))
-            .on_action(cx.listener(|this, _: &crate::actions::Enter, _, cx| if this.model_menu { this.choose_model(this.model_sel, cx) } else { this.pick_mention(cx) }))
+            .on_action(cx.listener(|this, _: &crate::actions::Enter, _, cx| if this.restoring.is_some() { this.confirm_restore(cx) } else if this.model_menu { this.choose_model(this.model_sel, cx) } else { this.pick_mention(cx) }))
             .on_action(cx.listener(|this, _: &crate::actions::Tab, _, cx| if this.model_menu { this.choose_model(this.model_sel, cx) } else { this.pick_mention(cx) }))
             .child(
                 div().h(px(44.)).flex_none().px(px(12.)).flex().items_center().gap(px(6.)).border_b_1().border_color(t.border)

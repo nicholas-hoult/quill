@@ -6,6 +6,7 @@ mod tools;
 mod ai;
 mod assets;
 mod blocks;
+mod checkpoint;
 mod buffer;
 mod context;
 mod diff;

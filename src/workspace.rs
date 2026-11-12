@@ -192,6 +192,7 @@ impl Workspace {
         subs.push(cx.subscribe_in(&agent, window, |this, _, ev: &AgentEvent, window, cx| match ev {
             AgentEvent::Apply { path, code } => this.apply_code(path.clone(), code.clone(), window, cx),
             AgentEvent::OpenSettings => this.open_settings(window, cx),
+            AgentEvent::Restore(plan) => this.restore_files(plan.clone(), window, cx),
             AgentEvent::ModelChanged { model, models } => {
                 this.settings.model = model.clone();
                 this.settings.models = models.clone();
@@ -788,6 +789,52 @@ impl Workspace {
         }
     }
 
+    /// 检查点回退（#5）：把 Agent 改过的文件还原到改动前，并写盘；Agent 新建的文件删除。
+    /// 已打开的文件在编辑器里是一次可撤销的整体替换（⌘Z 能找回）。
+    fn restore_files(&mut self, plan: Vec<(String, crate::checkpoint::Action)>, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::checkpoint::Action;
+        let Some(root) = self.root.clone() else { return };
+        let (mut restored, mut deleted, mut failed) = (0usize, 0usize, vec![]);
+        for (rel, action) in plan {
+            // 路径来自模型：必须留在项目根内
+            let abs = match crate::tools::safe_path(&root, &rel) { Ok(p) => p.to_string_lossy().to_string(), Err(e) => { failed.push(format!("{rel}（{e}）")); continue; } };
+            match action {
+                Action::Restore(text) => {
+                    let tab = self.tabs.iter().position(|t| t.path == abs);
+                    if let Some(i) = tab {
+                        let ed = self.tabs[i].editor.clone();
+                        ed.update(cx, |e, cx| { e.reject_all(cx); e.set_text(&text, cx); });
+                    }
+                    if let Some(d) = Path::new(&abs).parent() { let _ = std::fs::create_dir_all(d); }
+                    match std::fs::write(&abs, &text) {
+                        Ok(()) => {
+                            if let Some(i) = tab { self.tabs[i].editor.update(cx, |e, cx| { e.mark_saved(); cx.notify(); }); }
+                            if let Ok(m) = std::fs::metadata(&abs) { self.stamps.insert(abs.clone(), (m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len())); }
+                            restored += 1;
+                        }
+                        Err(e) => failed.push(format!("{rel}（{e}）")),
+                    }
+                }
+                Action::Delete => {
+                    if let Some(i) = self.tabs.iter().position(|t| t.path == abs) { self.close_tab_now(i, window, cx); }
+                    match std::fs::remove_file(&abs) {
+                        Ok(()) => deleted += 1,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => deleted += 1,
+                        Err(e) => failed.push(format!("{rel}（{e}）")),
+                    }
+                }
+            }
+        }
+        self.refresh(cx);
+        let mut parts = vec![];
+        if restored > 0 { parts.push(format!("已恢复 {restored} 个文件")); }
+        if deleted > 0 { parts.push(format!("已删除 {deleted} 个新建的文件")); }
+        let mut msg = if parts.is_empty() { "没有需要恢复的文件".to_string() } else { parts.join("，") };
+        // 只有还原（编辑器里的整体替换）能 ⌘Z，删除文件不能
+        if failed.is_empty() { if restored > 0 { msg.push_str("（编辑器里 ⌘Z 可撤销还原）"); } self.toast(msg, false, cx); }
+        else { msg.push_str(&format!("；失败：{}", failed.join("、"))); self.toast(msg, true, cx); }
+    }
+
     /// 关闭标签页；有未保存改动时先确认，避免悄悄丢失
     fn close_tab(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(i) else { return };
@@ -900,7 +947,7 @@ impl Workspace {
             CommandItem { title: "切换侧栏", keys: "⌘B" }, CommandItem { title: "切换 AI 对话", keys: "⇧⌘A" }, CommandItem { title: "聚焦对话输入框", keys: "⌘L" },
             CommandItem { title: "在项目中搜索", keys: "⇧⌘F" }, CommandItem { title: "查看 Git 改动", keys: "" }, CommandItem { title: "就地改写（Inline Assist）", keys: "⌘K" },
             CommandItem { title: "在文件中查找", keys: "⌘F" }, CommandItem { title: "新建对话", keys: "" }, CommandItem { title: "打开设置", keys: "⌘," },
-            CommandItem { title: "切换深色 / 浅色", keys: "" }, CommandItem { title: "关闭当前标签页", keys: "⌘W" }, CommandItem { title: "应用最近的代码块", keys: "⇧⌘↵" }, CommandItem { title: "切换终端", keys: "⌘J" }, CommandItem { title: "跳转到符号", keys: "⇧⌘O" }, CommandItem { title: "跳转到行", keys: "⌃G" }, CommandItem { title: "查看符号大纲", keys: "" }, CommandItem { title: "查找并替换", keys: "⌥⌘F" }, CommandItem { title: "切换自动换行", keys: "⌥Z" }, CommandItem { title: "转到定义", keys: "F12" }, CommandItem { title: "显示悬停信息", keys: "⌘I" }, CommandItem { title: "触发补全", keys: "⌃Space" }, CommandItem { title: "查看问题", keys: "" }, CommandItem { title: "折叠全部", keys: "" }, CommandItem { title: "展开全部", keys: "" }, CommandItem { title: "折叠当前块", keys: "⌥⌘[" }, CommandItem { title: "向右拆分 / 取消拆分", keys: "⌘\\" }, CommandItem { title: "选中下一处相同内容", keys: "⌘D" }, CommandItem { title: "选中全部相同内容", keys: "⇧⌘L" },
+            CommandItem { title: "切换深色 / 浅色", keys: "" }, CommandItem { title: "关闭当前标签页", keys: "⌘W" }, CommandItem { title: "应用最近的代码块", keys: "⇧⌘↵" }, CommandItem { title: "切换终端", keys: "⌘J" }, CommandItem { title: "跳转到符号", keys: "⇧⌘O" }, CommandItem { title: "跳转到行", keys: "⌃G" }, CommandItem { title: "查看符号大纲", keys: "" }, CommandItem { title: "查找并替换", keys: "⌥⌘F" }, CommandItem { title: "切换自动换行", keys: "⌥Z" }, CommandItem { title: "转到定义", keys: "F12" }, CommandItem { title: "显示悬停信息", keys: "⌘I" }, CommandItem { title: "触发补全", keys: "⌃Space" }, CommandItem { title: "查看问题", keys: "" }, CommandItem { title: "折叠全部", keys: "" }, CommandItem { title: "展开全部", keys: "" }, CommandItem { title: "折叠当前块", keys: "⌥⌘[" }, CommandItem { title: "向右拆分 / 取消拆分", keys: "⌘\\" }, CommandItem { title: "选中下一处相同内容", keys: "⌘D" }, CommandItem { title: "选中全部相同内容", keys: "⇧⌘L" }, CommandItem { title: "恢复 Agent 最近一次改动之前的状态", keys: "" },
         ]
     }
 
@@ -960,6 +1007,7 @@ impl Workspace {
             28 => self.toggle_split(cx),
             29 => { if let Some(e) = self.active_editor() { e.update(cx, |e, cx| e.select_next(&SelectNext, window, cx)); } }
             30 => { if let Some(e) = self.active_editor() { e.update(cx, |e, cx| e.select_all_occurrences(&SelectAllOccurrences, window, cx)); } }
+            31 => { self.focus_agent(window, cx); self.agent.update(cx, |a, cx| a.restore_latest(cx)); }
             _ => {}
         }
     }

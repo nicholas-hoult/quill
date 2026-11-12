@@ -180,7 +180,7 @@ pub fn run_agent_stream(s: Settings, system: String, messages: Vec<serde_json::V
     };
     if s.provider == "mock" {
         std::thread::sleep(Duration::from_millis(250));
-        let events = crate::agent_proto::mock_turn(&messages).or_else(|| crate::agent_proto::mock_cmd_turn(&messages)).unwrap_or_else(|| vec![ProtoEvent::Text(mock_reply(&flatten_text_msgs(&messages))), ProtoEvent::Stop("end_turn".into())]);
+        let events = crate::agent_proto::mock_turn(&messages).or_else(|| crate::agent_proto::mock_cmd_turn(&messages)).or_else(|| crate::agent_proto::mock_new_file_turn(&messages)).unwrap_or_else(|| vec![ProtoEvent::Text(mock_reply(&flatten_text_msgs(&messages))), ProtoEvent::Stop("end_turn".into())]);
         let mut stop = String::from("end_turn");
         for ev in events {
             if cancel.load(Ordering::Relaxed) { return; }

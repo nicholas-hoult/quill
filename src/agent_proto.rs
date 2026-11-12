@@ -129,6 +129,21 @@ pub fn mock_cmd_turn(messages: &[Value]) -> Option<Vec<ProtoEvent>> {
     })
 }
 
+/// 新建文件演示：用户消息含 `[new-demo]` 时，提交一次对新文件 `notes/by_agent.txt` 的 edit_file，然后总结。
+pub fn mock_new_file_turn(messages: &[Value]) -> Option<Vec<ProtoEvent>> {
+    if !last_user_text(messages).contains("[new-demo]") { return None; }
+    let done = messages.iter().filter(|m| m["role"] == "user").filter_map(|m| m["content"].as_array()).filter_map(|a| a.first()).any(|b| b["type"] == "tool_result");
+    Some(if done {
+        vec![ProtoEvent::Text("新文件已经放进编辑器等你审阅。".into()), ProtoEvent::Stop("end_turn".into())]
+    } else {
+        vec![
+            ProtoEvent::Text("我新建一个笔记文件。".into()),
+            ProtoEvent::ToolUse { id: "toolu_new1".into(), name: "edit_file".into(), input: json!({ "path": "notes/by_agent.txt", "content": "由 Agent 新建\n" }) },
+            ProtoEvent::Stop("tool_use".into()),
+        ]
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +232,16 @@ mod tests {
         assert!(matches!(t2.last(), Some(ProtoEvent::Stop(s)) if s == "end_turn"));
         let f = mock_cmd_turn(&[u("[cmd-fail]")]).unwrap();
         assert!(matches!(&f[1], ProtoEvent::ToolUse { input, .. } if input["command"].as_str().unwrap().contains("exit 2")));
+    }
+
+    #[test]
+    fn 新建文件演示() {
+        let u = |t: &str| json!({"role":"user","content":t});
+        assert!(mock_new_file_turn(&[u("你好")]).is_none());
+        let t0 = mock_new_file_turn(&[u("[new-demo]")]).unwrap();
+        assert!(matches!(&t0[1], ProtoEvent::ToolUse { name, input, .. } if name == "edit_file" && input["path"] == "notes/by_agent.txt"));
+        let r = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_new1","content":"ok"}]});
+        let t1 = mock_new_file_turn(&[u("[new-demo]"), json!({"role":"assistant","content":[]}), r]).unwrap();
+        assert!(matches!(t1.last(), Some(ProtoEvent::Stop(s)) if s == "end_turn"));
     }
 }
