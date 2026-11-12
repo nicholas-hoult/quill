@@ -12,6 +12,7 @@ mod fuzzy;
 mod git;
 mod inline;
 mod md;
+mod outline;
 mod palette;
 mod settings_view;
 mod shot;

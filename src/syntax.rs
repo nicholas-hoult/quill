@@ -76,23 +76,31 @@ pub fn lang_label(l: Option<Lang>) -> &'static str {
     }
 }
 
+pub fn ts_language(lang: Lang) -> tree_sitter::Language {
+    match lang {
+        Lang::Rust => tree_sitter_rust::LANGUAGE.into(),
+        Lang::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+        Lang::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        Lang::Json => tree_sitter_json::LANGUAGE.into(),
+        Lang::Python => tree_sitter_python::LANGUAGE.into(),
+        Lang::Css => tree_sitter_css::LANGUAGE.into(),
+        Lang::Bash => tree_sitter_bash::LANGUAGE.into(),
+        Lang::Go => tree_sitter_go::LANGUAGE.into(),
+    }
+}
+
 fn build(lang: Lang) -> Option<HighlightConfiguration> {
     let (language, name, query): (tree_sitter::Language, &str, String) = match lang {
-        Lang::Rust => (tree_sitter_rust::LANGUAGE.into(), "rust", tree_sitter_rust::HIGHLIGHTS_QUERY.to_string()),
-        Lang::JavaScript => (tree_sitter_javascript::LANGUAGE.into(), "javascript", tree_sitter_javascript::HIGHLIGHT_QUERY.to_string()),
-        Lang::TypeScript => (
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), "typescript",
-            format!("{}\n{}", tree_sitter_javascript::HIGHLIGHT_QUERY, tree_sitter_typescript::HIGHLIGHTS_QUERY),
-        ),
-        Lang::Tsx => (
-            tree_sitter_typescript::LANGUAGE_TSX.into(), "tsx",
-            format!("{}\n{}", tree_sitter_javascript::HIGHLIGHT_QUERY, tree_sitter_typescript::HIGHLIGHTS_QUERY),
-        ),
-        Lang::Json => (tree_sitter_json::LANGUAGE.into(), "json", tree_sitter_json::HIGHLIGHTS_QUERY.to_string()),
-        Lang::Python => (tree_sitter_python::LANGUAGE.into(), "python", tree_sitter_python::HIGHLIGHTS_QUERY.to_string()),
-        Lang::Css => (tree_sitter_css::LANGUAGE.into(), "css", tree_sitter_css::HIGHLIGHTS_QUERY.to_string()),
-        Lang::Bash => (tree_sitter_bash::LANGUAGE.into(), "bash", tree_sitter_bash::HIGHLIGHT_QUERY.to_string()),
-        Lang::Go => (tree_sitter_go::LANGUAGE.into(), "go", tree_sitter_go::HIGHLIGHTS_QUERY.to_string()),
+        Lang::Rust => (ts_language(lang), "rust", tree_sitter_rust::HIGHLIGHTS_QUERY.to_string()),
+        Lang::JavaScript => (ts_language(lang), "javascript", tree_sitter_javascript::HIGHLIGHT_QUERY.to_string()),
+        Lang::TypeScript => (ts_language(lang), "typescript", format!("{}\n{}", tree_sitter_javascript::HIGHLIGHT_QUERY, tree_sitter_typescript::HIGHLIGHTS_QUERY)),
+        Lang::Tsx => (ts_language(lang), "tsx", format!("{}\n{}", tree_sitter_javascript::HIGHLIGHT_QUERY, tree_sitter_typescript::HIGHLIGHTS_QUERY)),
+        Lang::Json => (ts_language(lang), "json", tree_sitter_json::HIGHLIGHTS_QUERY.to_string()),
+        Lang::Python => (ts_language(lang), "python", tree_sitter_python::HIGHLIGHTS_QUERY.to_string()),
+        Lang::Css => (ts_language(lang), "css", tree_sitter_css::HIGHLIGHTS_QUERY.to_string()),
+        Lang::Bash => (ts_language(lang), "bash", tree_sitter_bash::HIGHLIGHT_QUERY.to_string()),
+        Lang::Go => (ts_language(lang), "go", tree_sitter_go::HIGHLIGHTS_QUERY.to_string()),
     };
     let mut cfg = HighlightConfiguration::new(language, name, &query, "", "").ok()?;
     cfg.configure(NAMES);

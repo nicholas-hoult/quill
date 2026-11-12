@@ -12,14 +12,14 @@ pub struct TreeRow {
     pub expanded: bool,
 }
 
-const HIDDEN: &[&str] = &[".git", ".DS_Store", "node_modules", "target", ".venv", "__pycache__"];
+const HIDDEN: &[&str] = &[".git", ".DS_Store", "node_modules", ".venv", "__pycache__", "dist", ".worktrees"];
 
 /// 读取一个目录：目录在前、文件在后，各自按名称（不区分大小写）排序。
 pub fn read_dir_sorted(dir: &Path) -> Vec<(String, bool)> {
     let mut v: Vec<(String, bool)> = std::fs::read_dir(dir)
         .map(|rd| rd.filter_map(|e| e.ok()).map(|e| (e.file_name().to_string_lossy().to_string(), e.file_type().map(|t| t.is_dir()).unwrap_or(false))).collect())
         .unwrap_or_default();
-    v.retain(|(n, _)| !HIDDEN.contains(&n.as_str()));
+    v.retain(|(n, _)| !HIDDEN.contains(&n.as_str()) && !n.starts_with("target"));
     v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.to_lowercase().cmp(&b.0.to_lowercase())));
     v
 }

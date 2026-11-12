@@ -19,7 +19,7 @@ actions!(
     [
         Save, CloseTab, NextTab, PrevTab, QuickOpen, CommandPalette, ToggleSidebar, ToggleTerminal, ToggleAgent,
         FocusAgent, ProjectSearch, OpenFolder, InlineAssist, AcceptReview, RejectReview, NewThread, OpenSettings, Quit,
-        ToggleTheme, ShowGit, ShowFiles, ApplyLatest,
+        ToggleTheme, ShowGit, ShowFiles, ApplyLatest, GotoSymbol, GotoLine, ShowOutline,
     ]
 );
 
@@ -93,6 +93,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-backspace", RejectReview, Some("Review")),
         KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-shift-o", GotoSymbol, None),
+        KeyBinding::new("ctrl-g", GotoLine, None),
         KeyBinding::new("cmd-shift-enter", ApplyLatest, None),
         KeyBinding::new("cmd-shift-e", ShowFiles, None),
         KeyBinding::new("cmd-shift-g", ShowGit, Some("Workspace")),

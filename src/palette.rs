@@ -10,10 +10,11 @@ pub enum PaletteEvent {
     Close,
     OpenFile(String),
     Command(usize),
+    GotoLine(usize),
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub enum PaletteMode { Files, Commands }
+pub enum PaletteMode { Files, Commands, Symbols, Line }
 
 pub struct CommandItem {
     pub title: &'static str,
@@ -36,6 +37,8 @@ pub struct Palette {
     files: Vec<String>,
     open_files: Vec<String>,
     commands: Vec<CommandItem>,
+    /// (名称, 类型标签, 行号)
+    symbols: Vec<(String, &'static str, usize)>,
     items: Vec<Item>,
     selected: usize,
     scroll: UniformListScrollHandle,
@@ -49,8 +52,8 @@ impl Focusable for Palette {
 }
 
 impl Palette {
-    pub fn new(mode: PaletteMode, files: Vec<String>, open_files: Vec<String>, commands: Vec<CommandItem>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let ph = if mode == PaletteMode::Files { "按文件名跳转…" } else { "输入命令…" };
+    pub fn new(mode: PaletteMode, files: Vec<String>, open_files: Vec<String>, commands: Vec<CommandItem>, symbols: Vec<(String, &'static str, usize)>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let ph = match mode { PaletteMode::Files => "按文件名跳转…", PaletteMode::Commands => "输入命令…", PaletteMode::Symbols => "跳转到符号…", PaletteMode::Line => "输入行号，回车跳转" };
         let input = cx.new(|cx| Editor::new(EditorMode::input(ph), cx));
         let sub = cx.subscribe(&input, |this, _, ev: &EditorEvent, cx| match ev {
             EditorEvent::Changed => { this.refilter(cx); }
@@ -59,7 +62,7 @@ impl Palette {
             _ => {}
         });
         window.focus(&input.read(cx).focus);
-        let mut p = Self { input, mode, files, open_files, commands, items: vec![], selected: 0, scroll: UniformListScrollHandle::new(), _sub: sub };
+        let mut p = Self { input, mode, files, open_files, commands, symbols, items: vec![], selected: 0, scroll: UniformListScrollHandle::new(), _sub: sub };
         p.refilter(cx);
         p
     }
@@ -77,6 +80,14 @@ impl Palette {
                     }
                 }
             }
+            PaletteMode::Symbols => {
+                for (i, (name, kind, line)) in self.symbols.iter().enumerate() {
+                    if let Some((s, hits)) = fuzzy_match(&q, name) {
+                        scored.push((s - i as f32 * 0.001, Item { label: name.clone(), sub: format!("{kind} · 第 {} 行", line + 1), keys: String::new(), hits, is_file: false, id: i }));
+                    }
+                }
+            }
+            PaletteMode::Line => {}
             PaletteMode::Commands => {
                 for (i, c) in self.commands.iter().enumerate() {
                     if let Some((s, hits)) = fuzzy_match(&q, c.title) {
@@ -92,10 +103,16 @@ impl Palette {
     }
 
     fn confirm(&mut self, cx: &mut Context<Self>) {
+        if self.mode == PaletteMode::Line {
+            if let Ok(n) = self.input.read(cx).text().trim().parse::<usize>() { cx.emit(PaletteEvent::GotoLine(n.saturating_sub(1))); }
+            return;
+        }
         let Some(it) = self.items.get(self.selected).cloned() else { return };
         match self.mode {
             PaletteMode::Files => cx.emit(PaletteEvent::OpenFile(self.files[it.id].clone())),
             PaletteMode::Commands => cx.emit(PaletteEvent::Command(it.id)),
+            PaletteMode::Symbols => cx.emit(PaletteEvent::GotoLine(self.symbols[it.id].2)),
+            PaletteMode::Line => {}
         }
     }
 
@@ -112,6 +129,7 @@ impl Render for Palette {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.theme().clone();
         let count = self.items.len();
+        let line_mode = self.mode == PaletteMode::Line;
         div()
             .id("palette-scrim")
             .absolute()
@@ -140,7 +158,9 @@ impl Render for Palette {
                     .overflow_hidden()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(div().h(px(52.)).px(px(20.)).flex().items_center().border_b_1().border_color(t.border).child(div().flex_1().child(self.input.clone())))
-                    .child(if count == 0 {
+                    .child(if line_mode {
+                        div().px(px(20.)).py(px(10.)).text_size(px(12.)).text_color(t.faint).child("输入行号后按回车").into_any_element()
+                    } else if count == 0 {
                         div().p(px(24.)).text_color(t.faint).flex().justify_center().child("没有匹配项").into_any_element()
                     } else {
                         uniform_list("palette-items", count, cx.processor(|this, range: std::ops::Range<usize>, _w, cx| {

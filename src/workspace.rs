@@ -7,6 +7,7 @@ use crate::git::{self, Change};
 use crate::palette::{CommandItem, Palette, PaletteEvent, PaletteMode};
 use crate::settings_view::{SettingsEvent, SettingsView};
 use crate::inline::{InlineAssist as InlineView, InlineEvent};
+use crate::outline::{self, Symbol};
 use crate::syntax;
 use crate::terminal::TerminalView;
 use crate::theme::{ActiveTheme, MONO_FONT, Theme, UI_FONT};
@@ -18,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Clone, Copy, PartialEq)]
-enum SideView { Files, Search, Git }
+enum SideView { Files, Search, Git, Outline }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Resize { Side, Agent, Term }
@@ -116,6 +117,7 @@ pub struct Workspace {
     term_h: f32,
     term_t: f32,
     search_input: Entity<Editor>,
+    commit_input: Entity<Editor>,
     search_hits: Vec<Hit>,
     search_scroll: UniformListScrollHandle,
     find_input: Entity<Editor>,
@@ -123,6 +125,9 @@ pub struct Workspace {
     inline: Option<Entity<InlineView>>,
     changes: Vec<Change>,
     branch: Option<String>,
+    symbols: Vec<Symbol>,
+    symbols_key: (String, u64),
+    outline_scroll: UniformListScrollHandle,
     pub settings: Settings,
     toasts: Vec<Toast>,
     toast_seq: u64,
@@ -149,11 +154,13 @@ impl Workspace {
         let agent = cx.new(|cx| AgentPanel::new(weak, settings.clone(), cx));
         let search_input = cx.new(|cx| Editor::new(EditorMode::input("在项目中搜索"), cx));
         let find_input = cx.new(|cx| Editor::new(EditorMode::input("查找"), cx));
+        let commit_input = cx.new(|cx| Editor::new(EditorMode::composer("提交信息…"), cx));
         let mut subs = vec![];
         subs.push(cx.subscribe_in(&agent, window, |this, _, ev: &AgentEvent, window, cx| match ev {
             AgentEvent::Apply { path, code } => this.apply_code(path.clone(), code.clone(), window, cx),
             AgentEvent::OpenSettings => this.open_settings(window, cx),
         }));
+        subs.push(cx.subscribe(&commit_input, |this, _, ev: &EditorEvent, cx| match ev { EditorEvent::Submit => this.do_commit(cx), EditorEvent::Changed => cx.notify(), _ => {} }));
         subs.push(cx.subscribe(&search_input, |this, _, ev: &EditorEvent, cx| if let EditorEvent::Changed = ev { this.run_search(cx) }));
         subs.push(cx.subscribe_in(&find_input, window, |this, input, ev: &EditorEvent, window, cx| match ev {
             EditorEvent::Changed => { let q = input.read(cx).text(); if let Some(e) = this.active_editor() { e.update(cx, |e, cx| e.set_search(Some(q), cx)); } }
@@ -164,8 +171,8 @@ impl Workspace {
         let mut this = Self {
             focus: cx.focus_handle(), root: None, files: vec![], tabs: vec![], active: None, expanded: HashSet::new(), rows: vec![], tree_scroll: UniformListScrollHandle::new(),
             selected: None, side_view: SideView::Files, sidebar: true, agent_open: true, side_w: 264.0, agent_w: 440.0, side_t: 1.0, agent_t: 1.0, resizing: None,
-            overlay: Overlay::None, menu: None, agent, terminal: None, term_open: false, term_h: 280.0, term_t: 0.0, search_input, search_hits: vec![], search_scroll: UniformListScrollHandle::new(), find_input, find_open: false,
-            inline: None, changes: vec![], branch: None, settings, toasts: vec![], toast_seq: 0, recents: load_recents(), _subs: subs,
+            overlay: Overlay::None, menu: None, agent, terminal: None, term_open: false, term_h: 280.0, term_t: 0.0, search_input, commit_input, search_hits: vec![], search_scroll: UniformListScrollHandle::new(), find_input, find_open: false,
+            inline: None, changes: vec![], branch: None, symbols: vec![], symbols_key: (String::new(), u64::MAX), outline_scroll: UniformListScrollHandle::new(), settings, toasts: vec![], toast_seq: 0, recents: load_recents(), _subs: subs,
         };
         this.apply_theme(window, cx);
         this
@@ -180,6 +187,15 @@ impl Workspace {
     // ---------- 工具 ----------
 
     fn active_editor(&self) -> Option<Entity<Editor>> { self.active.and_then(|i| self.tabs.get(i)).map(|t| t.editor.clone()) }
+
+    /// 当前文件的符号列表（按文本版本缓存）
+    fn ensure_symbols(&mut self, cx: &mut Context<Self>) {
+        let Some(ed) = self.active_editor() else { self.symbols.clear(); self.symbols_key = (String::new(), u64::MAX); return };
+        let (path, ver, lang) = ed.read_with(cx, |e, _| (e.path.clone().unwrap_or_default(), e.buffer.version, e.lang));
+        if self.symbols_key == (path.clone(), ver) { return; }
+        self.symbols_key = (path, ver);
+        self.symbols = match lang { Some(l) if ed.read(cx).buffer.len() < 400_000 => outline::symbols(l, &ed.read(cx).text()), _ => vec![] };
+    }
 
     pub fn file_text_rel(&self, rel: &str, cx: &App) -> Option<String> {
         let root = self.root.as_ref()?;
@@ -398,22 +414,26 @@ impl Workspace {
             CommandItem { title: "切换侧栏", keys: "⌘B" }, CommandItem { title: "切换 AI 对话", keys: "⇧⌘A" }, CommandItem { title: "聚焦对话输入框", keys: "⌘L" },
             CommandItem { title: "在项目中搜索", keys: "⇧⌘F" }, CommandItem { title: "查看 Git 改动", keys: "" }, CommandItem { title: "就地改写（Inline Assist）", keys: "⌘K" },
             CommandItem { title: "在文件中查找", keys: "⌘F" }, CommandItem { title: "新建对话", keys: "" }, CommandItem { title: "打开设置", keys: "⌘," },
-            CommandItem { title: "切换深色 / 浅色", keys: "" }, CommandItem { title: "关闭当前标签页", keys: "⌘W" }, CommandItem { title: "应用最近的代码块", keys: "⇧⌘↵" }, CommandItem { title: "切换终端", keys: "⌘J" },
+            CommandItem { title: "切换深色 / 浅色", keys: "" }, CommandItem { title: "关闭当前标签页", keys: "⌘W" }, CommandItem { title: "应用最近的代码块", keys: "⇧⌘↵" }, CommandItem { title: "切换终端", keys: "⌘J" }, CommandItem { title: "跳转到符号", keys: "⇧⌘O" }, CommandItem { title: "跳转到行", keys: "⌃G" }, CommandItem { title: "查看符号大纲", keys: "" },
         ]
     }
 
     fn open_palette(&mut self, mode: PaletteMode, window: &mut Window, cx: &mut Context<Self>) {
         let files = self.files.clone();
         let open: Vec<String> = self.tabs.iter().map(|t| self.rel(&t.path)).collect();
-        let p = cx.new(|cx| Palette::new(mode, files, open, Self::commands(), window, cx));
+        self.ensure_symbols(cx);
+        let syms: Vec<(String, &'static str, usize)> = self.symbols.iter().map(|s| (format!("{}{}", "  ".repeat(s.depth), s.name), s.kind, s.line)).collect();
+        let p = cx.new(|cx| Palette::new(mode, files, open, Self::commands(), syms, window, cx));
         let sub = cx.subscribe_in(&p, window, |this, _, ev: &PaletteEvent, window, cx| {
             this.overlay = Overlay::None;
+            // 先把焦点还给编辑器 / 工作区，再处理事件（命令可能会再打开别的浮层并抢焦点）
+            if let Some(e) = this.active_editor() { window.focus(&e.read(cx).focus); } else { window.focus(&this.focus); }
             match ev {
                 PaletteEvent::Close => {}
                 PaletteEvent::OpenFile(rel) => { if let Some(r) = this.root.clone() { this.open_file(&r.join(rel).to_string_lossy(), None, window, cx); } }
                 PaletteEvent::Command(i) => this.run_command(*i, window, cx),
+                PaletteEvent::GotoLine(n) => { if let Some(e) = this.active_editor() { e.update(cx, |e, cx| e.scroll_to_line(*n, cx)); window.focus(&e.read(cx).focus); } }
             }
-            if let Some(e) = this.active_editor() { if matches!(ev, PaletteEvent::Close) { window.focus(&e.read(cx).focus); } } else { window.focus(&this.focus); }
             cx.notify();
         });
         self._subs.push(sub);
@@ -439,6 +459,9 @@ impl Workspace {
             13 => { if let Some(a) = self.active { self.close_tab(a, window, cx); } }
             14 => self.agent.update(cx, |a, cx| a.apply_latest(cx)),
             15 => self.toggle_terminal(window, cx),
+            16 => self.open_palette(PaletteMode::Symbols, window, cx),
+            17 => self.open_palette(PaletteMode::Line, window, cx),
+            18 => { self.sidebar = true; self.side_view = SideView::Outline; cx.notify(); }
             _ => {}
         }
     }
@@ -578,7 +601,7 @@ impl Workspace {
 
     fn sidebar_view(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.theme().clone();
-        let tabs = [(SideView::Files, "文件"), (SideView::Search, "搜索"), (SideView::Git, "改动")];
+        let tabs = [(SideView::Files, "文件"), (SideView::Search, "搜索"), (SideView::Git, "改动"), (SideView::Outline, "大纲")];
         let nchanges = self.changes.len();
         div().size_full().flex().flex_col()
             .child(div().flex().gap(px(2.)).px(px(10.)).pt(px(8.)).pb(px(6.)).children(tabs.iter().map(|(v, label)| {
@@ -593,6 +616,7 @@ impl Workspace {
                 SideView::Files => self.file_tree(cx).into_any_element(),
                 SideView::Search => self.search_panel(cx).into_any_element(),
                 SideView::Git => self.git_panel(cx).into_any_element(),
+                SideView::Outline => self.outline_panel(cx).into_any_element(),
             })
     }
 
@@ -647,19 +671,120 @@ impl Workspace {
             })
     }
 
+    fn outline_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = cx.theme().clone();
+        self.ensure_symbols(cx);
+        let n = self.symbols.len();
+        if n == 0 { return div().p(px(24.)).text_color(t.faint).flex().justify_center().child(if self.active.is_none() { "先打开一个文件" } else { "这个文件没有可识别的符号" }).into_any_element(); }
+        uniform_list("outline", n, cx.processor(|this, range: std::ops::Range<usize>, _w, cx| {
+            let t = cx.theme().clone();
+            range.map(|ix| {
+                let s = this.symbols[ix].clone();
+                let line = s.line;
+                let col = match s.kind { "fn" => t.syntax(syntax::Kind::Function), "struct" | "class" | "interface" | "enum" | "trait" | "type" => t.syntax(syntax::Kind::Type), _ => t.dim };
+                div().id(("sym", ix)).h(px(26.)).mx(px(6.)).pl(px(8. + s.depth as f32 * 14.)).pr(px(8.)).flex().items_center().gap(px(8.)).rounded(px(6.)).cursor_pointer().text_color(t.dim).hover(|st| st.bg(t.hover).text_color(t.text))
+                    .on_click(cx.listener(move |this, _, window, cx| { if let Some(e) = this.active_editor() { e.update(cx, |e, cx| e.scroll_to_line(line, cx)); window.focus(&e.read(cx).focus); } }))
+                    .child(div().w(px(52.)).flex_none().text_size(px(10.5)).font_family(MONO_FONT).text_color(col).child(s.kind))
+                    .child(div().flex_1().min_w_0().truncate().font_family(MONO_FONT).text_size(px(12.5)).child(s.name.clone()))
+                    .child(div().text_size(px(11.)).text_color(t.faint).child((s.line + 1).to_string()))
+            }).collect::<Vec<_>>()
+        })).track_scroll(self.outline_scroll.clone()).flex_1().pb(px(10.)).into_any_element()
+    }
+
+    fn breadcrumbs(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let t = cx.theme().clone();
+        let ed = self.active_editor()?;
+        self.ensure_symbols(cx);
+        let (path, line) = ed.read_with(cx, |e, _| (e.path.clone().unwrap_or_default(), e.cursor_line_col().0 - 1));
+        let rel = self.rel(&path);
+        let mut parts: Vec<(String, bool)> = rel.split('/').map(|s| (s.to_string(), false)).collect();
+        for s in outline::path_at(&self.symbols, line) { parts.push((s.name.clone(), true)); }
+        let last = parts.len().saturating_sub(1);
+        Some(div().h(px(26.)).flex_none().px(px(16.)).flex().items_center().gap(px(6.)).text_size(px(12.)).text_color(t.faint).overflow_hidden()
+            .children(parts.into_iter().enumerate().flat_map(|(i, (p, sym))| {
+                let mut v: Vec<AnyElement> = vec![];
+                if i > 0 { v.push(icon("chevron", 9., t.faint).into_any_element()); }
+                v.push(div().whitespace_nowrap().text_color(if i == last { t.text } else if sym { t.accent } else { t.dim }).font_family(if sym { MONO_FONT } else { crate::theme::UI_FONT }).child(p).into_any_element());
+                v
+            })).into_any_element())
+    }
+
+    fn git_op(&mut self, ok_msg: &'static str, f: impl FnOnce(String) -> Result<String, String> + Send + 'static, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else { return };
+        let r = root.to_string_lossy().to_string();
+        cx.spawn(async move |this, cx| {
+            let res = cx.background_executor().spawn(async move { f(r) }).await;
+            let _ = this.update(cx, |w, cx| {
+                match res {
+                    Ok(_) => { if !ok_msg.is_empty() { w.toast(ok_msg, false, cx); } }
+                    Err(e) => w.toast(format!("Git：{}", e.lines().next().unwrap_or("失败")), true, cx),
+                }
+                w.refresh(cx);
+                w.reload_heads(cx);
+            });
+        }).detach();
+    }
+
+    /// 提交 / 暂存之后，已打开文件相对 HEAD 的改动条要重新取基线
+    fn reload_heads(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else { return };
+        for t in &self.tabs {
+            let (rel, ed, r) = (self.rel(&t.path), t.editor.clone(), root.to_string_lossy().to_string());
+            cx.spawn(async move |_, cx| {
+                let head = cx.background_executor().spawn(async move { git::head_content(&r, &rel) }).await;
+                let _ = ed.update(cx, |e, cx| e.set_head(head, cx));
+            }).detach();
+        }
+    }
+
+    fn do_commit(&mut self, cx: &mut Context<Self>) {
+        let msg = self.commit_input.read(cx).text();
+        if !self.changes.iter().any(|c| c.staged) { self.toast("没有已暂存的改动：先点文件前的圆圈暂存", true, cx); return; }
+        if msg.trim().is_empty() { self.toast("请先写提交信息", true, cx); return; }
+        self.commit_input.update(cx, |e, cx| e.clear(cx));
+        self.git_op("已提交", move |r| git::commit(&r, &msg), cx);
+    }
+
     fn git_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.theme().clone();
-        div().flex_1().min_h_0().flex().flex_col().px(px(6.))
+        let staged: Vec<Change> = self.changes.iter().filter(|c| c.staged).cloned().collect();
+        let unstaged: Vec<Change> = self.changes.iter().filter(|c| !c.staged).cloned().collect();
+        let can_commit = !staged.is_empty() && !self.commit_input.read(cx).is_empty();
+        let row = |i: usize, c: &Change, is_staged: bool, cx: &mut Context<Self>| {
+            let t = cx.theme().clone();
+            let (open_path, op_path) = (c.path.clone(), c.path.clone());
+            let name = c.path.rsplit('/').next().unwrap_or(&c.path).to_string();
+            let col = match c.status { 'D' => t.del, 'M' => t.modified, _ => t.add };
+            div().id(("chg", i + if is_staged { 10_000 } else { 0 })).h(px(28.)).px(px(8.)).flex().items_center().gap(px(8.)).rounded(px(6.)).cursor_pointer().text_color(t.dim).hover(|s| s.bg(t.hover).text_color(t.text))
+                .on_click(cx.listener(move |this, _, window, cx| { if let Some(r) = this.root.clone() { this.open_file(&r.join(&open_path).to_string_lossy(), None, window, cx); } }))
+                .child(
+                    div().id(("stg", i + if is_staged { 10_000 } else { 0 })).size(px(16.)).flex_none().rounded(px(5.)).flex().items_center().justify_center().border_1().cursor_pointer()
+                        .border_color(if is_staged { t.accent } else { t.border_strong }).when(is_staged, |d| d.bg(t.accent))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            let p = op_path.clone();
+                            if is_staged { this.git_op("", move |r| git::unstage(&r, &p).map(|_| String::new()), cx) } else { this.git_op("", move |r| git::stage(&r, &p).map(|_| String::new()), cx) }
+                        }))
+                        .child(icon("check", 11., if is_staged { t.accent_ink } else { t.bg })),
+                )
+                .child(file_icon(&name, cx))
+                .child(div().flex_1().min_w_0().truncate().child(c.path.clone()))
+                .child(div().text_size(px(10.)).font_family(MONO_FONT).font_weight(FontWeight::BOLD).text_color(col).child(if c.status == '?' { "U".to_string() } else { c.status.to_string() }))
+        };
+        let group_title = |label: String, cx: &mut Context<Self>| { let t = cx.theme().clone(); div().px(px(8.)).pt(px(10.)).pb(px(4.)).text_size(px(11.5)).text_color(t.faint).font_weight(FontWeight::MEDIUM).child(label) };
+        div().flex_1().min_h_0().flex().flex_col().px(px(6.)).overflow_hidden()
             .child(div().px(px(8.)).py(px(6.)).flex().items_center().gap(px(6.)).child(icon("branch", 14., t.dim)).child(div().font_weight(FontWeight::MEDIUM).child(self.branch.clone().unwrap_or_else(|| "非 Git 仓库".into()))).child(div().text_color(t.faint).child(format!("· {} 处改动", self.changes.len()))))
-            .children(self.changes.iter().enumerate().map(|(i, c)| {
-                let path = c.path.clone();
-                let name = c.path.rsplit('/').next().unwrap_or(&c.path).to_string();
-                let col = match c.status { 'D' => t.del, 'M' => t.modified, _ => t.add };
-                div().id(("chg", i)).h(px(26.)).px(px(8.)).flex().items_center().gap(px(8.)).rounded(px(6.)).cursor_pointer().text_color(t.dim).hover(|s| s.bg(t.hover).text_color(t.text))
-                    .on_click(cx.listener(move |this, _, window, cx| { if let Some(r) = this.root.clone() { this.open_file(&r.join(&path).to_string_lossy(), None, window, cx); } }))
-                    .child(file_icon(&name, cx)).child(div().flex_1().min_w_0().truncate().child(c.path.clone())).child(div().text_size(px(10.)).font_family(MONO_FONT).font_weight(FontWeight::BOLD).text_color(col).child(if c.status == '?' { "U".to_string() } else { c.status.to_string() }))
-            }))
-            .when(self.changes.is_empty(), |d| d.child(div().p(px(20.)).text_color(t.faint).flex().justify_center().child("工作区干净")))
+            .when(self.branch.is_some(), |d| d.child(
+                div().mx(px(4.)).mb(px(4.)).p(px(8.)).flex().flex_col().gap(px(8.)).rounded(px(10.)).bg(t.elev).border_1().border_color(t.border)
+                    .child(self.commit_input.clone())
+                    .child(div().flex().gap(px(6.))
+                        .child(btn("commit-btn", &format!("提交（{}）", staged.len()), true, cx).h(px(26.)).flex_1().when(!can_commit, |d| d.opacity(0.45)).on_click(cx.listener(|this, _, _, cx| this.do_commit(cx))))
+                        .child(btn("stage-all", "全部暂存", false, cx).h(px(26.)).on_click(cx.listener(|this, _, _, cx| this.git_op("", |r| git::stage_all(&r).map(|_| String::new()), cx))))),
+            ))
+            .child(div().id("git-list").flex_1().min_h_0().overflow_y_scroll()
+                .when(!staged.is_empty(), |d| d.child(group_title(format!("已暂存 · {}", staged.len()), cx)).children(staged.iter().enumerate().map(|(i, c)| row(i, c, true, cx))))
+                .when(!unstaged.is_empty(), |d| d.child(group_title(format!("改动 · {}", unstaged.len()), cx)).children(unstaged.iter().enumerate().map(|(i, c)| row(i, c, false, cx))))
+                .when(self.changes.is_empty(), |d| d.child(div().p(px(20.)).text_color(t.faint).flex().justify_center().child("工作区干净"))))
     }
 
     fn tabs_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -821,6 +946,7 @@ impl Render for Workspace {
         } else {
             div().flex_1().min_w_0().flex().flex_col().bg(t.bg)
                 .child(self.tabs_bar(cx))
+                .children(self.breadcrumbs(cx))
                 .child(match &editor {
                     Some(e) => div().flex_1().min_h_0().relative().child(e.clone()).when(self.find_open, |d| d.child(self.find_bar(cx))).children(review).when_some(self.inline.clone(), |d, i| d.child(i)).into_any_element(),
                     None => div().flex_1().flex().items_center().justify_center().flex_col().gap(px(6.)).child(div().text_size(px(26.)).font_weight(FontWeight::BOLD).child("选一个文件开始")).child(div().text_color(t.dim).child("⌘P 跳转文件 · ⌘L 和 AI 对话")).into_any_element(),
@@ -849,6 +975,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &QuickOpen, window, cx| this.open_palette(PaletteMode::Files, window, cx)))
             .on_action(cx.listener(|this, _: &CommandPalette, window, cx| this.open_palette(PaletteMode::Commands, window, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| { this.sidebar = !this.sidebar; cx.notify(); }))
+            .on_action(cx.listener(|this, _: &GotoSymbol, window, cx| this.open_palette(PaletteMode::Symbols, window, cx)))
+            .on_action(cx.listener(|this, _: &GotoLine, window, cx| this.open_palette(PaletteMode::Line, window, cx)))
+            .on_action(cx.listener(|this, _: &ShowOutline, _, cx| { this.sidebar = true; this.side_view = SideView::Outline; cx.notify(); }))
             .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| this.toggle_terminal(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleAgent, _, cx| { this.agent_open = !this.agent_open; cx.notify(); }))
             .on_action(cx.listener(|this, _: &FocusAgent, window, cx| this.focus_agent(window, cx)))
