@@ -80,7 +80,8 @@ pub struct Editor {
     pub mode: EditorMode,
     pub path: Option<String>,
     pub buffer: Buffer,
-    saved_text: String,
+    /// 上次保存 / 打开时的内容（rope 快照，克隆不复制文本）
+    saved: ropey::Rope,
     saved_version: u64,
     dirty_cache: Cell<(u64, bool)>,
     edit_id: u64,
@@ -161,7 +162,7 @@ impl Editor {
             mode,
             path: None,
             buffer: Buffer::new(""),
-            saved_text: String::new(),
+            saved: ropey::Rope::new(),
             saved_version: 0,
             dirty_cache: Cell::new((u64::MAX, false)),
             edit_id: { static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1); NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) },
@@ -224,7 +225,7 @@ impl Editor {
         self.lang = path.as_deref().and_then(syntax::lang_for_path);
         self.path = path;
         self.buffer = Buffer::new(text);
-        self.saved_text = text.to_string();
+        self.saved = self.buffer.snapshot();
         self.saved_version = self.buffer.version;
         self.sel = 0..0;
         self.scroll_y = 0.0;
@@ -249,21 +250,21 @@ impl Editor {
         if v == self.saved_version { return false; }
         let (cv, cd) = self.dirty_cache.get();
         if cv == v { return cd; }
-        let d = self.buffer.len() != self.saved_text.len() || self.buffer.text() != self.saved_text;
+        let d = self.buffer.len() != self.saved.len_bytes() || self.buffer.snapshot() != self.saved;
         self.dirty_cache.set((v, d));
         d
     }
 
-    pub fn mark_saved(&mut self) { self.saved_text = self.buffer.text(); self.saved_version = self.buffer.version; }
+    pub fn mark_saved(&mut self) { self.saved = self.buffer.snapshot(); self.saved_version = self.buffer.version; }
 
     /// 磁盘上的内容和上次保存 / 打开时不一样
-    pub fn disk_differs(&self, disk: &str) -> bool { disk != self.saved_text }
+    pub fn disk_differs(&self, disk: &str) -> bool { self.saved.len_bytes() != disk.len() || self.saved.slice(..) != disk }
 
     /// 文件在外部被修改且这里没有未保存的改动：直接换成磁盘内容，保留光标和滚动位置
     pub fn reload_from_disk(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
         if self.is_dirty() || self.review.is_some() { return false; }
         self.buffer = Buffer::new(text);
-        self.saved_text = text.to_string();
+        self.saved = self.buffer.snapshot();
         self.saved_version = self.buffer.version;
         self.spans.clear();
         self.analysis_requested = u64::MAX;

@@ -505,16 +505,22 @@ impl Element for EditorElement {
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             if mode_gutter { window.paint_quad(fill(bounds, theme.bg)); }
             for (b, c) in &pre.row_bgs { window.paint_quad(fill(*b, *c)); }
+            let (mut t_bg, mut t_tx) = (0u128, 0u128);
             for r in &rows {
                 let origin = point(text_left, r.y);
                 match (&r.kind, &r.shaped) {
                     (_, Some(s)) => {
+                        let a = std::time::Instant::now();
                         let _ = s.paint_background(origin, lhp, TextAlign::Left, None, window, cx);
+                        t_bg += a.elapsed().as_micros();
+                        let b = std::time::Instant::now();
                         let _ = s.paint(origin, lhp, TextAlign::Left, None, window, cx);
+                        t_tx += b.elapsed().as_micros();
                     }
                     _ => {}
                 }
             }
+            if AFTER_OPEN.load(std::sync::atomic::Ordering::Relaxed) > 0 { eprintln!("[perf] paint 内部：行背景 {}µs  文字 {}µs  共 {} 行", t_bg, t_tx, rows.len()); }
             for b in &pre.eol_marks { window.paint_quad(fill(*b, theme.selection)); }
             for (b, sh) in &pre.chips {
                 window.paint_quad(quad(*b, px(5.), theme.press, px(1.), theme.border, BorderStyle::default()));

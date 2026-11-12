@@ -142,6 +142,8 @@ pub struct Workspace {
     focus_right: bool,
     warned_external: HashSet<String>,
     stamps: HashMap<String, (std::time::SystemTime, u64)>,
+    /// 字形图集预热：启动后前几帧各画一遍不可见的样例文字
+    warm_frames: u8,
     inline: Option<Entity<InlineView>>,
     changes: Vec<Change>,
     branch: Option<String>,
@@ -223,7 +225,7 @@ impl Workspace {
         let mut this = Self {
             focus: cx.focus_handle(), root: None, files: vec![], tabs: vec![], active: None, expanded: HashSet::new(), rows: vec![], tree_scroll: UniformListScrollHandle::new(),
             selected: None, side_view: SideView::Files, sidebar: settings.sidebar, agent_open: settings.agent_open, side_w: settings.side_w.clamp(180.0, 520.0), agent_w: settings.agent_w.clamp(320.0, 900.0), side_t: if settings.sidebar { 1.0 } else { 0.0 }, agent_t: if settings.agent_open { 1.0 } else { 0.0 }, resizing: None,
-            overlay: Overlay::None, menu: None, agent, terminal: None, term_open: false, term_h: settings.term_h.clamp(120.0, 620.0), term_t: 0.0, search_input, commit_input, search_hits: vec![], search_scroll: UniformListScrollHandle::new(), find_input, replace_input, find_replace: false, find_open: false, tabs_scroll: ScrollHandle::new(), split: false, left_tab: 0, right_tab: 0, focus_right: false, warned_external: HashSet::new(), stamps: HashMap::new(),
+            overlay: Overlay::None, menu: None, agent, terminal: None, term_open: false, term_h: settings.term_h.clamp(120.0, 620.0), term_t: 0.0, search_input, commit_input, search_hits: vec![], search_scroll: UniformListScrollHandle::new(), find_input, replace_input, find_replace: false, find_open: false, tabs_scroll: ScrollHandle::new(), split: false, left_tab: 0, right_tab: 0, focus_right: false, warned_external: HashSet::new(), stamps: HashMap::new(), warm_frames: 3,
             inline: None, changes: vec![], branch: None, lsp_tx, lsp: HashMap::new(), lsp_ready: HashSet::new(), diags: HashMap::new(), doc_versions: HashMap::new(), change_seq: HashMap::new(), last_len: HashMap::new(), hover: None, completion: None, comp_seq: 0, symbols: vec![], symbols_key: (String::new(), u64::MAX), outline_scroll: UniformListScrollHandle::new(), settings, toasts: vec![], toast_seq: 0, recents: load_recents(), _subs: subs,
         };
         this.apply_theme(window, cx);
@@ -522,6 +524,22 @@ impl Workspace {
     /// 开发脚本用：对当前编辑器做一次鼠标按下（和真实点击走同一条代码路径）
     pub fn debug_click(&mut self, x: f32, y: f32, clicks: usize, cx: &mut Context<Self>) {
         if let Some(e) = self.active_editor() { e.update(cx, |e, cx| { e.mouse_down(point(px(x), px(y)), clicks, false, cx); e.dragging = false; }); }
+    }
+
+    /// 近乎透明的样例文字，铺在最底层（会被后面不透明的界面盖住），让字形栅格化进图集（见 warm_frames）。
+    /// 不能裁剪：被裁掉的字形不会栅格化，预热就没有效果。
+    fn warm_element(t: &Theme) -> Div {
+        let ascii: String = (32u8..127).map(|c| c as char).collect();
+        let cjk = "文件搜索改动大纲问题对话终端设置编辑保存关闭打开项目命令跳转符号折叠拆分查找替换提交暂存应用拒绝接受全部审阅模型发送停止复制已的是在有和不这我你他个为中上下来到说要会可以";
+        let mut col = div().absolute().left(px(0.)).top(px(0.)).w(px(1100.)).flex().flex_col().whitespace_nowrap().text_color(hsla(0., 0., t.text.l, 0.004));
+        for (family, size) in [(MONO_FONT, 13.0f32), (MONO_FONT, 12.0), (UI_FONT, 13.0), (UI_FONT, 12.0), (UI_FONT, 11.5)] {
+            // 同一串文字用不同的亚像素偏移各画一遍（字形栅格化按亚像素位置分版本）
+            for off in [0.0f32, 0.25, 0.5, 0.75] {
+                col = col.child(div().ml(px(off)).font_family(family).text_size(px(size)).child(ascii.clone()));
+            }
+            col = col.child(div().font_family(family).text_size(px(size)).child(cjk.to_string()));
+        }
+        col
     }
 
     pub fn root_path(&self) -> Option<PathBuf> { self.root.clone() }
@@ -1426,6 +1444,7 @@ impl Render for Workspace {
             if d.abs() > 0.003 { *cur += d * 0.28; animating = true; } else { *cur = target; }
         }
         if animating { window.request_animation_frame(); }
+        let warm = if self.warm_frames > 0 { self.warm_frames -= 1; window.request_animation_frame(); Some(Self::warm_element(&t)) } else { None };
 
         let editor = self.active_editor();
         let review = editor.as_ref().and_then(|e| self.review_bar(e, cx));
@@ -1526,6 +1545,7 @@ impl Render for Workspace {
                 }
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| { if this.resizing.take().is_some() { this.save_layout(); cx.notify(); } }))
+            .children(warm)
             .child(self.titlebar(cx))
             .child(
                 div().flex_1().min_h_0().flex()

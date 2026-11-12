@@ -37,6 +37,9 @@ impl Buffer {
         Self { rope: Rope::from_str(text), undo: vec![], redo: vec![], version: 0, next_group: 0, join_next: false, edit_log: vec![] }
     }
 
+    /// O(1) 快照（rope 是写时复制的树，克隆不复制文本）
+    pub fn snapshot(&self) -> Rope { self.rope.clone() }
+
     pub fn len(&self) -> usize { self.rope.len_bytes() }
     pub fn is_empty(&self) -> bool { self.len() == 0 }
     pub fn text(&self) -> String { self.rope.to_string() }
