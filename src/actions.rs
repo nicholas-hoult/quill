@@ -10,7 +10,7 @@ actions!(
         MoveToDocStart, MoveToDocEnd, SelectToDocStart, SelectToDocEnd,
         PageUp, PageDown, SelectAll, Backspace, Delete, DeleteWordLeft, DeleteToLineStart, DeleteToLineEnd,
         Enter, Tab, Outdent, Undo, Redo, Copy, Cut, Paste, ToggleComment, DuplicateLine, MoveLineUp, MoveLineDown,
-        DeleteLine, Escape, Newline, ToggleWrap, ReplaceCurrent, ReplaceAll, ShowCharacterPalette, FindInFile, FindNext, FindPrev, AcceptHunk, RejectHunk,
+        DeleteLine, Escape, Newline, ToggleWrap, FoldAtCursor, UnfoldAtCursor, ReplaceCurrent, ReplaceAll, ShowCharacterPalette, FindInFile, FindNext, FindPrev, AcceptHunk, RejectHunk,
     ]
 );
 
@@ -74,6 +74,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-f", FindInFile, Some("Editor")),
         KeyBinding::new("cmd-g", FindNext, Some("Editor")),
         KeyBinding::new("alt-z", ToggleWrap, Some("Editor")),
+        KeyBinding::new("cmd-alt-[", FoldAtCursor, Some("Editor")),
+        KeyBinding::new("cmd-alt-]", UnfoldAtCursor, Some("Editor")),
         KeyBinding::new("cmd-shift-g", FindPrev, Some("Editor")),
         // 工作区
         KeyBinding::new("cmd-s", Save, None),

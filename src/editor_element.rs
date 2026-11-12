@@ -12,6 +12,7 @@ pub struct LastLayout {
     pub rows: Vec<VisRow>,
     pub hunk_buttons: Vec<HunkButton>,
     pub total_h: f32,
+    pub gutter_w: f32,
 }
 
 pub struct VisRow {
@@ -137,6 +138,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::find_next))
             .on_action(cx.listener(Self::find_prev))
             .on_action(cx.listener(Self::toggle_wrap))
+            .on_action(cx.listener(Self::fold_at_cursor))
+            .on_action(cx.listener(Self::unfold_at_cursor))
             .on_action(cx.listener(|_, _: &ShowCharacterPalette, w, _| w.show_character_palette()))
             .on_action(cx.listener(|_, _: &InlineAssist, _, cx| cx.emit(EditorEvent::InlineAssist)));
         let lh = self.mode.line_height;
@@ -175,6 +178,8 @@ pub struct Prepaint {
     focused: bool,
     eol_marks: Vec<Bounds<Pixels>>,
     dots: Vec<(Bounds<Pixels>, Hsla)>,
+    chips: Vec<(Bounds<Pixels>, ShapedLine)>,
+    chevrons: Vec<(Pixels, ShapedLine)>,
 }
 
 impl Element for EditorElement {
@@ -214,7 +219,7 @@ impl Element for EditorElement {
                 let l = window.text_system().shape_line("0".into(), px(mode.font_size - 1.0), &[TextRun { len: 1, font: num_font.clone(), color: theme.faint, background_color: None, underline: None, strikethrough: None }], None);
                 l.width.f()
             };
-            let gutter_w = if mode.gutter { digits as f32 * digit_w + 36.0 } else { 0.0 };
+            let gutter_w = if mode.gutter { digits as f32 * digit_w + 44.0 } else { 0.0 };
             let text_left = bounds.left() + px(gutter_w) + if mode.gutter { px(6.) } else { pad };
             let wrap_w = if mode.wrap { Some((bounds.right() - text_left - pad - px(6.)).max(px(40.))) } else { None };
             let view_h = bounds.size.height - pad * 2.0;
@@ -222,8 +227,9 @@ impl Element for EditorElement {
 
             // ---- 行模型 ----
             let review_rows: Option<Vec<RowKind>> = ed.review.as_ref().map(|r| r.rows.clone());
-            let row_count = review_rows.as_ref().map(|r| r.len()).unwrap_or_else(|| ed.buffer.line_count());
-            let kind_at = |i: usize| -> RowKind { review_rows.as_ref().map(|r| r[i].clone()).unwrap_or(RowKind::Line(i)) };
+            let fold_map: Option<Vec<usize>> = ed.visible_lines();
+            let row_count = review_rows.as_ref().map(|r| r.len()).or_else(|| fold_map.as_ref().map(|m| m.len())).unwrap_or_else(|| ed.buffer.line_count());
+            let kind_at = |i: usize| -> RowKind { match (&review_rows, &fold_map) { (Some(r), _) => r[i].clone(), (None, Some(m)) => RowKind::Line(m[i]), _ => RowKind::Line(i) } };
 
             let total_h: f32;
             let mut heights: Vec<f32> = vec![];
@@ -245,7 +251,7 @@ impl Element for EditorElement {
             // ---- 光标可见 ----
             let cursor = ed.cursor();
             let cur_line = ed.buffer.line_of(cursor);
-            let cur_row = ed.review.as_ref().and_then(|r| r.line_row.get(cur_line).copied()).unwrap_or(cur_line);
+            let cur_row = ed.review.as_ref().and_then(|r| r.line_row.get(cur_line).copied()).or_else(|| fold_map.as_ref().map(|m| match m.binary_search(&cur_line) { Ok(i) | Err(i) => i.min(m.len().saturating_sub(1)) })).unwrap_or(cur_line);
             let row_y = |i: usize| -> f32 { if mode.wrap { heights[..i.min(heights.len())].iter().sum() } else { i as f32 * mode.line_height } };
             if ed.reveal && !(mode.wrap && heights.is_empty()) {
                 let y0 = row_y(cur_row);
@@ -303,6 +309,9 @@ impl Element for EditorElement {
             let mut numbers: Vec<(Pixels, ShapedLine, bool)> = vec![];
             let mut eol_marks: Vec<Bounds<Pixels>> = vec![];
             let mut dots: Vec<(Bounds<Pixels>, Hsla)> = vec![];
+            let mut chips: Vec<(Bounds<Pixels>, ShapedLine)> = vec![];
+            let mut chevrons: Vec<(Pixels, ShapedLine)> = vec![];
+            let gutter_hover = ed.gutter_hover;
             let mut line_sev: std::collections::HashMap<usize, u8> = Default::default();
             for d in &ed.diagnostics { let l = ed.buffer.line_of(d.range.start.min(ed.buffer.len())); let e = line_sev.entry(l).or_insert(d.severity); if d.severity < *e { *e = d.severity; } }
             let hunks_new: Vec<std::ops::Range<usize>> = ed.review.as_ref().map(|r| r.hunks.iter().map(|h| h.new.clone()).collect()).unwrap_or_default();
@@ -329,6 +338,24 @@ impl Element for EditorElement {
                         }
                         if let Some(sev) = line_sev.get(l) {
                             if mode.gutter { dots.push((Bounds::new(point(bounds.left() + px(9.), r.y + px((mode.line_height - 6.0) / 2.0)), size(px(6.), px(6.))), diag_color(&theme, *sev))); }
+                        }
+                        // 折叠：标题行末尾的「⋯」标签，行号栏的箭头
+                        if mode.gutter && ed.review.is_none() {
+                            let end = ed.fold_end_of(*l);
+                            let foldable = end.is_some() || (gutter_hover && ed.foldable_end(*l).is_some());
+                            if foldable {
+                                let g = if end.is_some() { "›" } else { "⌄" };
+                                let sh = window.text_system().shape_line(g.into(), px(13.), &[TextRun { len: g.len(), font: font(UI_FONT), color: if end.is_some() { theme.accent } else { theme.dim }, background_color: None, underline: None, strikethrough: None }], None);
+                                chevrons.push((r.y, sh));
+                            }
+                            if let Some(e) = end {
+                                let closer: String = ed.buffer.line_text(e).trim().chars().take(8).collect();
+                                let label = if closer.is_empty() { "⋯".to_string() } else { format!("⋯ {closer}") };
+                                let sh = window.text_system().shape_line(label.clone().into(), px(11.5), &[TextRun { len: label.len(), font: font(UI_FONT), color: theme.dim, background_color: None, underline: None, strikethrough: None }], None);
+                                let tw = r.shaped.as_ref().map(|s| s.size(lh).width).unwrap_or(px(0.));
+                                let w = sh.width + px(14.);
+                                chips.push((Bounds::new(point(text_origin_x + tw + px(8.), r.y + px(2.)), size(w, px(mode.line_height - 4.))), sh));
+                            }
                         }
                         if mode.gutter {
                             let s = (l + 1).to_string();
@@ -407,8 +434,8 @@ impl Element for EditorElement {
             } else { None };
 
             if (ed.layout.total_h - total_h).abs() > 0.5 && mode.max_lines.is_some() { cx.notify(); }
-            ed.layout = LastLayout { bounds, text_left: text_origin_x, rows, hunk_buttons, total_h };
-            Prepaint { hitbox, gutter_w, numbers, cursor: cursor_out, marks, row_bgs, thumb, buttons, placeholder, focused, eol_marks, dots }
+            ed.layout = LastLayout { bounds, text_left: text_origin_x, rows, hunk_buttons, total_h, gutter_w };
+            Prepaint { hitbox, gutter_w, numbers, cursor: cursor_out, marks, row_bgs, thumb, buttons, placeholder, focused, eol_marks, dots, chips, chevrons }
         })
     }
 
@@ -436,6 +463,10 @@ impl Element for EditorElement {
                 }
             }
             for b in &pre.eol_marks { window.paint_quad(fill(*b, theme.selection)); }
+            for (b, sh) in &pre.chips {
+                window.paint_quad(quad(*b, px(5.), theme.press, px(1.), theme.border, BorderStyle::default()));
+                let _ = sh.paint(point(b.left() + px(7.), b.top() + px((b.size.height.f() - 14.0) / 2.0)), px(14.), window, cx);
+            }
             if let Some(p) = &pre.placeholder {
                 let _ = p.paint(point(text_left, bounds.top() + px(padding) + px((lh - font_size * 1.25) / 2.0)), lhp, window, cx);
             }
@@ -444,11 +475,12 @@ impl Element for EditorElement {
             if mode_gutter {
                 window.paint_quad(fill(Bounds::new(bounds.origin, size(px(pre.gutter_w), bounds.size.height)), theme.bg));
                 for (y, s, _) in &pre.numbers {
-                    let x = bounds.left() + px(pre.gutter_w) - px(16.) - s.width;
+                    let x = bounds.left() + px(pre.gutter_w) - px(24.) - s.width;
                     let _ = s.paint(point(x, *y + px(0.5)), lhp, window, cx);
                 }
                 for (b, c) in &pre.marks { window.paint_quad(fill(*b, *c)); }
                 for (b, c) in &pre.dots { window.paint_quad(quad(*b, px(3.), *c, px(0.), *c, BorderStyle::default())); }
+                for (y, sh) in &pre.chevrons { let _ = sh.paint(point(bounds.left() + px(pre.gutter_w) - px(19.), *y + px(1.)), lhp, window, cx); }
             } else {
                 for (b, c) in &pre.marks { window.paint_quad(fill(*b, *c)); }
             }
@@ -479,6 +511,8 @@ impl Element for EditorElement {
             window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _window, cx| {
                 if phase != DispatchPhase::Capture && phase != DispatchPhase::Bubble { return; }
                 editor.update(cx, |ed, cx| {
+                    let over = ed.mode.gutter && ed.layout.bounds.contains(&ev.position) && ev.position.x < ed.layout.bounds.left() + px(ed.layout.gutter_w);
+                    if over != ed.gutter_hover { ed.gutter_hover = over; cx.notify(); }
                     if !ed.dragging || ev.pressed_button != Some(MouseButton::Left) { return; }
                     let lh = ed.mode.line_height;
                     // 拖到边缘外时自动滚动

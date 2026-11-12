@@ -70,6 +70,38 @@ pub fn path_at(symbols: &[Symbol], line: usize) -> Vec<&Symbol> {
     path
 }
 
+/// 可折叠区域：(标题行, 结束行)，折叠时隐藏 标题行+1 ..= 结束行。同一标题行只保留最外层。
+pub fn fold_ranges(lang: Lang, text: &str) -> Vec<(usize, usize)> {
+    let kinds: &[&str] = match lang {
+        Lang::Rust => &["block", "declaration_list", "field_declaration_list", "enum_variant_list", "match_block"],
+        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => &["statement_block", "class_body", "object", "array", "object_type", "interface_body", "switch_body", "enum_body"],
+        Lang::Python => &["block"],
+        Lang::Json => &["object", "array"],
+        Lang::Css => &["block"],
+        Lang::Go => &["block", "field_declaration_list", "interface_type"],
+        Lang::Bash => &["compound_statement"],
+    };
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&ts_language(lang)).is_err() { return vec![]; }
+    let Some(tree) = parser.parse(text, None) else { return vec![] };
+    let mut best: std::collections::BTreeMap<usize, usize> = Default::default();
+    fn walk(node: tree_sitter::Node, kinds: &[&str], python: bool, out: &mut std::collections::BTreeMap<usize, usize>) {
+        if kinds.contains(&node.kind()) {
+            let (s, e) = (node.start_position().row, node.end_position().row);
+            // Python 的 block 从第一条语句开始，标题行是它的上一行
+            let head = if python { s.saturating_sub(1) } else { s };
+            if e > head + 1 || (e > head && !python) {
+                let slot = out.entry(head).or_insert(e);
+                if e > *slot { *slot = e; }
+            }
+        }
+        let mut c = node.walk();
+        for ch in node.children(&mut c) { walk(ch, kinds, python, out); }
+    }
+    walk(tree.root_node(), kinds, lang == Lang::Python, &mut best);
+    best.into_iter().filter(|(h, e)| e > h).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,6 +133,22 @@ mod tests {
         let s = symbols(Lang::Python, "class K:\n    def a(self):\n        pass\n");
         assert_eq!(s.iter().map(|x| (x.name.as_str(), x.depth)).collect::<Vec<_>>(), vec![("K", 0), ("a", 1)]);
         assert!(symbols(Lang::Json, "{}").is_empty());
+    }
+
+    #[test]
+    fn 折叠范围_rust() {
+        let src = "fn a() {\n    let x = 1;\n    if x > 0 {\n        x\n    }\n}\nfn b() {}\n";
+        let f = fold_ranges(Lang::Rust, src);
+        assert_eq!(f, vec![(0, 5), (2, 4)]);
+    }
+
+    #[test]
+    fn 折叠范围_python_与_json() {
+        let f = fold_ranges(Lang::Python, "def f():\n    a = 1\n    return a\nx = 2\n");
+        assert_eq!(f, vec![(0, 2)]);
+        let j = fold_ranges(Lang::Json, "{\n  \"a\": [\n    1,\n    2\n  ]\n}\n");
+        assert_eq!(j, vec![(0, 5), (1, 4)]);
+        assert!(fold_ranges(Lang::Rust, "fn a() { 1 }").is_empty(), "单行块不可折叠");
     }
 
     #[test]

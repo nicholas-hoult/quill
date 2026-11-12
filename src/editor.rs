@@ -103,6 +103,12 @@ pub struct Editor {
     /// 外部（如 @ 提及弹窗）接管 上/下/回车/Tab 时置位，编辑器把这些键交还给父级
     pub intercept: bool,
     pub diagnostics: Vec<Diagnostic>,
+    /// 已折叠的区域：(标题行, 结束行)
+    pub folds: Vec<(usize, usize)>,
+    fold_cache: (u64, Vec<(usize, usize)>),
+    fold_gen: u64,
+    visible_cache: (u64, u64, Vec<usize>),
+    pub gutter_hover: bool,
 }
 
 impl EventEmitter<EditorEvent> for Editor {}
@@ -160,6 +166,11 @@ impl Editor {
             read_only: false,
             intercept: false,
             diagnostics: vec![],
+            folds: vec![],
+            fold_cache: (u64::MAX, vec![]),
+            fold_gen: 0,
+            visible_cache: (u64::MAX, u64::MAX, vec![]),
+            gutter_hover: false,
         };
         // 光标闪烁：输入后停 0.5s 再开始闪
         cx.spawn(async move |this, cx| {
@@ -276,12 +287,116 @@ impl Editor {
         cx.notify();
     }
 
+    // ---------- 代码折叠 ----------
+
+    fn folding_enabled(&self) -> bool { self.mode.gutter && !self.mode.wrap && self.review.is_none() }
+
+    /// 全部可折叠区域（按标题行排序，随文本版本缓存）
+    pub fn fold_ranges(&mut self) -> &[(usize, usize)] {
+        if self.fold_cache.0 != self.buffer.version {
+            let r = match self.lang { Some(l) if self.buffer.len() < 600_000 => crate::outline::fold_ranges(l, &self.buffer.text()), _ => vec![] };
+            self.fold_cache = (self.buffer.version, r);
+        }
+        &self.fold_cache.1
+    }
+
+    pub fn foldable_end(&mut self, line: usize) -> Option<usize> {
+        if !self.folding_enabled() { return None; }
+        let r = self.fold_ranges();
+        r.binary_search_by_key(&line, |x| x.0).ok().map(|i| r[i].1)
+    }
+
+    pub fn is_folded(&self, line: usize) -> bool { self.folds.iter().any(|f| f.0 == line) }
+
+    pub fn toggle_fold(&mut self, line: usize, cx: &mut Context<Self>) {
+        if let Some(i) = self.folds.iter().position(|f| f.0 == line) { self.folds.remove(i); }
+        else if let Some(end) = self.foldable_end(line) {
+            self.folds.push((line, end));
+            // 光标落在被折叠的范围里时，挪回标题行末尾
+            let c = self.buffer.line_of(self.cursor());
+            if c > line && c <= end { let o = self.buffer.line_end(line); self.sel = o..o; self.reversed = false; }
+        }
+        self.fold_gen += 1;
+        cx.notify();
+    }
+
+    /// 折叠光标所在的最内层区域
+    pub fn fold_at_cursor(&mut self, _: &FoldAtCursor, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.folding_enabled() { return; }
+        let line = self.buffer.line_of(self.cursor());
+        let folded = self.folds.clone();
+        let pick = self.fold_ranges().iter().filter(|r| r.0 <= line && line <= r.1 && !folded.contains(r)).max_by_key(|r| r.0).copied();
+        if let Some((h, _)) = pick { self.toggle_fold(h, cx); }
+    }
+
+    pub fn unfold_at_cursor(&mut self, _: &UnfoldAtCursor, _: &mut Window, cx: &mut Context<Self>) {
+        let line = self.buffer.line_of(self.cursor());
+        let pick = self.folds.iter().filter(|r| r.0 <= line && line <= r.1).max_by_key(|r| r.0).copied();
+        if let Some((h, _)) = pick { self.toggle_fold(h, cx); }
+    }
+
+    pub fn fold_all(&mut self, cx: &mut Context<Self>) {
+        if !self.folding_enabled() { return; }
+        self.folds = self.fold_ranges().to_vec();
+        let c = self.buffer.line_of(self.cursor());
+        if let Some(f) = self.folds.iter().filter(|f| f.0 < c && c <= f.1).min_by_key(|f| f.0) { let o = self.buffer.line_end(f.0); self.sel = o..o; self.reversed = false; }
+        self.fold_gen += 1;
+        cx.notify();
+    }
+
+    pub fn unfold_all(&mut self, cx: &mut Context<Self>) {
+        if self.folds.is_empty() { return; }
+        self.folds.clear();
+        self.fold_gen += 1;
+        cx.notify();
+    }
+
+    /// 光标跑进被折叠的行里（查找、跳转、撤销…）就自动展开
+    fn reveal_cursor_in_folds(&mut self) {
+        if self.folds.is_empty() { return; }
+        let line = self.buffer.line_of(self.cursor());
+        let before = self.folds.len();
+        self.folds.retain(|f| !(f.0 < line && line <= f.1));
+        if self.folds.len() != before { self.fold_gen += 1; }
+    }
+
+    /// 折叠后的可见行（行号升序）；没有折叠返回 None
+    pub fn visible_lines(&mut self) -> Option<Vec<usize>> {
+        if self.folds.is_empty() || !self.folding_enabled() { return None; }
+        if self.visible_cache.0 != self.fold_gen || self.visible_cache.1 != self.buffer.version {
+            let n = self.buffer.line_count();
+            let mut hidden = vec![false; n];
+            for &(h, e) in &self.folds { for l in (h + 1)..=e.min(n - 1) { hidden[l] = true; } }
+            self.visible_cache = (self.fold_gen, self.buffer.version, (0..n).filter(|&l| !hidden[l]).collect());
+        }
+        Some(self.visible_cache.2.clone())
+    }
+
+    /// 被折叠区域起始行的结束行（用来显示 `⋯ }`）
+    pub fn fold_end_of(&self, line: usize) -> Option<usize> { self.folds.iter().find(|f| f.0 == line).map(|f| f.1) }
+
+    /// 目标行如果在折叠区域里，按方向落到可见行上
+    fn skip_hidden(&self, line: usize, down: bool) -> usize {
+        match self.folds.iter().find(|f| f.0 < line && line <= f.1) {
+            Some(&(h, e)) => if down { (e + 1).min(self.buffer.line_count().saturating_sub(1)) } else { h },
+            None => line,
+        }
+    }
+
     /// 鼠标按下：审阅按钮 / 定位光标 / 双击选词 / 三击选行。返回是否命中编辑内容。
     pub fn mouse_down(&mut self, position: Point<Pixels>, click_count: usize, shift: bool, cx: &mut Context<Self>) -> bool {
         if let Some(b) = self.layout.hunk_buttons.iter().find(|b| b.rect.contains(&position)) {
             let (k, accept) = (b.hunk, b.accept);
             if accept { self.accept_hunk(k, cx) } else { self.reject_hunk(k, cx) }
             return true;
+        }
+        // 行号栏右侧的折叠箭头
+        let gx = self.layout.bounds.left() + px(self.layout.gutter_w);
+        if self.mode.gutter && position.x < gx && position.x > gx - px(30.) {
+            let line = self.layout.rows.iter().find(|r| position.y >= r.y && position.y < r.y + r.h).and_then(|r| if let RowKind::Line(l) = r.kind { Some(l) } else { None });
+            if let Some(l) = line {
+                if self.is_folded(l) || self.foldable_end(l).is_some() { self.toggle_fold(l, cx); return true; }
+            }
         }
         let lh = self.mode.line_height;
         let len = self.buffer.len();
@@ -394,6 +509,7 @@ impl Editor {
     // ---------- 选区 / 光标 ----------
 
     fn touch(&mut self, cx: &mut Context<Self>) {
+        self.reveal_cursor_in_folds();
         cx.emit(EditorEvent::Moved);
         self.blink_on = true;
         self.blink_epoch += 1;
@@ -427,7 +543,7 @@ impl Editor {
         let target = line as isize + delta;
         if target < 0 { return self.go(0, select, true, cx); }
         if target as usize >= self.buffer.line_count() { return self.go(self.buffer.len(), select, true, cx); }
-        let t = target as usize;
+        let t = self.skip_hidden(target as usize, delta > 0);
         let text = self.buffer.line_text(t);
         let byte = text.char_indices().nth(col).map(|(i, _)| i).unwrap_or(text.len());
         self.go(self.buffer.line_start(t) + byte, select, true, cx);
@@ -486,6 +602,7 @@ impl Editor {
     }
 
     fn after_change(&mut self, cx: &mut Context<Self>) {
+        if !self.folds.is_empty() { self.folds.clear(); self.fold_gen += 1; }
         self.touch(cx);
         cx.emit(EditorEvent::Changed);
     }
