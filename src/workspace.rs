@@ -136,6 +136,10 @@ pub struct Workspace {
     find_replace: bool,
     find_open: bool,
     tabs_scroll: ScrollHandle,
+    split: bool,
+    left_tab: usize,
+    right_tab: usize,
+    focus_right: bool,
     warned_external: HashSet<String>,
     inline: Option<Entity<InlineView>>,
     changes: Vec<Change>,
@@ -218,7 +222,7 @@ impl Workspace {
         let mut this = Self {
             focus: cx.focus_handle(), root: None, files: vec![], tabs: vec![], active: None, expanded: HashSet::new(), rows: vec![], tree_scroll: UniformListScrollHandle::new(),
             selected: None, side_view: SideView::Files, sidebar: settings.sidebar, agent_open: settings.agent_open, side_w: settings.side_w.clamp(180.0, 520.0), agent_w: settings.agent_w.clamp(320.0, 900.0), side_t: if settings.sidebar { 1.0 } else { 0.0 }, agent_t: if settings.agent_open { 1.0 } else { 0.0 }, resizing: None,
-            overlay: Overlay::None, menu: None, agent, terminal: None, term_open: false, term_h: settings.term_h.clamp(120.0, 620.0), term_t: 0.0, search_input, commit_input, search_hits: vec![], search_scroll: UniformListScrollHandle::new(), find_input, replace_input, find_replace: false, find_open: false, tabs_scroll: ScrollHandle::new(), warned_external: HashSet::new(),
+            overlay: Overlay::None, menu: None, agent, terminal: None, term_open: false, term_h: settings.term_h.clamp(120.0, 620.0), term_t: 0.0, search_input, commit_input, search_hits: vec![], search_scroll: UniformListScrollHandle::new(), find_input, replace_input, find_replace: false, find_open: false, tabs_scroll: ScrollHandle::new(), split: false, left_tab: 0, right_tab: 0, focus_right: false, warned_external: HashSet::new(),
             inline: None, changes: vec![], branch: None, lsp_tx, lsp: HashMap::new(), lsp_ready: HashSet::new(), diags: HashMap::new(), doc_versions: HashMap::new(), change_seq: HashMap::new(), last_len: HashMap::new(), hover: None, completion: None, comp_seq: 0, symbols: vec![], symbols_key: (String::new(), u64::MAX), outline_scroll: UniformListScrollHandle::new(), settings, toasts: vec![], toast_seq: 0, recents: load_recents(), _subs: subs,
         };
         this.apply_theme(window, cx);
@@ -640,9 +644,40 @@ impl Workspace {
         }).detach();
     }
 
+    /// 切换当前标签；分屏时替换当前聚焦窗格里的文件（目标文件已在另一窗格就直接聚焦那边）
+    fn set_active_tab(&mut self, i: usize) {
+        if self.split {
+            let other = if self.focus_right { self.left_tab } else { self.right_tab };
+            if i == other { self.focus_right = !self.focus_right; }
+            else if self.focus_right { self.right_tab = i; } else { self.left_tab = i; }
+        }
+        self.active = Some(i);
+    }
+
+    fn toggle_split(&mut self, cx: &mut Context<Self>) {
+        if self.split { self.split = false; cx.notify(); return; }
+        let Some(a) = self.active else { return };
+        let Some(o) = (0..self.tabs.len()).rev().find(|&i| i != a) else { self.toast("再打开一个文件才能向右拆分", false, cx); return };
+        self.split = true;
+        self.left_tab = a;
+        self.right_tab = o;
+        self.focus_right = false;
+        cx.notify();
+    }
+
+    fn focus_pane(&mut self, right: bool, cx: &mut Context<Self>) {
+        if !self.split || self.focus_right == right { return; }
+        self.focus_right = right;
+        let i = if right { self.right_tab } else { self.left_tab };
+        self.active = Some(i);
+        if let Some(t) = self.tabs.get(i) { let rel = self.rel(&t.path); self.agent.update(cx, |a, _| a.active_file = Some(rel)); }
+        self.close_popups(cx);
+        cx.notify();
+    }
+
     pub fn open_file(&mut self, abs: &str, line: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(i) = self.tabs.iter().position(|t| t.path == abs) {
-            self.active = Some(i);
+            self.set_active_tab(i);
         } else {
             let text = match std::fs::read(abs) {
                 Ok(b) => match String::from_utf8(b) { Ok(s) => s, Err(_) => { self.toast("不是 UTF-8 文本文件，无法打开", true, cx); return; } },
@@ -659,7 +694,7 @@ impl Workspace {
             });
             self.tabs.push(Tab { path: abs.to_string(), editor: editor.clone(), _sub: sub });
             self.lsp_did_open(abs, &text, cx);
-            self.active = Some(self.tabs.len() - 1);
+            self.set_active_tab(self.tabs.len() - 1);
             if let Some(root) = self.root.clone() {
                 let rel = self.rel(abs);
                 let ed = editor.clone();
@@ -726,6 +761,10 @@ impl Workspace {
         if i >= self.tabs.len() { return; }
         let closed = self.tabs.remove(i).path.clone();
         self.lsp_did_close(&closed);
+        if self.split {
+            if self.left_tab == i || self.right_tab == i { self.split = false; }
+            else { if self.left_tab > i { self.left_tab -= 1; } if self.right_tab > i { self.right_tab -= 1; } }
+        }
         self.active = if self.tabs.is_empty() { None } else { Some(match self.active { Some(a) if a > i => a - 1, Some(a) if a == i => i.min(self.tabs.len() - 1), Some(a) => a, None => 0 }) };
         if let Some(ed) = self.active_editor() {
             window.focus(&ed.read(cx).focus);
@@ -811,7 +850,7 @@ impl Workspace {
             CommandItem { title: "切换侧栏", keys: "⌘B" }, CommandItem { title: "切换 AI 对话", keys: "⇧⌘A" }, CommandItem { title: "聚焦对话输入框", keys: "⌘L" },
             CommandItem { title: "在项目中搜索", keys: "⇧⌘F" }, CommandItem { title: "查看 Git 改动", keys: "" }, CommandItem { title: "就地改写（Inline Assist）", keys: "⌘K" },
             CommandItem { title: "在文件中查找", keys: "⌘F" }, CommandItem { title: "新建对话", keys: "" }, CommandItem { title: "打开设置", keys: "⌘," },
-            CommandItem { title: "切换深色 / 浅色", keys: "" }, CommandItem { title: "关闭当前标签页", keys: "⌘W" }, CommandItem { title: "应用最近的代码块", keys: "⇧⌘↵" }, CommandItem { title: "切换终端", keys: "⌘J" }, CommandItem { title: "跳转到符号", keys: "⇧⌘O" }, CommandItem { title: "跳转到行", keys: "⌃G" }, CommandItem { title: "查看符号大纲", keys: "" }, CommandItem { title: "查找并替换", keys: "⌥⌘F" }, CommandItem { title: "切换自动换行", keys: "⌥Z" }, CommandItem { title: "转到定义", keys: "F12" }, CommandItem { title: "显示悬停信息", keys: "⌘I" }, CommandItem { title: "触发补全", keys: "⌃Space" }, CommandItem { title: "查看问题", keys: "" }, CommandItem { title: "折叠全部", keys: "" }, CommandItem { title: "展开全部", keys: "" }, CommandItem { title: "折叠当前块", keys: "⌥⌘[" },
+            CommandItem { title: "切换深色 / 浅色", keys: "" }, CommandItem { title: "关闭当前标签页", keys: "⌘W" }, CommandItem { title: "应用最近的代码块", keys: "⇧⌘↵" }, CommandItem { title: "切换终端", keys: "⌘J" }, CommandItem { title: "跳转到符号", keys: "⇧⌘O" }, CommandItem { title: "跳转到行", keys: "⌃G" }, CommandItem { title: "查看符号大纲", keys: "" }, CommandItem { title: "查找并替换", keys: "⌥⌘F" }, CommandItem { title: "切换自动换行", keys: "⌥Z" }, CommandItem { title: "转到定义", keys: "F12" }, CommandItem { title: "显示悬停信息", keys: "⌘I" }, CommandItem { title: "触发补全", keys: "⌃Space" }, CommandItem { title: "查看问题", keys: "" }, CommandItem { title: "折叠全部", keys: "" }, CommandItem { title: "展开全部", keys: "" }, CommandItem { title: "折叠当前块", keys: "⌥⌘[" }, CommandItem { title: "向右拆分 / 取消拆分", keys: "⌘\\" },
         ]
     }
 
@@ -868,6 +907,7 @@ impl Workspace {
             25 => { if let Some(e) = self.active_editor() { e.update(cx, |e, cx| e.fold_all(cx)); } }
             26 => { if let Some(e) = self.active_editor() { e.update(cx, |e, cx| e.unfold_all(cx)); } }
             27 => { if let Some(e) = self.active_editor() { e.update(cx, |e, cx| e.fold_at_cursor(&FoldAtCursor, window, cx)); } }
+            28 => self.toggle_split(cx),
             _ => {}
         }
     }
@@ -1102,14 +1142,16 @@ impl Workspace {
         })).track_scroll(self.outline_scroll.clone()).flex_1().pb(px(10.)).into_any_element()
     }
 
-    fn breadcrumbs(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn breadcrumbs(&mut self, idx: Option<usize>, cx: &mut Context<Self>) -> Option<AnyElement> {
         let t = cx.theme().clone();
-        let ed = self.active_editor()?;
-        self.ensure_symbols(cx);
+        let idx = idx.or(self.active)?;
+        let ed = self.tabs.get(idx)?.editor.clone();
+        let is_active = self.active == Some(idx);
+        if is_active { self.ensure_symbols(cx); }
         let (path, line) = ed.read_with(cx, |e, _| (e.path.clone().unwrap_or_default(), e.cursor_line_col().0 - 1));
         let rel = self.rel(&path);
         let mut parts: Vec<(String, bool)> = rel.split('/').map(|s| (s.to_string(), false)).collect();
-        for s in outline::path_at(&self.symbols, line) { parts.push((s.name.clone(), true)); }
+        if is_active { for s in outline::path_at(&self.symbols, line) { parts.push((s.name.clone(), true)); } }
         let last = parts.len().saturating_sub(1);
         Some(div().h(px(26.)).flex_none().px(px(16.)).flex().items_center().gap(px(6.)).text_size(px(12.)).text_color(t.faint).overflow_hidden()
             .children(parts.into_iter().enumerate().flat_map(|(i, (p, sym))| {
@@ -1371,8 +1413,29 @@ impl Render for Workspace {
         } else {
             div().flex_1().min_w_0().flex().flex_col().bg(t.bg)
                 .child(self.tabs_bar(cx))
-                .children(self.breadcrumbs(cx))
+                .children(if self.split { None } else { self.breadcrumbs(None, cx) })
                 .child(match &editor {
+                    Some(e) if self.split && self.left_tab < self.tabs.len() && self.right_tab < self.tabs.len() => {
+                        let popups: Vec<AnyElement> = [
+                            review.map(|r| r.into_any_element()),
+                            self.find_open.then(|| self.find_bar(cx).into_any_element()),
+                            self.inline.clone().map(|i| i.into_any_element()),
+                            self.completion_view(cx),
+                            self.hover_view(cx),
+                        ].into_iter().flatten().collect();
+                        let (li, ri) = (self.left_tab, self.right_tab);
+                        let crumbs = [self.breadcrumbs(Some(li), cx), self.breadcrumbs(Some(ri), cx)];
+                        let eds = [self.tabs[li].editor.clone(), self.tabs[ri].editor.clone()];
+                        let _ = e;
+                        let mut popups = Some(popups);
+                        div().flex_1().min_h_0().flex().children(crumbs.into_iter().zip(eds).enumerate().map(|(k, (crumb, ed))| {
+                            let focused = (k == 1) == self.focus_right;
+                            div().flex_1().min_w_0().flex().flex_col().when(k == 1, |d| d.border_l_1().border_color(t.border))
+                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.focus_pane(k == 1, cx)))
+                                .children(crumb)
+                                .child(div().flex_1().min_h_0().relative().child(ed).when(focused, |d| d.children(popups.take().unwrap_or_default())))
+                        })).into_any_element()
+                    }
                     Some(e) => div().flex_1().min_h_0().relative().child(e.clone()).when(self.find_open, |d| d.child(self.find_bar(cx))).children(review).when_some(self.inline.clone(), |d, i| d.child(i)).children(self.completion_view(cx)).children(self.hover_view(cx)).into_any_element(),
                     None => div().flex_1().flex().items_center().justify_center().flex_col().gap(px(6.)).child(div().text_size(px(26.)).font_weight(FontWeight::BOLD).child("选一个文件开始")).child(div().text_color(t.dim).child("⌘P 跳转文件 · ⌘L 和 AI 对话")).into_any_element(),
                 })
@@ -1401,6 +1464,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &CommandPalette, window, cx| this.open_palette(PaletteMode::Commands, window, cx)))
             .on_action(cx.listener(|this, _: &Quit, window, cx| this.request_quit(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| { this.sidebar = !this.sidebar; this.save_layout(); cx.notify(); }))
+            .on_action(cx.listener(|this, _: &SplitRight, _, cx| this.toggle_split(cx)))
             .on_action(cx.listener(|this, _: &GotoDefinition, window, cx| this.goto_definition(window, cx)))
             .on_action(cx.listener(|this, _: &ShowHover, _, cx| this.show_hover(cx)))
             .on_action(cx.listener(|this, _: &TriggerCompletion, _, cx| this.request_completion(true, cx)))
