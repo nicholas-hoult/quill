@@ -1,5 +1,7 @@
 mod actions;
 mod agent;
+mod agent_proto;
+mod tools;
 mod ai;
 mod assets;
 mod blocks;

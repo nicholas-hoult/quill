@@ -201,6 +201,8 @@ impl Workspace {
 
     // ---------- 工具 ----------
 
+    pub fn root_path(&self) -> Option<PathBuf> { self.root.clone() }
+
     fn active_editor(&self) -> Option<Entity<Editor>> { self.active.and_then(|i| self.tabs.get(i)).map(|t| t.editor.clone()) }
 
     /// 当前文件的符号列表（按文本版本缓存）

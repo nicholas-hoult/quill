@@ -33,6 +33,8 @@ pub fn strip_context(content: &str) -> &str {
 
 pub const SYSTEM_PROMPT: &str = "你是 Quill，嵌在代码编辑器里的编程助手。用中文回答，简洁直接。\n当你要修改文件时，输出该文件的**完整新内容**，放在一个围栏代码块里，围栏信息写成 ```语言 path=相对路径，例如 ```rust path=src/main.rs。\n不要用省略号或\"其余不变\"代替未改动的部分。一次回复里每个文件最多一个代码块。";
 
+pub const TOOL_HINT: &str = "你可以调用工具了解项目：read_file / list_dir / search。需要修改文件时调用 edit_file，给出该文件修改后的完整新内容（会进入用户的逐块审阅，不会直接写盘）。先读再改，不要凭空猜测文件内容。";
+
 pub const INLINE_PROMPT: &str = "你是代码改写器。只输出改写后的代码，放进一个围栏代码块里，不要任何解释。保持原有缩进与风格。";
 
 #[cfg(test)]

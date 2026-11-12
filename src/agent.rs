@@ -1,5 +1,7 @@
 //! Agent 对话面板：线程、流式回复、@文件引用、代码块一键应用。
-use crate::ai::{self, Msg, Settings, StreamEvent};
+use crate::agent_proto::{HistCall, HistMsg, api_messages};
+use crate::ai::{self, AgentStreamEvent, Settings};
+use crate::tools;
 use crate::blocks::{self, CodeBlock, Segment};
 use crate::context::{self, build_user_message, find_mentions, strip_context};
 use crate::editor::{Editor, EditorEvent, EditorMode};
@@ -27,8 +29,18 @@ pub enum Role { User, Assistant }
 pub enum Status { Streaming, Done, Error(String) }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub input: serde_json::Value,
+    pub result: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Message {
     pub id: u64,
+    #[serde(default)]
+    pub calls: Vec<ToolCall>,
     pub role: Role,
     pub content: String,
     pub refs: Vec<String>,
@@ -72,6 +84,7 @@ pub struct AgentPanel {
     menu: bool,
     pub settings: Settings,
     next_id: u64,
+    rounds: usize,
     expanded: HashSet<(u64, usize)>,
     _sub: Subscription,
 }
@@ -90,7 +103,7 @@ impl AgentPanel {
         let threads = load_threads();
         let active = 0;
         let next_id = threads.iter().flat_map(|t| t.messages.iter().map(|m| m.id)).max().unwrap_or(0) + 1;
-        Self { workspace, composer, threads, active, cancel: None, scroll: ScrollHandle::new(), stick: true, files: vec![], active_file: None, dropped: vec![], extra: vec![], mention: None, menu: false, settings, next_id, expanded: HashSet::new(), _sub: sub }
+        Self { workspace, composer, threads, active, cancel: None, scroll: ScrollHandle::new(), stick: true, files: vec![], active_file: None, dropped: vec![], extra: vec![], mention: None, menu: false, settings, next_id, rounds: 0, expanded: HashSet::new(), _sub: sub }
     }
 
     pub fn focus_composer(&self, window: &mut Window, cx: &App) { window.focus(&self.composer.read(cx).focus); }
@@ -164,27 +177,42 @@ impl AgentPanel {
         self.composer.update(cx, |c, cx| { c.clear(cx); c.intercept = false; });
         self.mention = None;
         self.extra.clear();
-        let user = Message { id: self.next_id, role: Role::User, content: build_user_message(&text, &files), refs: files.iter().map(|f| f.0.clone()).collect(), status: Status::Done, applied: HashSet::new() };
-        let ai_id = self.next_id + 1;
-        self.next_id += 2;
-        let ai = Message { id: ai_id, role: Role::Assistant, content: String::new(), refs: vec![], status: Status::Streaming, applied: HashSet::new() };
+        let user = Message { id: self.next_id, calls: vec![], role: Role::User, content: build_user_message(&text, &files), refs: files.iter().map(|f| f.0.clone()).collect(), status: Status::Done, applied: HashSet::new() };
+        self.next_id += 1;
         let first = self.threads[self.active].messages.is_empty();
         if first { self.thread().title = text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(26).collect(); }
-        self.thread().messages.push(user.clone());
-        self.thread().messages.push(ai);
-        let history: Vec<Msg> = self.threads[self.active].messages.iter()
-            .filter(|m| m.id != ai_id && !matches!(m.status, Status::Error(_)))
-            .map(|m| Msg { role: if m.role == Role::User { "user".into() } else { "assistant".into() }, content: if m.role == Role::User && m.id != user.id { strip_context(&m.content).to_string() } else { m.content.clone() } })
+        self.thread().messages.push(user);
+        self.rounds = 0;
+        self.stick = true;
+        self.start_round(cx);
+    }
+
+    /// 发起一轮模型请求（一次对话里遇到工具调用会连续发起多轮）
+    fn start_round(&mut self, cx: &mut Context<Self>) {
+        let ai_id = self.next_id;
+        self.next_id += 1;
+        self.thread().messages.push(Message { id: ai_id, calls: vec![], role: Role::Assistant, content: String::new(), refs: vec![], status: Status::Streaming, applied: HashSet::new() });
+        let msgs = &self.threads[self.active].messages;
+        let last_user = msgs.iter().rposition(|m| m.role == Role::User);
+        let hist: Vec<HistMsg> = msgs.iter().enumerate()
+            .filter(|(_, m)| m.id != ai_id && !matches!(m.status, Status::Error(_)))
+            .map(|(i, m)| HistMsg {
+                role: if m.role == Role::User { "user" } else { "assistant" },
+                text: if m.role == Role::User && Some(i) != last_user { strip_context(&m.content).to_string() } else { m.content.clone() },
+                calls: m.calls.iter().filter_map(|c| Some(HistCall { id: c.id.clone(), name: c.name.clone(), input: c.input.clone(), result: c.result.clone()? })).collect(),
+            })
             .collect();
+        let messages = api_messages(&hist);
+        let tools_on = self.settings.provider != "openai";
+        let system = if tools_on { format!("{}\n{}", context::SYSTEM_PROMPT, context::TOOL_HINT) } else { context::SYSTEM_PROMPT.to_string() };
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = Some(cancel.clone());
-        self.stick = true;
         let (tx, rx) = async_channel::unbounded();
         let settings = self.settings.clone();
-        cx.background_executor().spawn(async move { ai::run_stream(settings, context::SYSTEM_PROMPT.to_string(), history, tx, cancel); }).detach();
+        cx.background_executor().spawn(async move { ai::run_agent_stream(settings, system, messages, tools_on, tx, cancel); }).detach();
         cx.spawn(async move |this, cx| {
             while let Ok(ev) = rx.recv().await {
-                let end = matches!(ev, StreamEvent::Done | StreamEvent::Error(_));
+                let end = matches!(ev, AgentStreamEvent::Done(_) | AgentStreamEvent::Error(_));
                 if this.update(cx, |p, cx| p.on_event(ai_id, ev, cx)).is_err() { break; }
                 if end { break; }
             }
@@ -192,16 +220,45 @@ impl AgentPanel {
         cx.notify();
     }
 
-    fn on_event(&mut self, id: u64, ev: StreamEvent, cx: &mut Context<Self>) {
+    fn on_event(&mut self, id: u64, ev: AgentStreamEvent, cx: &mut Context<Self>) {
         let msg = self.threads.iter_mut().flat_map(|t| t.messages.iter_mut()).find(|m| m.id == id);
         let Some(m) = msg else { return };
+        let mut run_tools = false;
         match ev {
-            StreamEvent::Chunk(c) => m.content.push_str(&c),
-            StreamEvent::Done => { m.status = Status::Done; self.cancel = None; self.save(); }
-            StreamEvent::Error(e) => { m.status = Status::Error(e); self.cancel = None; self.save(); }
+            AgentStreamEvent::Chunk(c) => m.content.push_str(&c),
+            AgentStreamEvent::ToolUse { id, name, input } => m.calls.push(ToolCall { id, name, input, result: None }),
+            AgentStreamEvent::Done(stop) => { m.status = Status::Done; self.cancel = None; run_tools = stop == "tool_use" && m.calls.iter().any(|c| c.result.is_none()); self.save(); }
+            AgentStreamEvent::Error(e) => { m.status = Status::Error(e); self.cancel = None; self.save(); }
         }
         if self.stick { self.scroll.scroll_to_bottom(); }
         cx.notify();
+        if run_tools { self.run_tools(id, cx); }
+    }
+
+    /// 执行本轮的工具调用，把结果回填后继续下一轮。edit_file 不直接写盘，交给工作区走审阅。
+    fn run_tools(&mut self, msg_id: u64, cx: &mut Context<Self>) {
+        let root = self.workspace.update(cx, |w, _| w.root_path()).ok().flatten();
+        let pending: Vec<(usize, String, serde_json::Value)> = self.threads.iter().flat_map(|t| t.messages.iter()).find(|m| m.id == msg_id)
+            .map(|m| m.calls.iter().enumerate().filter(|(_, c)| c.result.is_none()).map(|(i, c)| (i, c.name.clone(), c.input.clone())).collect()).unwrap_or_default();
+        for (i, name, input) in pending {
+            let result = if name == "edit_file" {
+                match (input["path"].as_str(), input["content"].as_str()) {
+                    (Some(p), Some(c)) => { cx.emit(AgentEvent::Apply { path: Some(p.to_string()), code: c.to_string() }); "修改已放进编辑器，等待用户审阅（接受或拒绝）。".to_string() }
+                    _ => "错误：edit_file 需要 path 和 content".to_string(),
+                }
+            } else {
+                match &root { Some(r) => tools::run(r, &name, &input).unwrap_or_else(|e| format!("错误：{e}")), None => "错误：没有打开项目".to_string() }
+            };
+            if let Some(c) = self.threads.iter_mut().flat_map(|t| t.messages.iter_mut()).find(|m| m.id == msg_id).and_then(|m| m.calls.get_mut(i)) { c.result = Some(result); }
+        }
+        self.rounds += 1;
+        if self.rounds >= 8 {
+            if let Some(m) = self.threads.iter_mut().flat_map(|t| t.messages.iter_mut()).find(|m| m.id == msg_id) { m.content.push_str("\n\n（已达到单次对话的工具调用上限，先停在这里。）"); }
+            self.save();
+            cx.notify();
+            return;
+        }
+        self.start_round(cx);
     }
 
     /// 应用最近一条回复里还没应用的代码块（⌘⇧↵）
@@ -315,11 +372,12 @@ impl AgentPanel {
                     .child(div().flex_none().size(px(22.)).mt(px(1.)).rounded(px(7.)).bg(t.accent).flex().items_center().justify_center().child(icon("agent", 13., t.accent_ink)).when(streaming, |d| d.opacity(0.85)))
                     .child(
                         div().flex_1().min_w_0().flex().flex_col().gap(px(8.)).line_height(px(21.))
-                            .when(segs.is_empty() && streaming, |d| d.child(div().text_color(t.faint).child("思考中…")))
+                            .when(segs.is_empty() && m.calls.is_empty() && streaming, |d| d.child(div().text_color(t.faint).child("思考中…")))
                             .children(segs.iter().enumerate().map(|(i, s)| match s {
                                 Segment::Text(tx) => self.render_text(tx, cx).into_any_element(),
                                 Segment::Code { block, closed } => self.render_code(mid, i, block, *closed, m.applied.contains(&i), cx).into_any_element(),
                             }))
+                            .children(m.calls.iter().map(|c| tool_row(c, cx)))
                             .when(streaming && !segs.is_empty(), |d| d.child(div().w(px(7.)).h(px(14.)).rounded(px(2.)).bg(t.accent)))
                             .when_some(if let Status::Error(e) = &m.status { Some(e.clone()) } else { None }, |d, e| d.child(div().px(px(12.)).py(px(8.)).rounded(px(9.)).bg(t.del_bg).text_color(t.del).child(format!("出错了：{e}"))))
                             .when(!streaming && pending.len() > 1, |d| d.child(
@@ -338,6 +396,16 @@ impl AgentPanel {
             }
         }
     }
+}
+
+fn tool_row(c: &ToolCall, cx: &App) -> Div {
+    let t = cx.theme();
+    let done = c.result.is_some();
+    let failed = c.result.as_deref().map(|r| r.starts_with("错误")).unwrap_or(false);
+    div().flex().items_center().gap(px(8.)).h(px(28.)).px(px(10.)).rounded(px(8.)).bg(t.hover).border_1().border_color(t.border).text_size(px(12.5)).text_color(t.dim)
+        .child(icon(match c.name.as_str() { "search" => "search", "list_dir" => "folder", "edit_file" => "agent", _ => "file" }, 13., t.dim))
+        .child(div().flex_1().min_w_0().truncate().child(tools::summary(&c.name, &c.input)))
+        .child(if failed { icon("x", 13., t.del).into_any_element() } else if done { icon("check", 13., t.add).into_any_element() } else { div().text_color(t.faint).child("…").into_any_element() })
 }
 
 fn chip(path: &str, cx: &App) -> Div {

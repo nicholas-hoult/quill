@@ -137,6 +137,87 @@ pub fn run_stream(s: Settings, system: String, messages: Vec<Msg>, tx: async_cha
     send(StreamEvent::Done);
 }
 
+#[derive(Debug)]
+pub enum AgentStreamEvent {
+    Chunk(String),
+    ToolUse { id: String, name: String, input: serde_json::Value },
+    /// 停止原因：end_turn / tool_use …
+    Done(String),
+    Error(String),
+}
+
+fn flatten_text_msgs(messages: &[serde_json::Value]) -> Vec<Msg> {
+    messages.iter().filter_map(|m| Some(Msg { role: m["role"].as_str()?.to_string(), content: m["content"].as_str()?.to_string() })).collect()
+}
+
+/// 带工具调用的流式请求（Agent 模式）。Anthropic 与 mock 支持工具；OpenAI 兼容退回纯文本。
+pub fn run_agent_stream(s: Settings, system: String, messages: Vec<serde_json::Value>, tools: bool, tx: async_channel::Sender<AgentStreamEvent>, cancel: Arc<AtomicBool>) {
+    use crate::agent_proto::{ProtoEvent, SseParser};
+    let send = |e: AgentStreamEvent| { let _ = tx.send_blocking(e); };
+    let emit = |ev: ProtoEvent, stop: &mut String| match ev {
+        ProtoEvent::Text(t) => send(AgentStreamEvent::Chunk(t)),
+        ProtoEvent::ToolUse { id, name, input } => send(AgentStreamEvent::ToolUse { id, name, input }),
+        ProtoEvent::Stop(r) => *stop = r,
+    };
+    if s.provider == "mock" {
+        std::thread::sleep(Duration::from_millis(250));
+        let events = crate::agent_proto::mock_turn(&messages).unwrap_or_else(|| vec![ProtoEvent::Text(mock_reply(&flatten_text_msgs(&messages))), ProtoEvent::Stop("end_turn".into())]);
+        let mut stop = String::from("end_turn");
+        for ev in events {
+            if cancel.load(Ordering::Relaxed) { return; }
+            match ev {
+                ProtoEvent::Text(t) => {
+                    for piece in t.chars().collect::<Vec<_>>().chunks(3) {
+                        if cancel.load(Ordering::Relaxed) { return; }
+                        send(AgentStreamEvent::Chunk(piece.iter().collect()));
+                        std::thread::sleep(Duration::from_millis(12));
+                    }
+                }
+                other => emit(other, &mut stop),
+            }
+        }
+        send(AgentStreamEvent::Done(stop));
+        return;
+    }
+    if s.provider != "anthropic" {
+        // OpenAI 兼容：没有工具，复用纯文本流
+        let (itx, irx) = async_channel::unbounded();
+        let (s2, c2, msgs) = (s.clone(), cancel.clone(), flatten_text_msgs(&messages));
+        std::thread::spawn(move || run_stream(s2, system, msgs, itx, c2));
+        while let Ok(e) = irx.recv_blocking() {
+            match e {
+                StreamEvent::Chunk(c) => send(AgentStreamEvent::Chunk(c)),
+                StreamEvent::Done => { send(AgentStreamEvent::Done("end_turn".into())); return; }
+                StreamEvent::Error(m) => { send(AgentStreamEvent::Error(m)); return; }
+            }
+        }
+        return;
+    }
+    if s.api_key.is_empty() { send(AgentStreamEvent::Error("未配置 API Key，请在设置中填写".into())); return; }
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(600))).build().into();
+    let base = if s.base_url.is_empty() { "https://api.anthropic.com".to_string() } else { s.base_url.trim_end_matches('/').to_string() };
+    let mut body = serde_json::json!({ "model": s.model, "max_tokens": 8192, "stream": true, "system": system, "messages": messages });
+    if tools { body["tools"] = crate::tools::defs(); }
+    let resp = agent.post(format!("{base}/v1/messages")).header("x-api-key", &s.api_key).header("anthropic-version", "2023-06-01").send_json(body);
+    let mut resp = match resp { Ok(r) => r, Err(e) => { send(AgentStreamEvent::Error(e.to_string())); return; } };
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let text = resp.body_mut().read_to_string().unwrap_or_default();
+        send(AgentStreamEvent::Error(format!("{code}: {}", text.chars().take(300).collect::<String>())));
+        return;
+    }
+    let reader = std::io::BufReader::new(resp.into_body().into_reader());
+    let (mut parser, mut stop) = (SseParser::default(), String::from("end_turn"));
+    for line in reader.lines() {
+        if cancel.load(Ordering::Relaxed) { return; }
+        match line {
+            Ok(l) => { for ev in parser.feed(l.trim_end_matches('\r')) { emit(ev, &mut stop); } }
+            Err(e) => { send(AgentStreamEvent::Error(e.to_string())); return; }
+        }
+    }
+    send(AgentStreamEvent::Done(stop));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
