@@ -40,6 +40,8 @@ cargo build --release    # 发布构建（首次很慢）
 
 `agent.rs` 的 `start_round` → `ai::run_agent_stream`（Anthropic 带 tools；mock 用 `agent_proto::mock_turn`；OpenAI 兼容退回纯文本）。遇到 `stop_reason == tool_use` 时 `run_tools` 执行工具并回填，再发起下一轮（上限 8 轮）。`edit_file` **不直接写盘**，发 `AgentEvent::Apply` 让工作区走逐块审阅。
 无 Key 验证：在对话里发含 `[tool-demo]` 的消息，mock 会依次 列目录 → 读文件 → 提交编辑。
+终端 / 诊断工具（#3）：`run_command`（`tools::exec`，`sh -c`、cwd=项目根、stdout+stderr 合并、60s 超时、取消时杀整个进程组、输出头尾各留约 10KB）每次都要用户确认——`run_tools` 是状态机：遇到 run_command 记入 `awaiting` 并 return，确认卡片上 `⌘↵` 允许 / `Esc` 拒绝 / 「本会话始终允许」（只存内存），之后 `decide` → `spawn_command`（后台线程）→ `command_done` 回到 `run_tools` 继续。`diagnostics` 读 `Workspace::all_diags`（LSP 推送的最新诊断）。OpenAI 兼容接口没有工具调用，这些工具不可用。轮数上限 `MAX_ROUNDS`=12。
+验证：消息含 `[cmd-demo]`（命令成功）/ `[cmd-fail]`（命令失败）走「运行命令 → 查看诊断 → 总结」；`QUILL_DEBUG_SYSTEM=1` 发送时在 stderr 打印最终系统提示。脚本里 `key:cmd-enter` 等于点「允许运行」（脚本的 click 只走编辑器，点不到面板按钮）。
 
 ## 打包
 

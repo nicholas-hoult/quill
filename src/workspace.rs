@@ -446,6 +446,11 @@ impl Workspace {
         }).detach();
     }
 
+    /// 当前已知的全部诊断（绝对路径 → 诊断），给 Agent 的 diagnostics 工具用
+    pub fn all_diags(&self) -> Vec<(String, Vec<lsp::RawDiag>)> {
+        self.diags.iter().map(|(p, d)| (p.clone(), d.clone())).collect()
+    }
+
     fn diag_counts(&self) -> (usize, usize) {
         let all = self.diags.values().flatten();
         let (mut e, mut w) = (0, 0);

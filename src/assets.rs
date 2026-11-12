@@ -9,7 +9,7 @@ macro_rules! icons {
 
 icons!(
     "sidebar", "agent", "terminal", "search", "chevron", "chevron_down", "x", "plus", "send", "stop", "branch", "check", "copy",
-    "folder", "folder_open", "file", "settings", "trash", "git", "sun",
+    "folder", "folder_open", "file", "settings", "trash", "git", "sun", "alert",
 );
 
 pub struct Assets;

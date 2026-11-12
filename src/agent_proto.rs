@@ -112,6 +112,23 @@ pub fn mock_turn(messages: &[Value]) -> Option<Vec<ProtoEvent>> {
     })
 }
 
+/// 终端 / 诊断演示：用户消息含 `[cmd-demo]`（命令成功）或 `[cmd-fail]`（命令失败）时，依次 运行命令 → 查看诊断 → 总结。
+pub fn mock_cmd_turn(messages: &[Value]) -> Option<Vec<ProtoEvent>> {
+    let text = last_user_text(messages);
+    let fail = text.contains("[cmd-fail]");
+    if !fail && !text.contains("[cmd-demo]") { return None; }
+    let results = messages.iter().filter(|m| m["role"] == "user").filter_map(|m| m["content"].as_array()).filter_map(|a| a.first()).filter(|b| b["type"] == "tool_result").count();
+    let call = |id: &str, name: &str, input: Value| ProtoEvent::ToolUse { id: id.into(), name: name.into(), input };
+    Some(match results {
+        0 => {
+            let command = if fail { "echo 'error[E0425]: 找不到值 `x`' 1>&2; exit 2" } else { "echo '检查通过'; echo 'warning: 示例警告' 1>&2; ls | head -5" };
+            vec![ProtoEvent::Text("我先在项目里跑一下检查。".into()), call("toolu_cmd1", "run_command", json!({ "command": command })), ProtoEvent::Stop("tool_use".into())]
+        }
+        1 => vec![ProtoEvent::Text("再看看语言服务器有没有报问题。".into()), call("toolu_cmd2", "diagnostics", json!({})), ProtoEvent::Stop("tool_use".into())],
+        _ => vec![ProtoEvent::Text(if fail { "命令失败了，退出码 2。这是演示数据，真实模型会据此去改代码。".into() } else { "命令跑完了，诊断也看过了。".into() }), ProtoEvent::Stop("end_turn".into())],
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +201,21 @@ mod tests {
         let t3 = mock_turn(&[ask, a1, r1, a2, r2, a3, r3]).unwrap();
         assert_eq!(t3.last(), Some(&ProtoEvent::Stop("end_turn".into())));
         assert!(mock_turn(&[json!({"role":"user","content":"你好"})]).is_none());
+    }
+
+    #[test]
+    fn 命令演示按结果数推进() {
+        let u = |t: &str| json!({"role":"user","content":t});
+        let tr = |id: &str, c: &str| json!({"role":"user","content":[{"type":"tool_result","tool_use_id":id,"content":c}]});
+        assert!(mock_cmd_turn(&[u("你好")]).is_none());
+        let t0 = mock_cmd_turn(&[u("跑一下 [cmd-demo]")]).unwrap();
+        assert!(matches!(&t0[1], ProtoEvent::ToolUse { name, input, .. } if name == "run_command" && input["command"].as_str().unwrap().contains("检查通过")));
+        let a = json!({"role":"assistant","content":[]});
+        let t1 = mock_cmd_turn(&[u("[cmd-demo]"), a.clone(), tr("toolu_cmd1", "ok")]).unwrap();
+        assert!(matches!(&t1[1], ProtoEvent::ToolUse { name, .. } if name == "diagnostics"));
+        let t2 = mock_cmd_turn(&[u("[cmd-demo]"), a.clone(), tr("toolu_cmd1", "ok"), a, tr("toolu_cmd2", "无")]).unwrap();
+        assert!(matches!(t2.last(), Some(ProtoEvent::Stop(s)) if s == "end_turn"));
+        let f = mock_cmd_turn(&[u("[cmd-fail]")]).unwrap();
+        assert!(matches!(&f[1], ProtoEvent::ToolUse { input, .. } if input["command"].as_str().unwrap().contains("exit 2")));
     }
 }

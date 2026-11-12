@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 pub enum AgentEvent {
     Apply { path: Option<String>, code: String },
@@ -91,8 +92,20 @@ pub struct AgentPanel {
     /// 当前项目生效的规则文件名（#2），以及它是按哪个项目根读出来的
     rules_file: Option<String>,
     rules_root: Option<std::path::PathBuf>,
+    /// 正在等用户确认的工具调用：(消息 id, 调用序号)。同一时刻只会有一个，按顺序逐个确认
+    awaiting: Option<(u64, usize)>,
+    /// 正在后台运行的命令
+    running: Option<(u64, usize)>,
+    /// 本会话内「始终允许运行命令」。只存内存，重启即失效
+    always_allow: bool,
     _sub: Subscription,
 }
+
+#[derive(Clone, Copy, PartialEq)]
+enum Decision { Once, Always, Deny }
+
+/// 单次对话里工具调用的轮数上限（跑测试 → 修 → 再跑 需要几轮）
+const MAX_ROUNDS: usize = 12;
 
 impl EventEmitter<AgentEvent> for AgentPanel {}
 
@@ -102,13 +115,13 @@ impl AgentPanel {
         let sub = cx.subscribe(&composer, |this, _, ev: &EditorEvent, cx| match ev {
             EditorEvent::Submit => this.send(cx),
             EditorEvent::Changed => this.update_mention(cx),
-            EditorEvent::Cancel => { if this.cancel.is_some() { this.stop(cx); } }
+            EditorEvent::Cancel => { if this.awaiting.is_some() { this.decide(Decision::Deny, cx); } else if this.cancel.is_some() { this.stop(cx); } }
             _ => {}
         });
         let threads = load_threads();
         let active = 0;
         let next_id = threads.iter().flat_map(|t| t.messages.iter().map(|m| m.id)).max().unwrap_or(0) + 1;
-        Self { workspace, composer, threads, active, cancel: None, scroll: ScrollHandle::new(), stick: true, files: vec![], active_file: None, dropped: vec![], extra: vec![], mention: None, menu: false, settings, next_id, rounds: 0, expanded: HashSet::new(), hl_cache: Default::default(), rules_file: None, rules_root: None, _sub: sub }
+        Self { workspace, composer, threads, active, cancel: None, scroll: ScrollHandle::new(), stick: true, files: vec![], active_file: None, dropped: vec![], extra: vec![], mention: None, menu: false, settings, next_id, rounds: 0, expanded: HashSet::new(), hl_cache: Default::default(), rules_file: None, rules_root: None, awaiting: None, running: None, always_allow: false, _sub: sub }
     }
 
     pub fn focus_composer(&self, window: &mut Window, cx: &App) { window.focus(&self.composer.read(cx).focus); }
@@ -133,6 +146,7 @@ impl AgentPanel {
     fn thread(&mut self) -> &mut Thread { &mut self.threads[self.active] }
 
     pub fn new_thread(&mut self, cx: &mut Context<Self>) {
+        self.abort_pending(cx);
         if self.threads[self.active].messages.is_empty() { return; }
         self.threads.insert(0, Thread::new());
         self.active = 0;
@@ -179,7 +193,7 @@ impl AgentPanel {
     }
 
     fn send(&mut self, cx: &mut Context<Self>) {
-        if self.cancel.is_some() { return; }
+        if self.cancel.is_some() || self.awaiting.is_some() { return; }
         let text = self.composer.read(cx).text().trim().to_string();
         if text.is_empty() { return; }
         let atts = self.attachments(&text);
@@ -256,30 +270,103 @@ impl AgentPanel {
         if run_tools { self.run_tools(id, cx); }
     }
 
-    /// 执行本轮的工具调用，把结果回填后继续下一轮。edit_file 不直接写盘，交给工作区走审阅。
+    fn set_result(&mut self, msg_id: u64, i: usize, result: String) {
+        if let Some(c) = self.threads.iter_mut().flat_map(|t| t.messages.iter_mut()).find(|m| m.id == msg_id).and_then(|m| m.calls.get_mut(i)) { c.result = Some(result); }
+    }
+
+    /// 逐个执行本轮的工具调用，全部有结果后回填并继续下一轮（#3）。
+    /// 读类工具同步执行；edit_file 交给工作区走审阅；run_command 要先经用户确认，并在后台线程运行——
+    /// 这两种情况会在这里 return，等用户点选 / 命令跑完后由 `decide` / `command_done` 回到这里继续。
     fn run_tools(&mut self, msg_id: u64, cx: &mut Context<Self>) {
         let root = self.workspace.update(cx, |w, _| w.root_path()).ok().flatten();
-        let pending: Vec<(usize, String, serde_json::Value)> = self.threads.iter().flat_map(|t| t.messages.iter()).find(|m| m.id == msg_id)
-            .map(|m| m.calls.iter().enumerate().filter(|(_, c)| c.result.is_none()).map(|(i, c)| (i, c.name.clone(), c.input.clone())).collect()).unwrap_or_default();
-        for (i, name, input) in pending {
-            let result = if name == "edit_file" {
-                match (input["path"].as_str(), input["content"].as_str()) {
+        loop {
+            let next = self.threads.iter().flat_map(|t| t.messages.iter()).find(|m| m.id == msg_id)
+                .and_then(|m| m.calls.iter().enumerate().find(|(_, c)| c.result.is_none()).map(|(i, c)| (i, c.name.clone(), c.input.clone())));
+            let Some((i, name, input)) = next else { break };
+            let result = match name.as_str() {
+                "edit_file" => match (input["path"].as_str(), input["content"].as_str()) {
                     (Some(p), Some(c)) => { cx.emit(AgentEvent::Apply { path: Some(p.to_string()), code: c.to_string() }); "修改已放进编辑器，等待用户审阅（接受或拒绝）。".to_string() }
                     _ => "错误：edit_file 需要 path 和 content".to_string(),
+                },
+                "diagnostics" => match &root {
+                    Some(r) => {
+                        let files = self.workspace.read_with(cx, |w, _| w.all_diags()).unwrap_or_default();
+                        tools::format_diagnostics(r, &files, input["path"].as_str().filter(|p| !p.trim().is_empty()))
+                    }
+                    None => "错误：没有打开项目".to_string(),
+                },
+                "run_command" => {
+                    if input["command"].as_str().map(|c| c.trim().is_empty()).unwrap_or(true) { "错误：run_command 需要 command".to_string() }
+                    else if root.is_none() { "错误：没有打开项目".to_string() }
+                    else if tools::needs_permission(&name) && !self.always_allow {
+                        self.awaiting = Some((msg_id, i));
+                        if self.stick { self.scroll.scroll_to_bottom(); }
+                        cx.notify();
+                        return;
+                    } else { self.spawn_command(msg_id, i, cx); return; }
                 }
-            } else {
-                match &root { Some(r) => tools::run(r, &name, &input).unwrap_or_else(|e| format!("错误：{e}")), None => "错误：没有打开项目".to_string() }
+                _ => match &root { Some(r) => tools::run(r, &name, &input).unwrap_or_else(|e| format!("错误：{e}")), None => "错误：没有打开项目".to_string() },
             };
-            if let Some(c) = self.threads.iter_mut().flat_map(|t| t.messages.iter_mut()).find(|m| m.id == msg_id).and_then(|m| m.calls.get_mut(i)) { c.result = Some(result); }
+            self.set_result(msg_id, i, result);
         }
         self.rounds += 1;
-        if self.rounds >= 8 {
+        if self.rounds >= MAX_ROUNDS {
             if let Some(m) = self.threads.iter_mut().flat_map(|t| t.messages.iter_mut()).find(|m| m.id == msg_id) { m.content.push_str("\n\n（已达到单次对话的工具调用上限，先停在这里。）"); }
             self.save();
             cx.notify();
             return;
         }
         self.start_round(cx);
+    }
+
+    /// 用户对确认卡片的选择
+    fn decide(&mut self, d: Decision, cx: &mut Context<Self>) {
+        let Some((msg_id, i)) = self.awaiting.take() else { return };
+        match d {
+            Decision::Deny => {
+                self.set_result(msg_id, i, "用户拒绝运行这条命令。不要重复请求同一条命令：换一种办法，或向用户说明为什么需要它。".into());
+                self.run_tools(msg_id, cx);
+            }
+            Decision::Once => self.spawn_command(msg_id, i, cx),
+            Decision::Always => { self.always_allow = true; self.spawn_command(msg_id, i, cx); }
+        }
+        cx.notify();
+    }
+
+    /// 在后台线程运行命令，界面不卡；停止按钮通过取消标志杀掉进程
+    fn spawn_command(&mut self, msg_id: u64, i: usize, cx: &mut Context<Self>) {
+        let root = self.workspace.update(cx, |w, _| w.root_path()).ok().flatten();
+        let command = self.threads.iter().flat_map(|t| t.messages.iter()).find(|m| m.id == msg_id)
+            .and_then(|m| m.calls.get(i)).and_then(|c| c.input["command"].as_str().map(str::to_string)).unwrap_or_default();
+        let Some(root) = root else { self.set_result(msg_id, i, "错误：没有打开项目".into()); self.run_tools(msg_id, cx); return };
+        let flag = Arc::new(AtomicBool::new(false));
+        self.cancel = Some(flag.clone());
+        self.running = Some((msg_id, i));
+        let (tx, rx) = async_channel::bounded::<String>(1);
+        let f = flag.clone();
+        cx.background_executor().spawn(async move {
+            let r = tools::exec(&root, &command, Duration::from_secs(60), &f).unwrap_or_else(|e| format!("错误：{e}"));
+            let _ = tx.send_blocking(r);
+        }).detach();
+        cx.spawn(async move |this, cx| {
+            if let Ok(r) = rx.recv().await { let _ = this.update(cx, |p, cx| p.command_done(msg_id, i, r, flag, cx)); }
+        }).detach();
+        if self.stick { self.scroll.scroll_to_bottom(); }
+        cx.notify();
+    }
+
+    fn command_done(&mut self, msg_id: u64, i: usize, result: String, flag: Arc<AtomicBool>, cx: &mut Context<Self>) {
+        self.running = None;
+        let cancelled = flag.load(Ordering::Relaxed);
+        if !cancelled { self.cancel = None; } // 被取消时 stop() 已经把 cancel 取走了
+        self.set_result(msg_id, i, result);
+        if cancelled { self.save(); cx.notify(); return; }
+        self.run_tools(msg_id, cx);
+    }
+
+    /// 切换 / 新建 / 删除对话前，先结束还在等确认或运行中的命令，避免确认卡片留在看不见的对话里
+    fn abort_pending(&mut self, cx: &mut Context<Self>) {
+        if self.awaiting.is_some() || self.running.is_some() { self.stop(cx); }
     }
 
     /// 应用最近一条回复里还没应用的代码块（⌘⇧↵）
@@ -298,12 +385,13 @@ impl AgentPanel {
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
+        if let Some((mid, i)) = self.awaiting.take() { self.set_result(mid, i, "用户中止了这次对话，命令没有运行。".into()); }
         if let Some(c) = self.cancel.take() {
             c.store(true, Ordering::Relaxed);
             for m in self.threads[self.active].messages.iter_mut() { if m.status == Status::Streaming { m.status = Status::Done; } }
-            self.save();
-            cx.notify();
         }
+        self.save();
+        cx.notify();
     }
 
     fn render_text(&self, text: &str, cx: &App) -> Div {
@@ -388,7 +476,81 @@ impl AgentPanel {
             ))
     }
 
-    fn render_message(&self, m: &Message, cx: &mut Context<Self>) -> AnyElement {
+    /// 一次工具调用：读类是一行紧凑的摘要；run_command 是带确认按钮和输出的终端卡片
+    fn render_call(&self, msg_id: u64, i: usize, c: &ToolCall, cx: &mut Context<Self>) -> Div {
+        let t = cx.theme().clone();
+        let (verb, obj) = tools::parts(&c.name, &c.input);
+        let failed = c.result.as_deref().map(|r| r.starts_with("错误")).unwrap_or(false);
+        let denied = c.result.as_deref().map(|r| r.starts_with("用户拒绝") || r.starts_with("用户中止")).unwrap_or(false);
+        if c.name != "run_command" {
+            let ic = match c.name.as_str() { "search" => "search", "list_dir" => "folder", "edit_file" => "agent", "diagnostics" => "alert", _ => "file" };
+            // 诊断工具：右侧直接给出「无问题 / N 条」
+            let note: Option<(String, Hsla)> = if c.name == "diagnostics" {
+                c.result.as_ref().filter(|_| !failed).map(|r| if r.starts_with("没有诊断") { ("无问题".to_string(), t.add) } else { (format!("{} 条", r.lines().filter(|l| !l.starts_with('…')).count()), t.modified) })
+            } else { None };
+            return div().flex().items_center().gap(px(8.)).h(px(30.)).px(px(10.)).rounded(px(9.)).border_1().border_color(t.border).text_size(px(12.5)).text_color(t.dim)
+                .child(icon(ic, 13., t.faint))
+                .child(div().flex_none().child(verb))
+                .child(div().flex_1().min_w_0().truncate().font_family(MONO_FONT).text_size(px(12.)).text_color(t.text).child(obj))
+                .when_some(note, |d, (n, col)| d.child(div().flex_none().text_size(px(11.5)).text_color(col).child(n)))
+                .child(if failed { icon("x", 13., t.del).into_any_element() } else if c.result.is_some() { icon("check", 13., t.add).into_any_element() } else { div().text_color(t.faint).child("…").into_any_element() });
+        }
+
+        let awaiting = self.awaiting == Some((msg_id, i));
+        let running = self.running == Some((msg_id, i));
+        let key = (msg_id, 10_000 + i);
+        let expanded = self.expanded.contains(&key);
+        let status = c.result.as_deref().and_then(tools::result_status);
+        let body: Option<String> = c.result.as_ref().filter(|_| !denied).map(|r| match tools::result_status(r) { Some((_, _, b)) => b.to_string(), None => r.clone() });
+        let lines: Vec<String> = body.as_deref().map(|b| b.lines().map(str::to_string).collect()).unwrap_or_default();
+        const COLLAPSED: usize = 10;
+        let hidden = lines.len() > COLLAPSED && !expanded;
+        let shown: Vec<String> = if hidden { lines[lines.len() - COLLAPSED..].to_vec() } else { lines.clone() };
+        let uid = (msg_id * 100 + i as u64) as usize;
+        let chip_el = |text: String, ok: bool| div().flex_none().px(px(7.)).h(px(18.)).flex().items_center().rounded(px(5.)).text_size(px(11.)).font_family(MONO_FONT)
+            .bg(if ok { t.add_bg } else { t.del_bg }).text_color(if ok { t.add } else { t.del }).child(text);
+
+        div().flex().flex_col().rounded(px(11.)).border_1().border_color(if awaiting { t.accent_line } else { t.border_strong }).bg(t.bg).overflow_hidden()
+            .child(
+                div().h(px(32.)).px(px(10.)).flex().items_center().gap(px(8.)).bg(t.elev).border_b_1().border_color(t.border).text_size(px(12.))
+                    .child(icon("terminal", 14., if awaiting { t.accent } else { t.dim }))
+                    .child(div().text_color(if awaiting { t.text } else { t.dim }).font_weight(FontWeight::MEDIUM).child(if awaiting { "Agent 想运行这条命令" } else { "终端" }))
+                    .child(div().flex_1())
+                    .child(if awaiting { div().text_color(t.accent).child("等待确认").into_any_element() }
+                        else if running { div().text_color(t.dim).child("运行中…").into_any_element() }
+                        else if denied { div().flex_none().px(px(7.)).h(px(18.)).flex().items_center().rounded(px(5.)).text_size(px(11.)).bg(t.press).text_color(t.dim).child(if c.result.as_deref().unwrap_or("").starts_with("用户拒绝") { "已拒绝" } else { "已中止" }).into_any_element() }
+                        else if let Some((label, ok, _)) = status.clone() { chip_el(label, ok).into_any_element() }
+                        else if failed { chip_el("出错".into(), false).into_any_element() }
+                        else { div().text_color(t.faint).child("…").into_any_element() }),
+            )
+            .child(
+                div().flex().gap(px(7.)).px(px(11.)).py(px(9.)).font_family(MONO_FONT).text_size(px(12.)).line_height(px(18.))
+                    .child(div().flex_none().text_color(t.accent).child("$"))
+                    .child(div().flex_1().min_w_0().text_color(t.text).child(obj)),
+            )
+            .when(!shown.is_empty(), |d| d.child(
+                div().flex().flex_col().px(px(11.)).py(px(8.)).border_t_1().border_color(t.border).font_family(MONO_FONT).text_size(px(11.5)).line_height(px(17.)).text_color(t.dim)
+                    .children(shown.iter().map(|l| div().child(if l.is_empty() { " ".to_string() } else { l.clone() }))),
+            ))
+            .when(lines.len() > COLLAPSED, |d| d.child(
+                div().id(("cmd-more", uid)).h(px(26.)).flex().items_center().justify_center().border_t_1().border_color(t.border).text_size(px(12.)).text_color(t.faint).cursor_pointer().hover(|s| s.text_color(t.text))
+                    .on_click(cx.listener(move |this, _, _, cx| { if !this.expanded.remove(&key) { this.expanded.insert(key); } cx.notify(); }))
+                    .child(if expanded { "收起".to_string() } else { format!("展开全部 {} 行", lines.len()) }),
+            ))
+            .when(awaiting, |d| d.child(
+                div().flex().items_center().gap(px(8.)).px(px(10.)).py(px(8.)).border_t_1().border_color(t.border).bg(t.elev)
+                    .child(
+                        div().id(("cmd-always", uid)).text_size(px(12.)).text_color(t.faint).cursor_pointer().hover(|s| s.text_color(t.dim)).child("本会话始终允许")
+                            .on_click(cx.listener(|this, _, _, cx| this.decide(Decision::Always, cx))),
+                    )
+                    .child(div().flex_1())
+                    .child(btn(("cmd-deny", uid), "拒绝  Esc", false, cx).h(px(26.)).px(px(12.)).on_click(cx.listener(|this, _, _, cx| this.decide(Decision::Deny, cx))))
+                    .child(btn(("cmd-allow", uid), "允许运行  ⌘↵", true, cx).h(px(26.)).px(px(12.)).on_click(cx.listener(|this, _, _, cx| this.decide(Decision::Once, cx)))),
+            ))
+    }
+
+    /// `cont`：上一条也是助手消息（同一次回复的后续一轮，比如工具调用之后），不再重复头像，间距也收紧
+    fn render_message(&self, m: &Message, cont: bool, cx: &mut Context<Self>) -> AnyElement {
         let t = cx.theme().clone();
         match m.role {
             Role::User => div().flex().flex_col().items_end().gap(px(6.)).mb(px(18.))
@@ -400,8 +562,8 @@ impl AgentPanel {
                 let segs = blocks::parse_segments(&m.content);
                 let pending: Vec<(usize, CodeBlock)> = segs.iter().enumerate().filter_map(|(i, s)| match s { Segment::Code { block, closed: true } if block.path.is_some() && !m.applied.contains(&i) => Some((i, block.clone())), _ => None }).collect();
                 let mid = m.id;
-                div().flex().gap(px(11.)).mb(px(20.))
-                    .child(div().flex_none().size(px(22.)).mt(px(1.)).rounded(px(7.)).bg(t.accent).flex().items_center().justify_center().child(icon("agent", 13., t.accent_ink)).when(streaming, |d| d.opacity(0.85)))
+                div().flex().gap(px(11.)).mb(px(if cont { 12. } else { 20. })).when(cont, |d| d.mt(px(-8.)))
+                    .child(if cont { div().flex_none().size(px(22.)) } else { div().flex_none().size(px(22.)).mt(px(1.)).rounded(px(7.)).bg(t.accent).flex().items_center().justify_center().child(icon("agent", 13., t.accent_ink)).when(streaming, |d| d.opacity(0.85)) })
                     .child(
                         div().flex_1().min_w_0().flex().flex_col().gap(px(8.)).line_height(px(21.))
                             .when(segs.is_empty() && m.calls.is_empty() && streaming, |d| d.child(div().text_color(t.faint).child("思考中…")))
@@ -409,7 +571,7 @@ impl AgentPanel {
                                 Segment::Text(tx) => self.render_text(tx, cx).into_any_element(),
                                 Segment::Code { block, closed } => self.render_code(mid, i, block, *closed, m.applied.contains(&i), cx).into_any_element(),
                             }))
-                            .children(m.calls.iter().map(|c| tool_row(c, cx)))
+                            .children(m.calls.iter().enumerate().map(|(ci, c)| self.render_call(mid, ci, c, cx)))
                             .when(streaming && !segs.is_empty(), |d| d.child(div().w(px(7.)).h(px(14.)).rounded(px(2.)).bg(t.accent)))
                             .when_some(if let Status::Error(e) = &m.status { Some(e.clone()) } else { None }, |d, e| d.child(div().px(px(12.)).py(px(8.)).rounded(px(9.)).bg(t.del_bg).text_color(t.del).child(format!("出错了：{e}"))))
                             .when(!streaming && pending.len() > 1, |d| d.child(
@@ -430,16 +592,6 @@ impl AgentPanel {
     }
 }
 
-fn tool_row(c: &ToolCall, cx: &App) -> Div {
-    let t = cx.theme();
-    let done = c.result.is_some();
-    let failed = c.result.as_deref().map(|r| r.starts_with("错误")).unwrap_or(false);
-    div().flex().items_center().gap(px(8.)).h(px(28.)).px(px(10.)).rounded(px(8.)).bg(t.hover).border_1().border_color(t.border).text_size(px(12.5)).text_color(t.dim)
-        .child(icon(match c.name.as_str() { "search" => "search", "list_dir" => "folder", "edit_file" => "agent", _ => "file" }, 13., t.dim))
-        .child(div().flex_1().min_w_0().truncate().child(tools::summary(&c.name, &c.input)))
-        .child(if failed { icon("x", 13., t.del).into_any_element() } else if done { icon("check", 13., t.add).into_any_element() } else { div().text_color(t.faint).child("…").into_any_element() })
-}
-
 fn chip(path: &str, cx: &App) -> Div {
     let t = cx.theme();
     let name = path.rsplit('/').next().unwrap_or(path).to_string();
@@ -452,7 +604,7 @@ impl Render for AgentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_rules(cx);
         let t = cx.theme().clone();
-        let streaming = self.cancel.is_some();
+        let streaming = self.cancel.is_some() || self.awaiting.is_some();
         let thread = self.threads[self.active].clone();
         let atts = { let text = self.composer.read(cx).text(); self.attachments(&text) };
         let can_send = !self.composer.read(cx).is_empty() && !streaming;
@@ -465,6 +617,10 @@ impl Render for AgentPanel {
             .bg(t.panel)
             .on_action(cx.listener(|this, _: &crate::actions::MoveUp, _, cx| { if let Some(m) = &mut this.mention { m.sel = (m.sel + m.items.len() - 1) % m.items.len(); cx.notify(); } }))
             .on_action(cx.listener(|this, _: &crate::actions::MoveDown, _, cx| { if let Some(m) = &mut this.mention { m.sel = (m.sel + 1) % m.items.len(); cx.notify(); } }))
+            .on_action(cx.listener(|this, _: &crate::actions::AcceptReview, _, cx| {
+                // ⌘↵：有命令在等确认就允许运行；否则交给后面的处理者（接受审阅）
+                if this.awaiting.is_some() { this.decide(Decision::Once, cx); } else { cx.propagate(); }
+            }))
             .on_action(cx.listener(|this, _: &crate::actions::Enter, _, cx| this.pick_mention(cx)))
             .on_action(cx.listener(|this, _: &crate::actions::Tab, _, cx| this.pick_mention(cx)))
             .child(
@@ -491,7 +647,7 @@ impl Render for AgentPanel {
                                     .child(*s)
                             }))
                     ))
-                    .children(thread.messages.iter().map(|m| self.render_message(m, cx))),
+                    .children(thread.messages.iter().enumerate().map(|(mi, m)| { let cont = mi > 0 && thread.messages[mi - 1].role == Role::Assistant && m.role == Role::Assistant; self.render_message(m, cont, cx) })),
             )
             .child(
                 div().flex_none().mx(px(12.)).mb(px(12.)).mt(px(6.)).relative().rounded(px(14.)).bg(t.elev).border_1().border_color(t.border_strong)
@@ -509,6 +665,10 @@ impl Render for AgentPanel {
                     .child(
                         div().flex().items_center().gap(px(6.)).px(px(8.)).pb(px(8.)).pl(px(12.)).text_size(px(12.)).text_color(t.faint)
                             .child("↵ 发送 · ⇧↵ 换行")
+                            .when(self.always_allow, |d| d.child(
+                                div().id("auto-allow").px(px(6.)).py(px(1.)).rounded(px(5.)).bg(t.accent_soft).text_color(t.accent).cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| { this.always_allow = false; cx.notify(); })).child("自动允许命令 ✕"),
+                            ))
                             .when_some(self.rules_file.clone(), |d, f| d.child(div().id("rules-tag").px(px(6.)).py(px(1.)).rounded(px(5.)).bg(t.press).text_color(t.dim).child(format!("规则 · {f}"))))
                             .child(div().flex_1())
                             .child(if streaming {
@@ -527,10 +687,11 @@ impl Render for AgentPanel {
                         .children(self.threads.iter().enumerate().map(|(i, th)| {
                             div().id(("th", i)).flex().items_center().px(px(10.)).py(px(7.)).rounded(px(8.)).cursor_pointer().gap(px(8.))
                                 .text_color(if i == self.active { t.text } else { t.dim }).when(i == self.active, |d| d.bg(t.accent_soft)).hover(|s| s.bg(t.hover))
-                                .on_click(cx.listener(move |this, _, _, cx| { this.active = i; this.menu = false; this.stick = true; cx.notify(); }))
+                                .on_click(cx.listener(move |this, _, _, cx| { this.abort_pending(cx); this.active = i; this.menu = false; this.stick = true; cx.notify(); }))
                                 .child(div().flex_1().truncate().child(th.title.clone()))
                                 .child(div().id(("thdel", i)).child(icon("trash", 13., t.faint)).on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
+                                    this.abort_pending(cx);
                                     this.threads.remove(i);
                                     if this.threads.is_empty() { this.threads.push(Thread::new()); }
                                     this.active = this.active.min(this.threads.len() - 1);
