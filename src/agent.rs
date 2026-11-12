@@ -86,6 +86,8 @@ pub struct AgentPanel {
     next_id: u64,
     rounds: usize,
     expanded: HashSet<(u64, usize)>,
+    /// 代码块语法高亮缓存：(内容哈希) → 区间。流式回复时每个分片都会重绘整个面板，不能每次都重新解析
+    hl_cache: std::cell::RefCell<std::collections::HashMap<u64, Vec<(std::ops::Range<usize>, syntax::Kind)>>>,
     _sub: Subscription,
 }
 
@@ -103,7 +105,7 @@ impl AgentPanel {
         let threads = load_threads();
         let active = 0;
         let next_id = threads.iter().flat_map(|t| t.messages.iter().map(|m| m.id)).max().unwrap_or(0) + 1;
-        Self { workspace, composer, threads, active, cancel: None, scroll: ScrollHandle::new(), stick: true, files: vec![], active_file: None, dropped: vec![], extra: vec![], mention: None, menu: false, settings, next_id, rounds: 0, expanded: HashSet::new(), _sub: sub }
+        Self { workspace, composer, threads, active, cancel: None, scroll: ScrollHandle::new(), stick: true, files: vec![], active_file: None, dropped: vec![], extra: vec![], mention: None, menu: false, settings, next_id, rounds: 0, expanded: HashSet::new(), hl_cache: Default::default(), _sub: sub }
     }
 
     pub fn focus_composer(&self, window: &mut Window, cx: &App) { window.focus(&self.composer.read(cx).focus); }
@@ -310,7 +312,18 @@ impl AgentPanel {
     fn render_code(&self, msg_id: u64, ix: usize, block: &CodeBlock, closed: bool, applied: bool, cx: &mut Context<Self>) -> Div {
         let t = cx.theme().clone();
         let lang = syntax::lang_for_name(&block.lang).or_else(|| block.path.as_deref().and_then(syntax::lang_for_path));
-        let spans = match lang { Some(l) if closed || block.code.len() < 20_000 => syntax::highlight(l, &block.code), _ => vec![] };
+        let spans = match lang {
+            Some(l) if closed || block.code.len() < 20_000 => {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (block.code.as_str(), block.lang.as_str(), block.path.as_deref()).hash(&mut h);
+                let key = h.finish();
+                let mut cache = self.hl_cache.borrow_mut();
+                if cache.len() > 300 { cache.clear(); }
+                cache.entry(key).or_insert_with(|| syntax::highlight(l, &block.code)).clone()
+            }
+            _ => vec![],
+        };
         let hl: Vec<(std::ops::Range<usize>, HighlightStyle)> = spans.into_iter().map(|(r, k)| (r, HighlightStyle { color: Some(t.syntax(k)), ..Default::default() })).collect();
         let lines = block.code.lines().count();
         let expanded = self.expanded.contains(&(msg_id, ix));

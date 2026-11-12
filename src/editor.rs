@@ -4,7 +4,10 @@
 use crate::actions::*;
 use crate::buffer::Buffer;
 use crate::diff::{self, Hunk};
+use crate::outline::Symbol;
 use crate::syntax::{self, Kind, Lang};
+use std::cell::Cell;
+use std::sync::Arc;
 use gpui::{prelude::*, *};
 use std::ops::Range;
 use std::time::{Duration, Instant};
@@ -16,6 +19,8 @@ pub enum EditorEvent {
     /// 请求打开行内改写
     InlineAssist,
     ReviewEnded,
+    /// 后台语法分析结果已到（符号大纲 / 折叠范围更新）
+    Analyzed,
     /// 光标或内容变化（用于关闭补全 / 悬停弹窗）
     Moved,
 }
@@ -76,6 +81,13 @@ pub struct Editor {
     pub path: Option<String>,
     pub buffer: Buffer,
     saved_text: String,
+    saved_version: u64,
+    dirty_cache: Cell<(u64, bool)>,
+    edit_id: u64,
+    analysis_tx: async_channel::Sender<crate::analysis::Analysis>,
+    analysis_requested: u64,
+    pub symbols: Vec<Symbol>,
+    pub symbols_version: u64,
     pub sel: Range<usize>,
     pub reversed: bool,
     pub marked: Option<Range<usize>>,
@@ -107,8 +119,10 @@ pub struct Editor {
     pub folds: Vec<(usize, usize)>,
     fold_cache: (u64, Vec<(usize, usize)>),
     fold_gen: u64,
-    visible_cache: (u64, u64, Vec<usize>),
+    visible_cache: (u64, u64, Arc<Vec<usize>>),
     pub gutter_hover: bool,
+    /// 上一次绘制时是否持有焦点（光标闪烁只在聚焦时才重绘，空闲不耗电）
+    pub was_focused: bool,
     /// 额外的光标 / 选区（多光标）；主选区是 `sel`
     pub extra: Vec<Range<usize>>,
     in_multi: bool,
@@ -138,12 +152,23 @@ fn comment_prefix(lang: Option<Lang>) -> Option<&'static str> {
 
 impl Editor {
     pub fn new(mode: EditorMode, cx: &mut Context<Self>) -> Self {
+        let (analysis_tx, analysis_rx) = async_channel::unbounded::<crate::analysis::Analysis>();
+        cx.spawn(async move |this, cx| {
+            while let Ok(a) = analysis_rx.recv().await { if this.update(cx, |e, cx| e.apply_analysis(a, cx)).is_err() { break; } }
+        }).detach();
         let this = Self {
             focus: cx.focus_handle(),
             mode,
             path: None,
             buffer: Buffer::new(""),
             saved_text: String::new(),
+            saved_version: 0,
+            dirty_cache: Cell::new((u64::MAX, false)),
+            edit_id: { static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1); NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) },
+            analysis_tx: analysis_tx.clone(),
+            analysis_requested: u64::MAX,
+            symbols: vec![],
+            symbols_version: u64::MAX,
             sel: 0..0,
             reversed: false,
             marked: None,
@@ -173,8 +198,9 @@ impl Editor {
             folds: vec![],
             fold_cache: (u64::MAX, vec![]),
             fold_gen: 0,
-            visible_cache: (u64::MAX, u64::MAX, vec![]),
+            visible_cache: (u64::MAX, u64::MAX, Arc::new(vec![])),
             gutter_hover: false,
+            was_focused: false,
             extra: vec![],
             in_multi: false,
             last_multi: (0, u64::MAX),
@@ -183,7 +209,7 @@ impl Editor {
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_millis(530)).await;
-                if this.update(cx, |e, cx| { e.blink_on = !e.blink_on; cx.notify(); }).is_err() { break; }
+                if this.update(cx, |e, cx| { if e.was_focused { e.blink_on = !e.blink_on; cx.notify(); } else if !e.blink_on { e.blink_on = true; } }).is_err() { break; }
             }
         })
         .detach();
@@ -199,11 +225,17 @@ impl Editor {
         self.path = path;
         self.buffer = Buffer::new(text);
         self.saved_text = text.to_string();
+        self.saved_version = self.buffer.version;
         self.sel = 0..0;
         self.scroll_y = 0.0;
         self.scroll_x = 0.0;
         self.review = None;
+        self.spans.clear();
         self.spans_version = u64::MAX;
+        self.analysis_requested = u64::MAX;
+        self.symbols.clear();
+        self.symbols_version = u64::MAX;
+        self.fold_cache = (u64::MAX, vec![]);
         cx.notify();
     }
 
@@ -211,11 +243,18 @@ impl Editor {
 
     pub fn is_empty(&self) -> bool { self.buffer.is_empty() }
 
+    /// 是否有未保存的改动。按文本版本缓存：版本没变就不再比较整份文本（标签栏每帧都会问）。
     pub fn is_dirty(&self) -> bool {
-        self.buffer.len() != self.saved_text.len() || self.buffer.text() != self.saved_text
+        let v = self.buffer.version;
+        if v == self.saved_version { return false; }
+        let (cv, cd) = self.dirty_cache.get();
+        if cv == v { return cd; }
+        let d = self.buffer.len() != self.saved_text.len() || self.buffer.text() != self.saved_text;
+        self.dirty_cache.set((v, d));
+        d
     }
 
-    pub fn mark_saved(&mut self) { self.saved_text = self.buffer.text(); }
+    pub fn mark_saved(&mut self) { self.saved_text = self.buffer.text(); self.saved_version = self.buffer.version; }
 
     /// 磁盘上的内容和上次保存 / 打开时不一样
     pub fn disk_differs(&self, disk: &str) -> bool { disk != self.saved_text }
@@ -225,6 +264,9 @@ impl Editor {
         if self.is_dirty() || self.review.is_some() { return false; }
         self.buffer = Buffer::new(text);
         self.saved_text = text.to_string();
+        self.saved_version = self.buffer.version;
+        self.spans.clear();
+        self.analysis_requested = u64::MAX;
         let c = self.sel.start.min(text.len());
         let c = (0..=c).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
         self.sel = c..c;
@@ -362,14 +404,8 @@ impl Editor {
 
     fn folding_enabled(&self) -> bool { self.mode.gutter && !self.mode.wrap && self.review.is_none() }
 
-    /// 全部可折叠区域（按标题行排序，随文本版本缓存）
-    pub fn fold_ranges(&mut self) -> &[(usize, usize)] {
-        if self.fold_cache.0 != self.buffer.version {
-            let r = match self.lang { Some(l) if self.buffer.len() < 600_000 => crate::outline::fold_ranges(l, &self.buffer.text()), _ => vec![] };
-            self.fold_cache = (self.buffer.version, r);
-        }
-        &self.fold_cache.1
-    }
+    /// 全部可折叠区域（按标题行排序）。由后台分析产出，可能比当前文本旧一个版本。
+    pub fn fold_ranges(&mut self) -> &[(usize, usize)] { &self.fold_cache.1 }
 
     pub fn foldable_end(&mut self, line: usize) -> Option<usize> {
         if !self.folding_enabled() { return None; }
@@ -432,13 +468,13 @@ impl Editor {
     }
 
     /// 折叠后的可见行（行号升序）；没有折叠返回 None
-    pub fn visible_lines(&mut self) -> Option<Vec<usize>> {
+    pub fn visible_lines(&mut self) -> Option<Arc<Vec<usize>>> {
         if self.folds.is_empty() || !self.folding_enabled() { return None; }
         if self.visible_cache.0 != self.fold_gen || self.visible_cache.1 != self.buffer.version {
             let n = self.buffer.line_count();
             let mut hidden = vec![false; n];
             for &(h, e) in &self.folds { for l in (h + 1)..=e.min(n - 1) { hidden[l] = true; } }
-            self.visible_cache = (self.fold_gen, self.buffer.version, (0..n).filter(|&l| !hidden[l]).collect());
+            self.visible_cache = (self.fold_gen, self.buffer.version, Arc::new((0..n).filter(|&l| !hidden[l]).collect()));
         }
         Some(self.visible_cache.2.clone())
     }
@@ -553,16 +589,39 @@ impl Editor {
 
     pub(crate) fn spans_ref(&self) -> &Vec<(Range<usize>, Kind)> { &self.spans }
 
-    /// 语法高亮区间（按文本版本缓存）
-    pub fn spans(&mut self) -> &[(Range<usize>, Kind)] {
-        if self.spans_version != self.buffer.version {
-            self.spans = match self.lang {
-                Some(l) if self.buffer.len() < 600_000 => syntax::highlight(l, &self.buffer.text()),
-                _ => vec![],
-            };
-            self.spans_version = self.buffer.version;
+    pub fn current_lang(&self) -> Option<Lang> { self.lang }
+
+    /// 每帧调用：先把积压的编辑平移到旧高亮上（保证打字时颜色不乱跳），再按需向后台线程要新的分析结果。
+    pub fn sync_analysis(&mut self, cx: &mut Context<Self>) {
+        let Some(lang) = self.lang else { self.buffer.edit_log.clear(); return };
+        if !self.buffer.edit_log.is_empty() {
+            let log = std::mem::take(&mut self.buffer.edit_log);
+            if log.len() > 64 { self.spans.clear(); } else { for (s, o, n) in log { crate::analysis::shift_spans(&mut self.spans, s, o, n); } }
         }
-        &self.spans
+        let v = self.buffer.version;
+        if self.spans_version == v || self.analysis_requested == v { return; }
+        self.analysis_requested = v;
+        // 首次打开立刻分析；之后的修改等 120ms 内不再变动才提交
+        let delay = if self.spans_version == u64::MAX { 0 } else { 120 };
+        cx.spawn(async move |this, cx| {
+            if delay > 0 { cx.background_executor().timer(Duration::from_millis(delay)).await; }
+            let _ = this.update(cx, |e, _| {
+                if e.buffer.version == v {
+                    crate::analysis::submit(crate::analysis::Job { id: e.edit_id, version: v, lang, text: e.buffer.text(), reply: e.analysis_tx.clone() });
+                }
+            });
+        }).detach();
+    }
+
+    fn apply_analysis(&mut self, a: crate::analysis::Analysis, cx: &mut Context<Self>) {
+        if a.version != self.buffer.version { return; } // 又改过了，新的任务会跟上
+        self.spans = a.spans;
+        self.spans_version = a.version;
+        self.symbols = a.symbols;
+        self.symbols_version = a.version;
+        self.fold_cache = (a.version, a.folds);
+        cx.emit(EditorEvent::Analyzed);
+        cx.notify();
     }
 
     /// 相对 HEAD 的改动块（行号基于当前文本）

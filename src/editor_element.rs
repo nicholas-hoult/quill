@@ -158,6 +158,21 @@ impl Render for Editor {
 pub trait PxF { fn f(self) -> f32; }
 impl PxF for Pixels { fn f(self) -> f32 { f32::from(self) } }
 
+/// 开发用：QUILL_PERF=1 时每 90 帧在 stderr 打印编辑器 prepaint / paint 的平均耗时（毫秒）
+fn perf_record(kind: usize, t0: std::time::Instant) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("QUILL_PERF").is_ok()) { return; }
+    static US: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    static N: AtomicU64 = AtomicU64::new(0);
+    let us = t0.elapsed().as_micros() as u64;
+    if us > 4000 { eprintln!("[perf] 慢帧 {} {:.1}ms", if kind == 0 { "prepaint" } else { "paint" }, us as f64 / 1000.0); }
+    US[kind].fetch_add(us, Ordering::Relaxed);
+    if kind == 1 && N.fetch_add(1, Ordering::Relaxed) % 90 == 89 {
+        eprintln!("[perf] 90 帧平均：prepaint {:.2}ms  paint {:.2}ms", US[0].swap(0, Ordering::Relaxed) as f64 / 90_000.0, US[1].swap(0, Ordering::Relaxed) as f64 / 90_000.0);
+    }
+}
+
 pub struct EditorElement {
     pub editor: Entity<Editor>,
 }
@@ -200,11 +215,15 @@ impl Element for EditorElement {
     }
 
     fn prepaint(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, bounds: Bounds<Pixels>, _: &mut (), window: &mut Window, cx: &mut App) -> Prepaint {
+        let t0 = std::time::Instant::now();
         let theme = cx.theme().clone();
         let focused = self.editor.read(cx).focus.is_focused(window);
+        if self.editor.read(cx).was_focused != focused { self.editor.update(cx, |e, _| e.was_focused = focused); }
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         let editor = self.editor.clone();
-        editor.update(cx, |ed, cx| {
+        let out = editor.update(cx, |ed, cx| {
+            let t_ck = std::time::Instant::now();
+            let mut cks: Vec<(&'static str, u128)> = vec![];
             let mode = ed.mode.clone();
             let lh = px(mode.line_height);
             let fsize = px(mode.font_size);
@@ -212,7 +231,7 @@ impl Element for EditorElement {
             let num_font = font(MONO_FONT);
             let pad = px(mode.padding);
             ed.refresh_review();
-            ed.spans();
+            ed.sync_analysis(cx);
             if ed.search.is_some() { ed.matches(); }
             let head_hunks: Vec<crate::diff::Hunk> = if mode.gutter && ed.review.is_none() { ed.head_hunks().to_vec() } else { vec![] };
 
@@ -228,9 +247,10 @@ impl Element for EditorElement {
             let view_h = bounds.size.height - pad * 2.0;
             let top = bounds.top() + pad;
 
+            cks.push(("准备", t_ck.elapsed().as_micros()));
             // ---- 行模型 ----
             let review_rows: Option<Vec<RowKind>> = ed.review.as_ref().map(|r| r.rows.clone());
-            let fold_map: Option<Vec<usize>> = ed.visible_lines();
+            let fold_map = ed.visible_lines();
             let row_count = review_rows.as_ref().map(|r| r.len()).or_else(|| fold_map.as_ref().map(|m| m.len())).unwrap_or_else(|| ed.buffer.line_count());
             let kind_at = |i: usize| -> RowKind { match (&review_rows, &fold_map) { (Some(r), _) => r[i].clone(), (None, Some(m)) => RowKind::Line(m[i]), _ => RowKind::Line(i) } };
 
@@ -290,6 +310,7 @@ impl Element for EditorElement {
                 i += 1;
             }
 
+            cks.push(("排版可见行", t_ck.elapsed().as_micros()));
             // ---- 水平滚动：保持光标可见 ----
             if !mode.wrap {
                 if let Some(r) = rows.iter().find(|r| matches!(r.kind, RowKind::Line(l) if l == cur_line)) {
@@ -379,6 +400,7 @@ impl Element for EditorElement {
                 }
             }
 
+            cks.push(("行背景与行号", t_ck.elapsed().as_micros()));
             // ---- 审阅按钮 ----
             let mut buttons: Vec<(Bounds<Pixels>, ShapedLine, bool)> = vec![];
             let mut hunk_buttons: Vec<HunkButton> = vec![];
@@ -439,13 +461,18 @@ impl Element for EditorElement {
                 Some(window.text_system().shape_line(mode.placeholder.clone(), fsize, &[TextRun { len: mode.placeholder.len(), font: base_font.clone(), color: theme.faint, background_color: None, underline: None, strikethrough: None }], None))
             } else { None };
 
+            cks.push(("光标与其余", t_ck.elapsed().as_micros()));
+            if t_ck.elapsed().as_micros() > 9000 && std::env::var("QUILL_PERF").is_ok() { eprintln!("[perf] 分段(累计µs) {:?} runs={}µs shape={}µs", cks, PERF_RUNS.swap(0, std::sync::atomic::Ordering::Relaxed), PERF_SHAPE.swap(0, std::sync::atomic::Ordering::Relaxed)); } else { PERF_RUNS.store(0, std::sync::atomic::Ordering::Relaxed); PERF_SHAPE.store(0, std::sync::atomic::Ordering::Relaxed); }
             if (ed.layout.total_h - total_h).abs() > 0.5 && mode.max_lines.is_some() { cx.notify(); }
             ed.layout = LastLayout { bounds, text_left: text_origin_x, rows, hunk_buttons, total_h, gutter_w };
             Prepaint { hitbox, gutter_w, numbers, cursor: cursor_out, marks, row_bgs, thumb, buttons, placeholder, focused, eol_marks, dots, chips, chevrons, extra_cursors }
-        })
+        });
+        perf_record(0, t0);
+        out
     }
 
     fn paint(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, bounds: Bounds<Pixels>, _: &mut (), pre: &mut Prepaint, window: &mut Window, cx: &mut App) {
+        let t_paint = std::time::Instant::now();
         let theme = cx.theme().clone();
         let editor = self.editor.clone();
         let (lh, mode_gutter, single, padding) = { let e = editor.read(cx); (e.mode.line_height, e.mode.gutter, e.mode.single_line, e.mode.padding) };
@@ -499,6 +526,7 @@ impl Element for EditorElement {
         });
         editor.update(cx, |e, _| e.layout.rows = rows);
         let _ = (pre.focused, single);
+        perf_record(1, t_paint);
 
         // ---- 鼠标 ----
         let hitbox_id = pre.hitbox.id;
@@ -589,8 +617,13 @@ fn shape_row(ed: &Editor, theme: &crate::theme::Theme, base_font: &Font, fsize: 
             if le == ls { return (None, vec![]); }
             let text = ed.buffer.line_text(*l);
             let (disp, tabs) = expand_tabs(&text);
+            let t_r = std::time::Instant::now();
             let runs = line_runs(ed, theme, base_font, ls, le, &tabs, &text);
-            (window.text_system().shape_text(disp.into(), fsize, &runs, wrap_w, None).ok().and_then(|mut v| v.pop()), tabs)
+            PERF_RUNS.fetch_add(t_r.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            let t_s = std::time::Instant::now();
+            let r = window.text_system().shape_text(disp.into(), fsize, &runs, wrap_w, None).ok().and_then(|mut v| v.pop());
+            PERF_SHAPE.fetch_add(t_s.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            (r, tabs)
         }
     }
 }
@@ -598,6 +631,9 @@ fn shape_row(ed: &Editor, theme: &crate::theme::Theme, base_font: &Font, fsize: 
 pub fn diag_color(t: &crate::theme::Theme, sev: u8) -> Hsla {
     match sev { 1 => t.del, 2 => t.modified, 3 => t.syntax(crate::syntax::Kind::Function), _ => t.dim }
 }
+
+pub static PERF_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PERF_SHAPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn expand_tabs(s: &str) -> (String, Vec<usize>) {
     if !s.contains('\t') { return (s.to_string(), vec![]); }

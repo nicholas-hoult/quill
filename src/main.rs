@@ -1,5 +1,6 @@
 mod actions;
 mod agent;
+mod analysis;
 mod agent_proto;
 mod tools;
 mod ai;

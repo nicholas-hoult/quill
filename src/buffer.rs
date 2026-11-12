@@ -25,6 +25,8 @@ pub struct Buffer {
     next_group: u64,
     /// 为 true 时，下一次修改并入上一次修改的撤销组（只生效一次）
     pub join_next: bool,
+    /// 自上次取走以来发生的编辑 (起点, 原长度, 新长度)，供高亮区间平移
+    pub edit_log: Vec<(usize, usize, usize)>,
 }
 
 /// 连续输入合并成一次撤销的时间窗口
@@ -32,7 +34,7 @@ const MERGE_MS: u64 = 700;
 
 impl Buffer {
     pub fn new(text: &str) -> Self {
-        Self { rope: Rope::from_str(text), undo: vec![], redo: vec![], version: 0, next_group: 0, join_next: false }
+        Self { rope: Rope::from_str(text), undo: vec![], redo: vec![], version: 0, next_group: 0, join_next: false, edit_log: vec![] }
     }
 
     pub fn len(&self) -> usize { self.rope.len_bytes() }
@@ -156,6 +158,7 @@ impl Buffer {
         if ce > cs { self.rope.remove(cs..ce); }
         if !text.is_empty() { self.rope.insert(cs, text); }
         self.version += 1;
+        self.edit_log.push((range.start, removed.len(), text.len()));
         self.redo.clear();
         // 合并：上一次是插入，这次紧接着在末尾继续插入单个非换行字符
         if let Some(last) = self.undo.last_mut() {
@@ -181,6 +184,7 @@ impl Buffer {
         if ce > cs { self.rope.remove(cs..ce); }
         if !e.removed.is_empty() { self.rope.insert(cs, &e.removed); }
         self.version += 1;
+        self.edit_log.push((e.start, e.inserted.len(), e.removed.len()));
     }
 
     /// 撤销，返回应恢复的选区
@@ -204,6 +208,7 @@ impl Buffer {
         if ce > cs { self.rope.remove(cs..ce); }
         if !e.inserted.is_empty() { self.rope.insert(cs, &e.inserted); }
         self.version += 1;
+        self.edit_log.push((e.start, e.removed.len(), e.inserted.len()));
     }
 
     pub fn redo(&mut self) -> Option<Range<usize>> {

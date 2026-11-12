@@ -141,6 +141,7 @@ pub struct Workspace {
     right_tab: usize,
     focus_right: bool,
     warned_external: HashSet<String>,
+    stamps: HashMap<String, (std::time::SystemTime, u64)>,
     inline: Option<Entity<InlineView>>,
     changes: Vec<Change>,
     branch: Option<String>,
@@ -222,7 +223,7 @@ impl Workspace {
         let mut this = Self {
             focus: cx.focus_handle(), root: None, files: vec![], tabs: vec![], active: None, expanded: HashSet::new(), rows: vec![], tree_scroll: UniformListScrollHandle::new(),
             selected: None, side_view: SideView::Files, sidebar: settings.sidebar, agent_open: settings.agent_open, side_w: settings.side_w.clamp(180.0, 520.0), agent_w: settings.agent_w.clamp(320.0, 900.0), side_t: if settings.sidebar { 1.0 } else { 0.0 }, agent_t: if settings.agent_open { 1.0 } else { 0.0 }, resizing: None,
-            overlay: Overlay::None, menu: None, agent, terminal: None, term_open: false, term_h: settings.term_h.clamp(120.0, 620.0), term_t: 0.0, search_input, commit_input, search_hits: vec![], search_scroll: UniformListScrollHandle::new(), find_input, replace_input, find_replace: false, find_open: false, tabs_scroll: ScrollHandle::new(), split: false, left_tab: 0, right_tab: 0, focus_right: false, warned_external: HashSet::new(),
+            overlay: Overlay::None, menu: None, agent, terminal: None, term_open: false, term_h: settings.term_h.clamp(120.0, 620.0), term_t: 0.0, search_input, commit_input, search_hits: vec![], search_scroll: UniformListScrollHandle::new(), find_input, replace_input, find_replace: false, find_open: false, tabs_scroll: ScrollHandle::new(), split: false, left_tab: 0, right_tab: 0, focus_right: false, warned_external: HashSet::new(), stamps: HashMap::new(),
             inline: None, changes: vec![], branch: None, lsp_tx, lsp: HashMap::new(), lsp_ready: HashSet::new(), diags: HashMap::new(), doc_versions: HashMap::new(), change_seq: HashMap::new(), last_len: HashMap::new(), hover: None, completion: None, comp_seq: 0, symbols: vec![], symbols_key: (String::new(), u64::MAX), outline_scroll: UniformListScrollHandle::new(), settings, toasts: vec![], toast_seq: 0, recents: load_recents(), _subs: subs,
         };
         this.apply_theme(window, cx);
@@ -530,10 +531,10 @@ impl Workspace {
     /// 当前文件的符号列表（按文本版本缓存）
     fn ensure_symbols(&mut self, cx: &mut Context<Self>) {
         let Some(ed) = self.active_editor() else { self.symbols.clear(); self.symbols_key = (String::new(), u64::MAX); return };
-        let (path, ver, lang) = ed.read_with(cx, |e, _| (e.path.clone().unwrap_or_default(), e.buffer.version, e.lang));
+        let (path, ver) = ed.read_with(cx, |e, _| (e.path.clone().unwrap_or_default(), e.symbols_version));
         if self.symbols_key == (path.clone(), ver) { return; }
         self.symbols_key = (path, ver);
-        self.symbols = match lang { Some(l) if ed.read(cx).buffer.len() < 400_000 => outline::symbols(l, &ed.read(cx).text()), _ => vec![] };
+        self.symbols = ed.read(cx).symbols.clone();
     }
 
     /// 回到窗口时检查外部修改：没有未保存改动就自动重载，有就提醒一次
@@ -541,6 +542,11 @@ impl Workspace {
         let mut conflicts = vec![];
         let mut reloaded = false;
         for t in &self.tabs {
+            // 先看修改时间和大小，没变就不读文件内容（轮询每 1.5 秒一次，不能每次都读盘）
+            let Ok(meta) = std::fs::metadata(&t.path) else { continue };
+            let stamp = (meta.modified().unwrap_or(std::time::UNIX_EPOCH), meta.len());
+            if self.stamps.get(&t.path) == Some(&stamp) { continue; }
+            self.stamps.insert(t.path.clone(), stamp);
             let Ok(disk) = std::fs::read_to_string(&t.path) else { continue };
             let ed = t.editor.clone();
             if !ed.read(cx).disk_differs(&disk) { self.warned_external.remove(&t.path); continue; }
@@ -687,11 +693,12 @@ impl Workspace {
             let sub = cx.subscribe_in(&editor, window, |this, ed, ev: &EditorEvent, window, cx| match ev {
                 EditorEvent::InlineAssist => this.open_inline(window, cx),
                 EditorEvent::Changed => { let p = ed.read(cx).path.clone().unwrap_or_default(); this.on_editor_changed(&p, ed, cx); cx.notify(); }
-                EditorEvent::ReviewEnded => cx.notify(),
+                EditorEvent::ReviewEnded | EditorEvent::Analyzed => cx.notify(),
                 EditorEvent::Moved => this.on_editor_moved(ed, cx),
                 EditorEvent::Cancel => { if this.completion.is_some() || this.hover.is_some() { this.close_popups(cx); } else if this.find_open { this.close_find(window, cx); } }
                 _ => {}
             });
+            if let Ok(m) = std::fs::metadata(abs) { self.stamps.insert(abs.to_string(), (m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len())); }
             self.tabs.push(Tab { path: abs.to_string(), editor: editor.clone(), _sub: sub });
             self.lsp_did_open(abs, &text, cx);
             self.set_active_tab(self.tabs.len() - 1);
@@ -722,6 +729,7 @@ impl Workspace {
         match std::fs::write(&path, &text) {
             Ok(()) => {
                 ed.update(cx, |e, cx| { e.mark_saved(); cx.notify(); });
+                if let Ok(m) = std::fs::metadata(&path) { self.stamps.insert(path.clone(), (m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len())); }
                 if let Some(Some(c)) = Self::lang_key(&path).and_then(|k| self.lsp.get(k)) { c.notify("textDocument/didSave", serde_json::json!({ "textDocument": { "uri": lsp::path_to_uri(&path) }, "text": text })); }
                 self.refresh(cx);
                 if let Some(root) = self.root.clone() {
