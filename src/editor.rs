@@ -102,10 +102,8 @@ pub struct Editor {
     pub review: Option<Review>,
     pub head: Option<String>,
     head_hunks: (u64, Vec<Hunk>),
-    pub blink_on: bool,
-    /// 上一次切换亮 / 灭的时间：光标按它做渐隐渐现（见 caret.rs）
+    /// 闪烁周期的起点：打字 / 移动 / 刚获得焦点时重置，光标总是先满亮（见 caret.rs）
     pub blink_at: Instant,
-    blink_epoch: u64,
     pub dragging: bool,
     pub layout: crate::editor_element::LastLayout,
     pub search: Option<String>,
@@ -185,9 +183,7 @@ impl Editor {
             review: None,
             head: None,
             head_hunks: (u64::MAX, vec![]),
-            blink_on: true,
             blink_at: Instant::now(),
-            blink_epoch: 0,
             dragging: false,
             layout: Default::default(),
             search: None,
@@ -209,11 +205,17 @@ impl Editor {
             in_multi: false,
             last_multi: (0, u64::MAX),
         };
-        // 光标闪烁：输入后停 0.5s 再开始闪
+        // 光标闪烁（时间驱动，见 caret.rs）：只在「画面需要变化」的时刻唤醒一次——亮住结束 / 淡出结束 / 周期结束；
+        // 淡出期间由绘制自己连续请求下一帧。没聚焦时慢速轮询，不重绘。
         cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor().timer(Duration::from_millis(530)).await;
-                if this.update(cx, |e, cx| { if e.was_focused { e.blink_on = !e.blink_on; e.blink_at = Instant::now(); cx.notify(); } else if !e.blink_on { e.blink_on = true; } }).is_err() { break; }
+                let wait = match this.read_with(cx, |e, _| (e.was_focused, e.blink_at.elapsed())) {
+                    Ok((true, since)) => crate::caret::until_next_change(crate::caret::phase(since)) + Duration::from_millis(4),
+                    Ok((false, _)) => Duration::from_millis(500),
+                    Err(_) => break,
+                };
+                cx.background_executor().timer(wait).await;
+                if this.update(cx, |e, cx| { if e.was_focused { cx.notify(); } }).is_err() { break; }
             }
         })
         .detach();
@@ -645,10 +647,8 @@ impl Editor {
     fn touch(&mut self, cx: &mut Context<Self>) {
         self.reveal_cursor_in_folds();
         cx.emit(EditorEvent::Moved);
-        self.blink_on = true;
-        // 打字 / 移动后立刻满亮（不走渐变）：把「距离上次切换」设成很久以前
-        self.blink_at = Instant::now().checked_sub(Duration::from_secs(10)).unwrap_or_else(Instant::now);
-        self.blink_epoch += 1;
+        // 打字 / 移动后周期从头算：光标先满亮 200ms 再开始淡出
+        self.blink_at = Instant::now();
         self.reveal = true;
         cx.notify();
     }

@@ -36,6 +36,10 @@ cargo build --release    # 发布构建（首次很慢）
 
 输入框右下角的模型 chip（`AgentPanel::model_chip`）→ 选择器浮层（`⌘⌥/`，与 Zed 一致；↑↓ 选、↵ 确认、Esc 关）。选项由 `models::choices` 生成：Anthropic 内置 Fable 5.2 / Opus 5.5 / Sonnet 5.5 / Haiku 5.5，OpenAI 兼容只列「用过的模型」（`Settings.models`，最近在前、最多 10 个，设置页保存和选择器选中都会记录），当前模型不在列表里就置顶。选中后 `AgentEvent::ModelChanged` 让工作区同步并保存设置，只影响之后发出的请求。演示模式没有可选模型，点击 / 快捷键直接打开设置页。浮层必须是输入框容器的**最后一个子元素**，否则会被后绘制的输入框文字盖住。
 
+## 光标
+
+对标 VS Code `cursorBlinking: smooth` / IDEA：`caret.rs`（纯逻辑，有单测）。中性色（取 `theme.text`，不是强调色）、2px 笔直竖线、高度一整行（上下各让 0.5px）、没有圆角和光晕。闪烁周期 1s：亮住 200ms → 淡出 400ms → 暗住 400ms → 立刻亮起；打字 / 移动 / 刚获得焦点时 `Editor.blink_at` 重置，光标先满亮。时间驱动：编辑器的后台任务只在「画面需要变化」的时刻唤醒（`until_next_change`），淡出期间由绘制自己 `request_animation_frame`，亮住 / 暗住时画面静止、不重绘。
+
 ## 折叠与分屏
 
 折叠：`outline::fold_ranges`（tree-sitter 语法块）→ `Editor.folds` → `visible_lines()` 行映射，`editor_element` 的 `fold_map` 把行号映射成显示行；任何文本修改都会清空折叠。分屏：`Workspace.split / left_tab / right_tab / focus_right`，`self.active` 始终等于聚焦窗格的标签，所以其余命令不用感知分屏；同一文件不能同时出现在两个窗格（Editor 的滚动 / 布局状态是独占的）。

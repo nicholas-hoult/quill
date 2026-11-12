@@ -236,7 +236,7 @@ impl Element for EditorElement {
         let t0 = PerfT::now();
         let theme = cx.theme().clone();
         let focused = self.editor.read(cx).focus.is_focused(window);
-        if self.editor.read(cx).was_focused != focused { self.editor.update(cx, |e, _| e.was_focused = focused); }
+        if self.editor.read(cx).was_focused != focused { self.editor.update(cx, |e, _| { e.was_focused = focused; if focused { e.blink_at = std::time::Instant::now(); } }); }
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         let editor = self.editor.clone();
         let out = editor.update(cx, |ed, cx| {
@@ -472,16 +472,16 @@ impl Element for EditorElement {
                 let next = if dx.abs() < 0.4 && dy.abs() < 0.4 || dy.abs() > 200.0 { target } else { point(cur.x + px(dx * 0.55), cur.y + px(dy * 0.55)) };
                 if next != target { window.request_animation_frame(); }
                 ed.cursor_anim = Some(next);
-                let (cw, ch, cdy) = crate::caret::geometry(mode.font_size, mode.line_height);
+                let (cw, ch, cdy) = crate::caret::geometry(mode.line_height);
                 // 向左挪半个像素：细光标压在字符边界上，而不是侵入下一个字符
                 cursor_box = Some(Bounds::new(point(next.x - px(0.5), next.y + px(cdy)), size(px(cw), px(ch))));
             }
-            // 闪烁走渐隐渐现：过渡期间继续请求下一帧，稳定后不再重绘
-            let since = ed.blink_at.elapsed();
-            let caret_a = if focused { crate::caret::alpha(ed.blink_on, since) } else { 0.0 };
-            if focused && crate::caret::animating(since) { window.request_animation_frame(); }
+            // 闪烁（VS Code smooth）：只有淡出阶段连续请求下一帧，亮住 / 暗住时画面不变
+            let ph = crate::caret::phase(ed.blink_at.elapsed());
+            let caret_a = if focused { crate::caret::alpha(ph) } else { 0.0 };
+            if focused && crate::caret::fading(ph) { window.request_animation_frame(); }
             let extra_cursors: Vec<Bounds<Pixels>> = if focused && caret_a > 0.01 {
-                let (cw, ch, cdy) = crate::caret::geometry(mode.font_size, mode.line_height);
+                let (cw, ch, cdy) = crate::caret::geometry(mode.line_height);
                 ed.extra.iter().filter_map(|r| ed.layout_position(&rows, text_left, scroll_x, r.end, lh).map(|(x, y)| Bounds::new(point(x - px(0.5), y + px(cdy)), size(px(cw), px(ch))))).collect()
             } else { vec![] };
             let show_cursor = focused && ed.sel.is_empty() || (focused && ed.marked.is_some());
@@ -548,16 +548,11 @@ impl Element for EditorElement {
             if let Some(p) = &pre.placeholder {
                 let _ = p.paint(point(text_left, bounds.top() + px(padding) + px((lh - font_size * 1.25) / 2.0)), lhp, window, cx);
             }
-            // 光标：细、圆头、带一圈很淡的光晕，闪烁时渐隐渐现
+            // 光标：和 VS Code / IDEA 一样用接近文字的中性色（不是强调色）、笔直的 2px 竖线、一整行高，没有圆角和光晕
             let paint_caret = |window: &mut Window, b: Bounds<Pixels>| {
-                let a = pre.caret_alpha;
-                let mut body = theme.accent;
-                body.a *= a;
-                let mut glow = theme.accent;
-                glow.a = 0.38 * a;
-                let r = b.size.width / 2.;
-                window.paint_shadows(b, Corners::all(r), &[BoxShadow { color: glow, offset: point(px(0.), px(0.)), blur_radius: px(7.), spread_radius: px(0.) }]);
-                window.paint_quad(quad(b, r, body, px(0.), gpui::transparent_black(), BorderStyle::default()));
+                let mut c = theme.text;
+                c.a *= if theme.dark { 0.88 } else { 0.94 } * pre.caret_alpha;
+                window.paint_quad(fill(b, c));
             };
             if let Some(c) = pre.cursor { paint_caret(window, c); }
             for c in &pre.extra_cursors { paint_caret(window, *c); }
