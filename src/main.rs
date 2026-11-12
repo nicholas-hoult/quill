@@ -15,6 +15,7 @@ mod git;
 mod inline;
 mod lsp;
 mod md;
+mod multicursor;
 mod outline;
 mod palette;
 mod settings_view;

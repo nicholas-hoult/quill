@@ -12,6 +12,8 @@ struct Edit {
     sel_before: Range<usize>,
     sel_after: Range<usize>,
     at_ms: u64,
+    /// 同组的编辑一次撤销 / 重做（多光标连续输入）
+    group: u64,
 }
 
 pub struct Buffer {
@@ -20,6 +22,9 @@ pub struct Buffer {
     redo: Vec<Edit>,
     /// 每次修改 +1，供高亮缓存判断是否过期
     pub version: u64,
+    next_group: u64,
+    /// 为 true 时，下一次修改并入上一次修改的撤销组（只生效一次）
+    pub join_next: bool,
 }
 
 /// 连续输入合并成一次撤销的时间窗口
@@ -27,7 +32,7 @@ const MERGE_MS: u64 = 700;
 
 impl Buffer {
     pub fn new(text: &str) -> Self {
-        Self { rope: Rope::from_str(text), undo: vec![], redo: vec![], version: 0 }
+        Self { rope: Rope::from_str(text), undo: vec![], redo: vec![], version: 0, next_group: 0, join_next: false }
     }
 
     pub fn len(&self) -> usize { self.rope.len_bytes() }
@@ -167,7 +172,8 @@ impl Buffer {
                 return;
             }
         }
-        self.undo.push(Edit { start: range.start, removed, inserted: text.to_string(), sel_before, sel_after, at_ms: now_ms });
+        let group = if std::mem::take(&mut self.join_next) { self.undo.last().map(|e| e.group) } else { None }.unwrap_or_else(|| { self.next_group += 1; self.next_group });
+        self.undo.push(Edit { start: range.start, removed, inserted: text.to_string(), sel_before, sel_after, at_ms: now_ms, group });
     }
 
     fn apply_inverse(&mut self, e: &Edit) {
@@ -180,20 +186,38 @@ impl Buffer {
     /// 撤销，返回应恢复的选区
     pub fn undo(&mut self) -> Option<Range<usize>> {
         let e = self.undo.pop()?;
+        let g = e.group;
         self.apply_inverse(&e);
-        let sel = e.sel_before.clone();
+        let mut sel = e.sel_before.clone();
         self.redo.push(e);
+        while self.undo.last().map(|t| t.group == g).unwrap_or(false) {
+            let e = self.undo.pop().unwrap();
+            self.apply_inverse(&e);
+            sel = e.sel_before.clone();
+            self.redo.push(e);
+        }
         Some(sel)
     }
 
-    pub fn redo(&mut self) -> Option<Range<usize>> {
-        let e = self.redo.pop()?;
+    fn apply_forward(&mut self, e: &Edit) {
         let (cs, ce) = (self.rope.byte_to_char(e.start), self.rope.byte_to_char(e.start + e.removed.len()));
         if ce > cs { self.rope.remove(cs..ce); }
         if !e.inserted.is_empty() { self.rope.insert(cs, &e.inserted); }
         self.version += 1;
-        let sel = e.sel_after.clone();
+    }
+
+    pub fn redo(&mut self) -> Option<Range<usize>> {
+        let e = self.redo.pop()?;
+        let g = e.group;
+        self.apply_forward(&e);
+        let mut sel = e.sel_after.clone();
         self.undo.push(e);
+        while self.redo.last().map(|t| t.group == g).unwrap_or(false) {
+            let e = self.redo.pop().unwrap();
+            self.apply_forward(&e);
+            sel = e.sel_after.clone();
+            self.undo.push(e);
+        }
         Some(sel)
     }
 
@@ -289,6 +313,24 @@ mod tests {
         let b = Buffer::new("let foo_bar = 1;");
         assert_eq!(b.word_range(6), 4..11);
         assert_eq!(b.word_range(11), 11..12); // 落在空格上选空白
+    }
+
+    #[test]
+    fn 同组编辑一次撤销一次重做() {
+        let mut b = Buffer::new("ab");
+        b.replace(0..1, "X", 0..0, 1..1, 5000);
+        b.join_next = true;
+        b.replace(1..2, "Y", 0..0, 2..2, 5001);
+        b.replace(2..2, "Z", 0..0, 3..3, 99_999); // 不同组
+        assert_eq!(b.text(), "XYZ");
+        b.undo();
+        assert_eq!(b.text(), "XY");
+        b.undo();
+        assert_eq!(b.text(), "ab", "X、Y 同组，应一起撤销");
+        b.redo();
+        assert_eq!(b.text(), "XY", "重做也成组");
+        b.redo();
+        assert_eq!(b.text(), "XYZ");
     }
 
     #[test]

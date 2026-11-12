@@ -138,6 +138,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::find_next))
             .on_action(cx.listener(Self::find_prev))
             .on_action(cx.listener(Self::toggle_wrap))
+            .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::select_all_occurrences))
             .on_action(cx.listener(Self::fold_at_cursor))
             .on_action(cx.listener(Self::unfold_at_cursor))
             .on_action(cx.listener(|_, _: &ShowCharacterPalette, w, _| w.show_character_palette()))
@@ -178,6 +180,7 @@ pub struct Prepaint {
     focused: bool,
     eol_marks: Vec<Bounds<Pixels>>,
     dots: Vec<(Bounds<Pixels>, Hsla)>,
+    extra_cursors: Vec<Bounds<Pixels>>,
     chips: Vec<(Bounds<Pixels>, ShapedLine)>,
     chevrons: Vec<(Pixels, ShapedLine)>,
 }
@@ -417,6 +420,9 @@ impl Element for EditorElement {
                 cursor_box = Some(Bounds::new(point(next.x, next.y + px(1.)), size(px(2.), px(mode.line_height - 2.))));
             }
             if ed.blink_on || !focused { /* 保持 */ }
+            let extra_cursors: Vec<Bounds<Pixels>> = if focused && ed.blink_on {
+                ed.extra.iter().filter_map(|r| ed.layout_position(&rows, text_left, scroll_x, r.end, lh).map(|(x, y)| Bounds::new(point(x, y + px(1.)), size(px(2.), px(mode.line_height - 2.))))).collect()
+            } else { vec![] };
             let show_cursor = focused && ed.sel.is_empty() || (focused && ed.marked.is_some());
             let cursor_out = if show_cursor && ed.blink_on { cursor_box } else { None };
 
@@ -435,7 +441,7 @@ impl Element for EditorElement {
 
             if (ed.layout.total_h - total_h).abs() > 0.5 && mode.max_lines.is_some() { cx.notify(); }
             ed.layout = LastLayout { bounds, text_left: text_origin_x, rows, hunk_buttons, total_h, gutter_w };
-            Prepaint { hitbox, gutter_w, numbers, cursor: cursor_out, marks, row_bgs, thumb, buttons, placeholder, focused, eol_marks, dots, chips, chevrons }
+            Prepaint { hitbox, gutter_w, numbers, cursor: cursor_out, marks, row_bgs, thumb, buttons, placeholder, focused, eol_marks, dots, chips, chevrons, extra_cursors }
         })
     }
 
@@ -471,6 +477,7 @@ impl Element for EditorElement {
                 let _ = p.paint(point(text_left, bounds.top() + px(padding) + px((lh - font_size * 1.25) / 2.0)), lhp, window, cx);
             }
             if let Some(c) = pre.cursor { window.paint_quad(fill(c, theme.accent)); }
+            for c in &pre.extra_cursors { window.paint_quad(fill(*c, theme.accent)); }
             // 行号栏盖在滚动后的文本之上
             if mode_gutter {
                 window.paint_quad(fill(Bounds::new(bounds.origin, size(px(pre.gutter_w), bounds.size.height)), theme.bg));
@@ -605,6 +612,7 @@ fn line_runs(ed: &Editor, theme: &crate::theme::Theme, font: &Font, ls: usize, l
     for (r, _) in spans[first..].iter().take_while(|(r, _)| r.start < le) { cuts.push(r.start.clamp(ls, le)); cuts.push(r.end.clamp(ls, le)); }
     let sel = &ed.sel;
     if sel.start < le && sel.end > ls { cuts.push(sel.start.clamp(ls, le)); cuts.push(sel.end.clamp(ls, le)); }
+    for x in &ed.extra { if x.start < le && x.end > ls { cuts.push(x.start.clamp(ls, le)); cuts.push(x.end.clamp(ls, le)); } }
     let matches = &ed.search_matches;
     if !matches.is_empty() {
         let f = matches.partition_point(|r| r.end <= ls);
@@ -620,7 +628,7 @@ fn line_runs(ed: &Editor, theme: &crate::theme::Theme, font: &Font, ls: usize, l
         let (a, b) = (w[0], w[1]);
         while si < spans.len() && spans[si].0.end <= a { si += 1; }
         let color = if si < spans.len() && spans[si].0.start <= a { theme.syntax(spans[si].1) } else { theme.text };
-        let in_sel = !sel.is_empty() && a >= sel.start && b <= sel.end;
+        let in_sel = (!sel.is_empty() && a >= sel.start && b <= sel.end) || ed.extra.iter().any(|x| !x.is_empty() && a >= x.start && b <= x.end);
         let cur_match = ed.search_matches.get(ed.search_current);
         let bg = if in_sel { Some(theme.selection) }
             else if ed.search_matches.iter().any(|r| r.start <= a && b <= r.end) {

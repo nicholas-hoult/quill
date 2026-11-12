@@ -109,6 +109,10 @@ pub struct Editor {
     fold_gen: u64,
     visible_cache: (u64, u64, Vec<usize>),
     pub gutter_hover: bool,
+    /// 额外的光标 / 选区（多光标）；主选区是 `sel`
+    pub extra: Vec<Range<usize>>,
+    in_multi: bool,
+    last_multi: (u64, u64),
 }
 
 impl EventEmitter<EditorEvent> for Editor {}
@@ -171,6 +175,9 @@ impl Editor {
             fold_gen: 0,
             visible_cache: (u64::MAX, u64::MAX, vec![]),
             gutter_hover: false,
+            extra: vec![],
+            in_multi: false,
+            last_multi: (0, u64::MAX),
         };
         // 光标闪烁：输入后停 0.5s 再开始闪
         cx.spawn(async move |this, cx| {
@@ -285,6 +292,70 @@ impl Editor {
         self.head = head;
         self.head_hunks.0 = u64::MAX;
         cx.notify();
+    }
+
+    // ---------- 多光标 ----------
+
+    /// 主选区 + 额外选区，按位置排序并去重叠
+    pub fn all_sels(&self) -> Vec<Range<usize>> {
+        let mut v: Vec<Range<usize>> = std::iter::once(self.sel.clone()).chain(self.extra.iter().cloned()).collect();
+        v.sort_by_key(|r| (r.start, r.end));
+        v.dedup_by(|b, a| b.start < a.end || *a == *b);
+        v
+    }
+
+    /// 在所有选区上同时做修改，作为一次可撤销的操作；结束后每处都留下一个光标
+    fn multi_apply(&mut self, edits: Vec<(Range<usize>, String)>, cx: &mut Context<Self>) {
+        if edits.is_empty() || self.read_only { return; }
+        let text = self.buffer.text();
+        let (cover, new, pos) = crate::multicursor::apply_edits(&text, &edits);
+        let now = self.now_ms();
+        let before = self.sel.clone();
+        let carets: Vec<Range<usize>> = pos.iter().map(|p| *p..*p).collect();
+        let last = carets.last().cloned().unwrap_or(0..0);
+        // 700ms 内、中间没有别的修改的连续多光标输入，并入同一次撤销
+        self.buffer.join_next = now.saturating_sub(self.last_multi.0) < 700 && self.last_multi.1 == self.buffer.version;
+        self.in_multi = true;
+        self.buffer.replace(cover, &new, before, last.clone(), now + 10_000);
+        self.last_multi = (now, self.buffer.version);
+        self.in_multi = false;
+        self.sel = last;
+        self.reversed = false;
+        self.marked = None;
+        self.extra = carets[..carets.len().saturating_sub(1)].to_vec();
+        self.after_change(cx);
+    }
+
+    /// ⌘D：先选中光标处的单词；再按就把下一处相同内容加进选区
+    pub fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
+        if self.sel.is_empty() {
+            let r = self.buffer.word_range(self.cursor());
+            if r.is_empty() { return; }
+            self.sel = r;
+            self.reversed = false;
+            self.touch(cx);
+            return;
+        }
+        let needle = self.buffer.slice(self.sel.clone());
+        let taken = self.all_sels();
+        let from = taken.last().map(|r| r.end).unwrap_or(0);
+        let Some(next) = crate::multicursor::next_occurrence(&self.buffer.text(), &needle, from, &taken) else { return };
+        self.extra.push(self.sel.clone());
+        self.sel = next;
+        self.reversed = false;
+        self.touch(cx);
+    }
+
+    /// ⇧⌘L：选中全部相同内容
+    pub fn select_all_occurrences(&mut self, _: &SelectAllOccurrences, _: &mut Window, cx: &mut Context<Self>) {
+        let needle = if self.sel.is_empty() { let r = self.buffer.word_range(self.cursor()); self.buffer.slice(r) } else { self.buffer.slice(self.sel.clone()) };
+        let all = crate::multicursor::all_occurrences(&self.buffer.text(), &needle);
+        if all.len() < 2 { return; }
+        let last = all.last().cloned().unwrap();
+        self.extra = all[..all.len() - 1].to_vec();
+        self.sel = last;
+        self.reversed = false;
+        self.touch(cx);
     }
 
     // ---------- 代码折叠 ----------
@@ -532,6 +603,7 @@ impl Editor {
     }
 
     fn go(&mut self, offset: usize, select: bool, keep_goal: bool, cx: &mut Context<Self>) {
+        self.extra.clear();
         if !keep_goal { self.goal_col = None; }
         if select { self.select_to(offset, cx) } else { self.move_to(offset, cx) }
     }
@@ -593,6 +665,7 @@ impl Editor {
     /// 所有文本修改的唯一入口：更新缓冲区、选区、通知
     fn edit(&mut self, range: Range<usize>, text: &str, new_sel: Range<usize>, cx: &mut Context<Self>) {
         if self.read_only { return; }
+        if !self.in_multi { self.extra.clear(); }
         let now = self.now_ms();
         self.buffer.replace(range, text, self.sel.clone(), new_sel.clone(), now);
         self.sel = new_sel;
@@ -614,6 +687,11 @@ impl Editor {
     }
 
     pub fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.extra.is_empty() {
+            let edits: Vec<(Range<usize>, String)> = self.all_sels().into_iter().map(|r| if r.is_empty() { (self.buffer.prev_boundary(r.start)..r.start, String::new()) } else { (r, String::new()) }).collect();
+            self.multi_apply(edits, cx);
+            return;
+        }
         if self.sel.is_empty() {
             let c = self.cursor();
             if c == 0 { return; }
@@ -640,6 +718,11 @@ impl Editor {
     }
 
     pub fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.extra.is_empty() {
+            let edits: Vec<(Range<usize>, String)> = self.all_sels().into_iter().map(|r| if r.is_empty() { (r.start..self.buffer.next_boundary(r.start), String::new()) } else { (r, String::new()) }).collect();
+            self.multi_apply(edits, cx);
+            return;
+        }
         if self.sel.is_empty() {
             let c = self.cursor();
             let n = self.buffer.next_boundary(c);
@@ -811,13 +894,20 @@ impl Editor {
     pub fn move_line_down(&mut self, _: &MoveLineDown, _: &mut Window, cx: &mut Context<Self>) { self.move_lines(false, cx) }
 
     pub fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        self.extra.clear();
         if let Some(sel) = self.buffer.undo() { self.sel = sel.clone(); self.reversed = false; self.marked = None; self.after_change(cx); }
     }
     pub fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        self.extra.clear();
         if let Some(sel) = self.buffer.redo() { self.sel = sel.clone(); self.reversed = false; self.marked = None; self.after_change(cx); }
     }
 
     pub fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.extra.is_empty() {
+            let texts: Vec<String> = self.all_sels().iter().map(|r| self.buffer.slice(r.clone())).collect();
+            cx.write_to_clipboard(ClipboardItem::new_string(texts.join("\n")));
+            return;
+        }
         if !self.sel.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(self.selected_text()));
         } else if !self.mode.single_line {
@@ -846,6 +936,7 @@ impl Editor {
     }
 
     pub fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.extra.is_empty() { self.extra.clear(); cx.notify(); return; }
         if self.search.is_some() { self.search = None; self.search_matches.clear(); cx.notify(); return; }
         cx.emit(EditorEvent::Cancel);
     }
@@ -1082,6 +1173,11 @@ impl EntityInputHandler for Editor {
 
     fn replace_text_in_range(&mut self, range_utf16: Option<Range<usize>>, text: &str, _: &mut Window, cx: &mut Context<Self>) {
         if self.read_only { return; }
+        if range_utf16.is_none() && self.marked.is_none() && !self.extra.is_empty() {
+            let edits: Vec<(Range<usize>, String)> = self.all_sels().into_iter().map(|r| (r, text.to_string())).collect();
+            self.multi_apply(edits, cx);
+            return;
+        }
         let explicit = range_utf16.is_some();
         let range = range_utf16.as_ref().map(|r| self.range_from_utf16(r)).or(self.marked.clone()).unwrap_or(self.sel.clone());
         // 自动补全括号 / 引号：只处理最常见的情形（无选区或有选区时包裹）
