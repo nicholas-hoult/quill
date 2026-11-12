@@ -41,7 +41,7 @@ impl SettingsView {
     }
 
     fn save(&mut self, cx: &mut Context<Self>) {
-        let mut s = self.s.clone();
+        let mut s = self.s.clone(); // 布局字段沿用打开设置时的值，由工作区在保存后覆盖
         s.api_key = self.key.read(cx).text();
         s.model = self.model.read(cx).text();
         s.base_url = self.base.read(cx).text();

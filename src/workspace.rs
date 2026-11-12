@@ -195,8 +195,8 @@ impl Workspace {
         });
         let mut this = Self {
             focus: cx.focus_handle(), root: None, files: vec![], tabs: vec![], active: None, expanded: HashSet::new(), rows: vec![], tree_scroll: UniformListScrollHandle::new(),
-            selected: None, side_view: SideView::Files, sidebar: true, agent_open: true, side_w: 264.0, agent_w: 440.0, side_t: 1.0, agent_t: 1.0, resizing: None,
-            overlay: Overlay::None, menu: None, agent, terminal: None, term_open: false, term_h: 280.0, term_t: 0.0, search_input, commit_input, search_hits: vec![], search_scroll: UniformListScrollHandle::new(), find_input, replace_input, find_replace: false, find_open: false, tabs_scroll: ScrollHandle::new(), warned_external: HashSet::new(),
+            selected: None, side_view: SideView::Files, sidebar: settings.sidebar, agent_open: settings.agent_open, side_w: settings.side_w.clamp(180.0, 520.0), agent_w: settings.agent_w.clamp(320.0, 900.0), side_t: if settings.sidebar { 1.0 } else { 0.0 }, agent_t: if settings.agent_open { 1.0 } else { 0.0 }, resizing: None,
+            overlay: Overlay::None, menu: None, agent, terminal: None, term_open: false, term_h: settings.term_h.clamp(120.0, 620.0), term_t: 0.0, search_input, commit_input, search_hits: vec![], search_scroll: UniformListScrollHandle::new(), find_input, replace_input, find_replace: false, find_open: false, tabs_scroll: ScrollHandle::new(), warned_external: HashSet::new(),
             inline: None, changes: vec![], branch: None, symbols: vec![], symbols_key: (String::new(), u64::MAX), outline_scroll: UniformListScrollHandle::new(), settings, toasts: vec![], toast_seq: 0, recents: load_recents(), _subs: subs,
         };
         this.apply_theme(window, cx);
@@ -210,6 +210,16 @@ impl Workspace {
     }
 
     // ---------- 工具 ----------
+
+    /// 把当前布局写进设置文件（拖拽结束、开合面板时调用）
+    fn save_layout(&mut self) {
+        self.settings.side_w = self.side_w;
+        self.settings.agent_w = self.agent_w;
+        self.settings.term_h = self.term_h;
+        self.settings.sidebar = self.sidebar;
+        self.settings.agent_open = self.agent_open;
+        let _ = self.settings.save();
+    }
 
     pub fn root_path(&self) -> Option<PathBuf> { self.root.clone() }
 
@@ -668,7 +678,7 @@ impl Workspace {
         let name = self.root.as_ref().and_then(|r| r.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "Quill".into());
         let file = self.active.and_then(|i| self.tabs.get(i)).map(|t| self.rel(&t.path));
         div().h(px(44.)).flex_none().flex().items_center().gap(px(10.)).pl(px(84.)).pr(px(12.)).bg(t.panel).border_b_1().border_color(t.border).window_control_area(WindowControlArea::Drag)
-            .child(icon_button("tb-side", "sidebar", self.sidebar, cx).on_click(cx.listener(|this, _, _, cx| { this.sidebar = !this.sidebar; cx.notify(); })))
+            .child(icon_button("tb-side", "sidebar", self.sidebar, cx).on_click(cx.listener(|this, _, _, cx| { this.sidebar = !this.sidebar; this.save_layout(); cx.notify(); })))
             .child(div().flex().gap(px(6.)).text_color(t.dim).max_w(px(300.)).truncate().child(div().font_weight(FontWeight::SEMIBOLD).text_color(t.text).child(name)).when_some(file, |d, f| d.child(format!("· {f}"))))
             .child(div().flex_1())
             .child(
@@ -679,7 +689,7 @@ impl Workspace {
             )
             .child(div().flex_1())
             .child(icon_button("tb-term", "terminal", self.term_open, cx).on_click(cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx))))
-            .child(icon_button("tb-agent", "agent", self.agent_open, cx).on_click(cx.listener(|this, _, _, cx| { this.agent_open = !this.agent_open; cx.notify(); })))
+            .child(icon_button("tb-agent", "agent", self.agent_open, cx).on_click(cx.listener(|this, _, _, cx| { this.agent_open = !this.agent_open; this.save_layout(); cx.notify(); })))
             .child(icon_button("tb-set", "settings", false, cx).on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx))))
     }
 
@@ -1066,12 +1076,12 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &QuickOpen, window, cx| this.open_palette(PaletteMode::Files, window, cx)))
             .on_action(cx.listener(|this, _: &CommandPalette, window, cx| this.open_palette(PaletteMode::Commands, window, cx)))
             .on_action(cx.listener(|this, _: &Quit, window, cx| this.request_quit(window, cx)))
-            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| { this.sidebar = !this.sidebar; cx.notify(); }))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| { this.sidebar = !this.sidebar; this.save_layout(); cx.notify(); }))
             .on_action(cx.listener(|this, _: &GotoSymbol, window, cx| this.open_palette(PaletteMode::Symbols, window, cx)))
             .on_action(cx.listener(|this, _: &GotoLine, window, cx| this.open_palette(PaletteMode::Line, window, cx)))
             .on_action(cx.listener(|this, _: &ShowOutline, _, cx| { this.sidebar = true; this.side_view = SideView::Outline; cx.notify(); }))
             .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| this.toggle_terminal(window, cx)))
-            .on_action(cx.listener(|this, _: &ToggleAgent, _, cx| { this.agent_open = !this.agent_open; cx.notify(); }))
+            .on_action(cx.listener(|this, _: &ToggleAgent, _, cx| { this.agent_open = !this.agent_open; this.save_layout(); cx.notify(); }))
             .on_action(cx.listener(|this, _: &FocusAgent, window, cx| this.focus_agent(window, cx)))
             .on_action(cx.listener(|this, _: &ProjectSearch, window, cx| { this.sidebar = true; this.side_view = SideView::Search; window.focus(&this.search_input.read(cx).focus); cx.notify(); }))
             .on_action(cx.listener(|this, _: &ShowFiles, _, cx| { this.sidebar = true; this.side_view = SideView::Files; cx.notify(); }))
@@ -1098,7 +1108,7 @@ impl Render for Workspace {
                     cx.notify();
                 }
             }))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| { if this.resizing.take().is_some() { cx.notify(); } }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| { if this.resizing.take().is_some() { this.save_layout(); cx.notify(); } }))
             .child(self.titlebar(cx))
             .child(
                 div().flex_1().min_h_0().flex()

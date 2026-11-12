@@ -15,11 +15,27 @@ pub struct Settings {
     pub model: String,
     /// "system" | "dark" | "light"
     pub theme: String,
+    /// 界面布局（下次启动恢复）
+    #[serde(default = "d_side")]
+    pub side_w: f32,
+    #[serde(default = "d_agent")]
+    pub agent_w: f32,
+    #[serde(default = "d_term")]
+    pub term_h: f32,
+    #[serde(default = "d_true")]
+    pub sidebar: bool,
+    #[serde(default = "d_true")]
+    pub agent_open: bool,
 }
+
+fn d_side() -> f32 { 264.0 }
+fn d_agent() -> f32 { 440.0 }
+fn d_term() -> f32 { 280.0 }
+fn d_true() -> bool { true }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { provider: "mock".into(), api_key: String::new(), base_url: String::new(), model: "claude-sonnet-5-5".into(), theme: "system".into() }
+        Self { provider: "mock".into(), api_key: String::new(), base_url: String::new(), model: "claude-sonnet-5-5".into(), theme: "system".into(), side_w: d_side(), agent_w: d_agent(), term_h: d_term(), sidebar: true, agent_open: true }
     }
 }
 

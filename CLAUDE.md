@@ -15,9 +15,18 @@ cargo build --release    # 发布构建（首次很慢）
 
 ## 结构
 
-* 纯逻辑（可单测，改动必须带测试）：`buffer`（rope + 撤销）、`diff`（逐块审阅）、`syntax`（tree-sitter 高亮）、`fuzzy`、`blocks`（围栏解析）、`context`（@ 引用 + 提示词）、`md`、`tree`、`git`、`ai`（Anthropic / OpenAI 兼容 / mock，阻塞式 SSE 放后台线程）
+* 纯逻辑（可单测，改动必须带测试）：`buffer`（rope + 撤销）、`diff`（逐块审阅）、`syntax`（tree-sitter 高亮）、`fuzzy`、`blocks`（围栏解析）、`context`（@ 引用 + 提示词）、`md`、`tree`、`git`（含暂存 / 提交）、`outline`（符号大纲）、`agent_proto`（工具调用协议 + 演示脚本）、`tools`（Agent 工具：read_file / list_dir / search，路径限制在项目内）、`ai`（Anthropic / OpenAI 兼容 / mock，阻塞式 SSE 放后台线程）
 * 界面：`editor` + `editor_element`（自绘编辑器；同一套代码也当单行输入框和聊天输入框，见 `EditorMode`）、`workspace`（标题栏 / 侧栏 / 标签 / 状态栏 / 面板开合动画 / 拖拽分栏 / 浮层）、`agent`（对话面板）、`palette`、`settings_view`、`inline`（⌘K）、`terminal`（alacritty_terminal 内核）、`theme`（深浅两套）、`ui`（小组件）、`assets`（内嵌 SVG 图标）
 * AI 改动的落地：`Editor::apply_with_review` / `replace_range_streaming` 把新文本写进缓冲区并进入审阅，`refresh_review` 按 `diff::hunks` 生成显示行（含被删除行），`accept_hunk` / `reject_hunk` 逐块处理
+
+## Agent 工具调用
+
+`agent.rs` 的 `start_round` → `ai::run_agent_stream`（Anthropic 带 tools；mock 用 `agent_proto::mock_turn`；OpenAI 兼容退回纯文本）。遇到 `stop_reason == tool_use` 时 `run_tools` 执行工具并回填，再发起下一轮（上限 8 轮）。`edit_file` **不直接写盘**，发 `AgentEvent::Apply` 让工作区走逐块审阅。
+无 Key 验证：在对话里发含 `[tool-demo]` 的消息，mock 会依次 列目录 → 读文件 → 提交编辑。
+
+## 打包
+
+`scripts/bundle.sh`：release 产物 → `dist/Quill.app`（ad-hoc 签名）+ zip + dmg。`BIN=target/debug/quill SUFFIX=-preview scripts/bundle.sh` 可用开发构建先出一版。release 用独立目录 `CARGO_TARGET_DIR=target-release`，不会阻塞开发构建。
 
 ## 开发时看界面（重要）
 
