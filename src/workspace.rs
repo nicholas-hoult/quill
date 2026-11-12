@@ -533,11 +533,13 @@ impl Workspace {
         let cjk = "文件搜索改动大纲问题对话终端设置编辑保存关闭打开项目命令跳转符号折叠拆分查找替换提交暂存应用拒绝接受全部审阅模型发送停止复制已的是在有和不这我你他个为中上下来到说要会可以";
         let mut col = div().absolute().left(px(0.)).top(px(0.)).w(px(1100.)).flex().flex_col().whitespace_nowrap().text_color(hsla(0., 0., t.text.l, 0.004));
         for (family, size) in [(MONO_FONT, 13.0f32), (MONO_FONT, 12.0), (UI_FONT, 13.0), (UI_FONT, 12.0), (UI_FONT, 11.5)] {
-            // 同一串文字用不同的亚像素偏移各画一遍（字形栅格化按亚像素位置分版本）
+            // 同一串文字用不同的亚像素偏移各画一遍（字形栅格化按 X、Y 各 4 档亚像素位置分版本）。
+            // 行高固定成编辑器的 21px：编辑器每行基线的小数部分是固定的，默认行高（字号×1.3）
+            // 会让行顶累加出小数，Y 方向的档位对不上，编辑器真正用到的那一档就没被预热
             for off in [0.0f32, 0.25, 0.5, 0.75] {
-                col = col.child(div().ml(px(off)).font_family(family).text_size(px(size)).child(ascii.clone()));
+                col = col.child(div().ml(px(off)).h(px(21.)).line_height(px(21.)).font_family(family).text_size(px(size)).child(ascii.clone()));
             }
-            col = col.child(div().font_family(family).text_size(px(size)).child(cjk.to_string()));
+            col = col.child(div().h(px(21.)).line_height(px(21.)).font_family(family).text_size(px(size)).child(cjk.to_string()));
         }
         col
     }

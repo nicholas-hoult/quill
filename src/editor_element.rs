@@ -161,14 +161,28 @@ impl PxF for Pixels { fn f(self) -> f32 { f32::from(self) } }
 /// 开发用：QUILL_PERF=1 时每 90 帧在 stderr 打印编辑器 prepaint / paint 的平均耗时（毫秒）
 pub static AFTER_OPEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn perf_record(kind: usize, t0: std::time::Instant) {
+/// 当前线程已用的 CPU 时间（微秒）。机器被别的进程占满时墙钟时间不可信，CPU 时间基本不受影响
+fn thread_cpu_us() -> u64 {
+    #[repr(C)] struct Ts { sec: i64, nsec: i64 }
+    unsafe extern "C" { fn clock_gettime(clk: u32, ts: *mut Ts) -> i32; }
+    let mut ts = Ts { sec: 0, nsec: 0 };
+    // macOS 的 CLOCK_THREAD_CPUTIME_ID = 16
+    unsafe { clock_gettime(16, &mut ts); }
+    (ts.sec as u64) * 1_000_000 + (ts.nsec as u64) / 1000
+}
+
+pub struct PerfT(std::time::Instant, u64);
+impl PerfT { fn now() -> Self { PerfT(std::time::Instant::now(), thread_cpu_us()) } }
+
+fn perf_record(kind: usize, t0: PerfT) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var("QUILL_PERF").is_ok()) { return; }
     static US: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
     static N: AtomicU64 = AtomicU64::new(0);
-    let us = t0.elapsed().as_micros() as u64;
-    if AFTER_OPEN.load(Ordering::Relaxed) > 0 { AFTER_OPEN.fetch_sub(1, Ordering::Relaxed); eprintln!("[perf] 打开后的帧 {} {:.1}ms", if kind == 0 { "prepaint" } else { "paint" }, us as f64 / 1000.0); }
+    let us = t0.0.elapsed().as_micros() as u64;
+    let cpu = thread_cpu_us().saturating_sub(t0.1);
+    if AFTER_OPEN.load(Ordering::Relaxed) > 0 { AFTER_OPEN.fetch_sub(1, Ordering::Relaxed); eprintln!("[perf] 打开后的帧 {} 墙钟 {:.1}ms CPU {:.1}ms", if kind == 0 { "prepaint" } else { "paint" }, us as f64 / 1000.0, cpu as f64 / 1000.0); }
     if us > 4000 { eprintln!("[perf] 慢帧 {} {:.1}ms", if kind == 0 { "prepaint" } else { "paint" }, us as f64 / 1000.0); }
     US[kind].fetch_add(us, Ordering::Relaxed);
     if kind == 1 && N.fetch_add(1, Ordering::Relaxed) % 90 == 89 {
@@ -218,7 +232,7 @@ impl Element for EditorElement {
     }
 
     fn prepaint(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, bounds: Bounds<Pixels>, _: &mut (), window: &mut Window, cx: &mut App) -> Prepaint {
-        let t0 = std::time::Instant::now();
+        let t0 = PerfT::now();
         let theme = cx.theme().clone();
         let focused = self.editor.read(cx).focus.is_focused(window);
         if self.editor.read(cx).was_focused != focused { self.editor.update(cx, |e, _| e.was_focused = focused); }
@@ -492,7 +506,7 @@ impl Element for EditorElement {
     }
 
     fn paint(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, bounds: Bounds<Pixels>, _: &mut (), pre: &mut Prepaint, window: &mut Window, cx: &mut App) {
-        let t_paint = std::time::Instant::now();
+        let t_paint = PerfT::now();
         let theme = cx.theme().clone();
         let editor = self.editor.clone();
         let (lh, mode_gutter, single, padding) = { let e = editor.read(cx); (e.mode.line_height, e.mode.gutter, e.mode.single_line, e.mode.padding) };
