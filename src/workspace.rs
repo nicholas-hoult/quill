@@ -877,8 +877,8 @@ impl Workspace {
     fn apply_code(&mut self, path: Option<String>, code: String, window: &mut Window, cx: &mut Context<Self>) {
         let abs = match (&path, &self.root) {
             (Some(p), Some(root)) => {
-                let rel = p.trim_start_matches("./").trim_start_matches('/');
-                let abs = root.join(rel);
+                // 路径来自模型：不能用 .. 逃出项目根，否则会在项目外建目录、写文件
+                let abs = match crate::tools::apply_target(root, p) { Ok(a) => a, Err(e) => { self.toast(format!("不能应用到「{p}」：{e}"), true, cx); return; } };
                 if !abs.exists() {
                     if let Some(d) = abs.parent() { let _ = std::fs::create_dir_all(d); }
                     if let Err(e) = std::fs::write(&abs, "") { self.toast(format!("无法创建文件：{e}"), true, cx); return; }

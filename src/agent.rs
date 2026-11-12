@@ -163,8 +163,10 @@ impl AgentPanel {
                 let root = w.root_path();
                 let text = w.file_text_rel(&rel, cx);
                 // 读不到内容但文件存在（不是文本 / 没权限）：不能当成「新建」记下，否则回退会把它删掉
-                let exists = root.as_ref().map(|r| r.join(rel.trim_start_matches("./").trim_start_matches('/')).exists()).unwrap_or(true);
-                (text, exists)
+                // 路径非法（会被 apply_code 拒绝）的不记检查点
+                let legal = root.as_ref().map(|r| crate::tools::apply_target(r, &rel).is_ok()).unwrap_or(false);
+                let exists = root.as_ref().and_then(|r| crate::tools::apply_target(r, &rel).ok()).map(|p| p.exists()).unwrap_or(true);
+                (if legal { text } else { None }, exists || !legal)
             }).ok();
             if let Some((text, exists)) = before {
                 if text.is_some() || !exists {
@@ -462,6 +464,10 @@ impl AgentPanel {
             let Some((i, name, input)) = next else { break };
             let result = match name.as_str() {
                 "edit_file" => match (input["path"].as_str(), input["content"].as_str()) {
+                    // 路径不合法（比如含 ..）要如实告诉模型，让它改正，而不是假装成功
+                    (Some(p), Some(_)) if root.as_ref().map(|r| tools::apply_target(r, p).is_err()).unwrap_or(false) => {
+                        format!("错误：{}", tools::apply_target(root.as_ref().unwrap(), p).unwrap_err())
+                    }
                     (Some(p), Some(c)) => { self.emit_apply(msg_id, Some(p.to_string()), c.to_string(), cx); "修改已放进编辑器，等待用户审阅（接受或拒绝）。".to_string() }
                     _ => "错误：edit_file 需要 path 和 content".to_string(),
                 },

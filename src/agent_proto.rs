@@ -130,15 +130,21 @@ pub fn mock_cmd_turn(messages: &[Value]) -> Option<Vec<ProtoEvent>> {
 }
 
 /// 新建文件演示：用户消息含 `[new-demo]` 时，提交一次对新文件 `notes/by_agent.txt` 的 edit_file，然后总结。
+/// `[new-demo:路径]` 可以指定路径（用来验证路径逃逸会被拒绝）。
 pub fn mock_new_file_turn(messages: &[Value]) -> Option<Vec<ProtoEvent>> {
-    if !last_user_text(messages).contains("[new-demo]") { return None; }
+    let text = last_user_text(messages);
+    let path = match text.find("[new-demo:") {
+        Some(i) => text[i + 10..].split(']').next().unwrap_or("").to_string(),
+        None if text.contains("[new-demo]") => "notes/by_agent.txt".to_string(),
+        None => return None,
+    };
     let done = messages.iter().filter(|m| m["role"] == "user").filter_map(|m| m["content"].as_array()).filter_map(|a| a.first()).any(|b| b["type"] == "tool_result");
     Some(if done {
         vec![ProtoEvent::Text("新文件已经放进编辑器等你审阅。".into()), ProtoEvent::Stop("end_turn".into())]
     } else {
         vec![
             ProtoEvent::Text("我新建一个笔记文件。".into()),
-            ProtoEvent::ToolUse { id: "toolu_new1".into(), name: "edit_file".into(), input: json!({ "path": "notes/by_agent.txt", "content": "由 Agent 新建\n" }) },
+            ProtoEvent::ToolUse { id: "toolu_new1".into(), name: "edit_file".into(), input: json!({ "path": path, "content": "由 Agent 新建\n" }) },
             ProtoEvent::Stop("tool_use".into()),
         ]
     })
@@ -243,5 +249,12 @@ mod tests {
         let r = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_new1","content":"ok"}]});
         let t1 = mock_new_file_turn(&[u("[new-demo]"), json!({"role":"assistant","content":[]}), r]).unwrap();
         assert!(matches!(t1.last(), Some(ProtoEvent::Stop(s)) if s == "end_turn"));
+    }
+
+    #[test]
+    fn 新建文件演示可指定路径() {
+        let u = json!({"role":"user","content":"请 [new-demo:../escape.txt] 谢谢"});
+        let t = mock_new_file_turn(&[u]).unwrap();
+        assert!(matches!(&t[1], ProtoEvent::ToolUse { input, .. } if input["path"] == "../escape.txt"));
     }
 }

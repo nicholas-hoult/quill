@@ -35,6 +35,14 @@ pub fn safe_path(root: &Path, rel: &str) -> Result<PathBuf, String> {
     Ok(out)
 }
 
+/// 「应用代码块 / edit_file」的目标路径：模型常写 `/src/a.rs` 或 `./src/a.rs`，宽容地当成相对项目根；
+/// 但不允许 `..` 逃出项目根（否则会在项目外建目录、写文件）。
+pub fn apply_target(root: &Path, model_path: &str) -> Result<PathBuf, String> {
+    let rel = model_path.trim().trim_start_matches("./").trim_start_matches('/');
+    if rel.is_empty() { return Err("路径为空".into()); }
+    safe_path(root, rel)
+}
+
 const MAX_READ: usize = 60_000;
 
 /// 有副作用、必须先经用户确认的工具。edit_file 不在此列：它本身就要走逐块审阅。
@@ -330,5 +338,20 @@ mod tests {
         assert!(!t.1 && t.0.starts_with("超时"));
         assert_eq!(result_status("错误：没有打开项目"), None);
         assert_eq!(result_status("普通输出\n没有状态行"), None);
+    }
+
+    #[test]
+    fn 应用目标路径_宽容开头的斜杠_但不能逃出项目根() {
+        let root = Path::new("/p");
+        assert_eq!(apply_target(root, "src/a.rs").unwrap(), PathBuf::from("/p/src/a.rs"));
+        assert_eq!(apply_target(root, "./src/a.rs").unwrap(), PathBuf::from("/p/src/a.rs"));
+        assert_eq!(apply_target(root, "/src/a.rs").unwrap(), PathBuf::from("/p/src/a.rs"));
+        assert_eq!(apply_target(root, "  notes/new.txt ").unwrap(), PathBuf::from("/p/notes/new.txt"));
+        assert!(apply_target(root, "../x").is_err());
+        assert!(apply_target(root, "../../etc/hosts").is_err());
+        assert!(apply_target(root, "/../x").is_err());
+        assert!(apply_target(root, "src/../../x").is_err());
+        assert!(apply_target(root, "").is_err());
+        assert!(apply_target(root, "  ./ ").is_err());
     }
 }
