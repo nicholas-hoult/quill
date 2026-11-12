@@ -51,14 +51,19 @@ pub struct PromptView {
 }
 
 #[derive(Clone)]
-pub enum PromptKind { NewFile(String), NewFolder(String), Rename(String), ConfirmDelete(String) }
+pub enum PromptKind { NewFile(String), NewFolder(String), Rename(String), ConfirmDelete(String), ConfirmClose(String), ConfirmQuit }
+
+impl PromptKind {
+    fn is_confirm(&self) -> bool { matches!(self, PromptKind::ConfirmDelete(_) | PromptKind::ConfirmClose(_) | PromptKind::ConfirmQuit) }
+    fn ok_label(&self) -> &'static str { match self { PromptKind::ConfirmDelete(_) => "删除", PromptKind::ConfirmClose(_) => "放弃修改", PromptKind::ConfirmQuit => "放弃修改并退出", _ => "确定" } }
+}
 
 pub enum PromptEvent { Close, Submit(PromptKind, String) }
 impl EventEmitter<PromptEvent> for PromptView {}
 
 impl PromptView {
     fn new(title: &str, initial: &str, kind: PromptKind, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let confirm = matches!(kind, PromptKind::ConfirmDelete(_));
+        let confirm = kind.is_confirm();
         let input = cx.new(|cx| Editor::new(EditorMode::input(""), cx));
         input.update(cx, |e, cx| { e.set_text(initial, cx); });
         let focus = cx.focus_handle();
@@ -75,8 +80,8 @@ impl PromptView {
 impl Render for PromptView {
     fn render(&mut self, _w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.theme().clone();
-        let confirm = matches!(self.kind, PromptKind::ConfirmDelete(_));
-        div().id("prompt-scrim").track_focus(&self.focus).on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| { match ev.keystroke.key.as_str() { "escape" => cx.emit(PromptEvent::Close), "enter" if matches!(this.kind, PromptKind::ConfirmDelete(_)) => { let t = this.input.read(cx).text(); cx.emit(PromptEvent::Submit(this.kind.clone(), t)); } _ => {} } })).absolute().inset_0().flex().justify_center().items_start().pt(px(160.)).bg(t.scrim).occlude()
+        let confirm = self.kind.is_confirm();
+        div().id("prompt-scrim").track_focus(&self.focus).on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| { match ev.keystroke.key.as_str() { "escape" => cx.emit(PromptEvent::Close), "enter" if this.kind.is_confirm() => { let t = this.input.read(cx).text(); cx.emit(PromptEvent::Submit(this.kind.clone(), t)); } _ => {} } })).absolute().inset_0().flex().justify_center().items_start().pt(px(160.)).bg(t.scrim).occlude()
             .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.emit(PromptEvent::Close)))
             .child(
                 div().w(px(420.)).p(px(18.)).flex().flex_col().gap(px(12.)).rounded(px(14.)).bg(t.elev).border_1().border_color(t.border_strong)
@@ -86,7 +91,7 @@ impl Render for PromptView {
                     .when(!confirm, |d| d.child(div().h(px(36.)).px(px(12.)).flex().items_center().rounded(px(9.)).bg(t.bg).border_1().border_color(t.accent_line).child(div().flex_1().child(self.input.clone()))))
                     .child(div().flex().justify_end().gap(px(8.))
                         .child(btn("prompt-cancel", "取消", false, cx).on_click(cx.listener(|_, _, _, cx| cx.emit(PromptEvent::Close))))
-                        .child(btn("prompt-ok", if confirm { "删除" } else { "确定" }, true, cx).on_click(cx.listener(|this, _, _, cx| { let t = this.input.read(cx).text(); cx.emit(PromptEvent::Submit(this.kind.clone(), t)); })))),
+                        .child(btn("prompt-ok", self.kind.ok_label(), true, cx).on_click(cx.listener(|this, _, _, cx| { let t = this.input.read(cx).text(); cx.emit(PromptEvent::Submit(this.kind.clone(), t)); })))),
             )
     }
 }
@@ -183,6 +188,11 @@ impl Workspace {
             cx.background_executor().timer(Duration::from_millis(1500)).await;
             if this.update(cx, |w, cx| w.check_external_changes(cx)).is_err() { break; }
         }).detach();
+        // 点红色关闭按钮时同样要确认
+        let weak_self = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            weak_self.update(cx, |w, cx| { if w.has_dirty(cx) { w.request_quit(window, cx); false } else { true } }).unwrap_or(true)
+        });
         let mut this = Self {
             focus: cx.focus_handle(), root: None, files: vec![], tabs: vec![], active: None, expanded: HashSet::new(), rows: vec![], tree_scroll: UniformListScrollHandle::new(),
             selected: None, side_view: SideView::Files, sidebar: true, agent_open: true, side_w: 264.0, agent_w: 440.0, side_t: 1.0, agent_t: 1.0, resizing: None,
@@ -375,7 +385,26 @@ impl Workspace {
         }
     }
 
+    /// 关闭标签页；有未保存改动时先确认，避免悄悄丢失
     fn close_tab(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(i) else { return };
+        if tab.editor.read(cx).is_dirty() {
+            let name = tab.path.rsplit('/').next().unwrap_or(&tab.path).to_string();
+            let path = tab.path.clone();
+            self.prompt(&format!("「{name}」有未保存的改动，关闭后会丢失"), "", PromptKind::ConfirmClose(path), window, cx);
+            return;
+        }
+        self.close_tab_now(i, window, cx);
+    }
+
+    pub fn has_dirty(&self, cx: &App) -> bool { self.tabs.iter().any(|t| t.editor.read(cx).is_dirty()) }
+
+    /// 退出：有未保存改动时先确认
+    pub fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_dirty(cx) { self.prompt("有文件尚未保存，退出后改动会丢失", "", PromptKind::ConfirmQuit, window, cx); } else { cx.quit(); }
+    }
+
+    fn close_tab_now(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
         if i >= self.tabs.len() { return; }
         self.tabs.remove(i);
         self.active = if self.tabs.is_empty() { None } else { Some(match self.active { Some(a) if a > i => a - 1, Some(a) if a == i => i.min(self.tabs.len() - 1), Some(a) => a, None => 0 }) };
@@ -617,6 +646,10 @@ impl Workspace {
                     Err(e) => self.toast(e.to_string(), true, cx),
                 }
             }
+            PromptKind::ConfirmClose(path) => {
+                if let Some(i) = self.tabs.iter().position(|t| t.path == path) { self.close_tab_now(i, window, cx); }
+            }
+            PromptKind::ConfirmQuit => cx.quit(),
             PromptKind::ConfirmDelete(path) => {
                 let p = Path::new(&path);
                 let r = if p.is_dir() { std::fs::remove_dir_all(p) } else { std::fs::remove_file(p) };
@@ -1032,6 +1065,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &PrevTab, window, cx| { if this.tabs.len() > 1 { let n = (this.active.unwrap_or(0) + this.tabs.len() - 1) % this.tabs.len(); let p = this.tabs[n].path.clone(); this.open_file(&p, None, window, cx); } }))
             .on_action(cx.listener(|this, _: &QuickOpen, window, cx| this.open_palette(PaletteMode::Files, window, cx)))
             .on_action(cx.listener(|this, _: &CommandPalette, window, cx| this.open_palette(PaletteMode::Commands, window, cx)))
+            .on_action(cx.listener(|this, _: &Quit, window, cx| this.request_quit(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| { this.sidebar = !this.sidebar; cx.notify(); }))
             .on_action(cx.listener(|this, _: &GotoSymbol, window, cx| this.open_palette(PaletteMode::Symbols, window, cx)))
             .on_action(cx.listener(|this, _: &GotoLine, window, cx| this.open_palette(PaletteMode::Line, window, cx)))

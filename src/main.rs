@@ -34,6 +34,7 @@ fn main() {
     Application::new().with_assets(assets::Assets).run(|cx: &mut App| {
         actions::bind_keys(cx);
         cx.set_global(theme::Theme::dark());
+        // 兜底：没有任何视图有焦点时（例如点菜单栏）直接退出；有工作区时由它先检查未保存的改动
         cx.on_action(|_: &actions::Quit, cx| cx.quit());
         cx.set_menus(vec![
             Menu { name: "Quill".into(), items: vec![MenuItem::action("打开设置", actions::OpenSettings), MenuItem::separator(), MenuItem::action("退出 Quill", actions::Quit)] },
