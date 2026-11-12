@@ -10,7 +10,7 @@ actions!(
         MoveToDocStart, MoveToDocEnd, SelectToDocStart, SelectToDocEnd,
         PageUp, PageDown, SelectAll, Backspace, Delete, DeleteWordLeft, DeleteToLineStart, DeleteToLineEnd,
         Enter, Tab, Outdent, Undo, Redo, Copy, Cut, Paste, ToggleComment, DuplicateLine, MoveLineUp, MoveLineDown,
-        DeleteLine, Escape, Newline, ShowCharacterPalette, FindInFile, FindNext, FindPrev, AcceptHunk, RejectHunk,
+        DeleteLine, Escape, Newline, ToggleWrap, ReplaceCurrent, ReplaceAll, ShowCharacterPalette, FindInFile, FindNext, FindPrev, AcceptHunk, RejectHunk,
     ]
 );
 
@@ -19,7 +19,7 @@ actions!(
     [
         Save, CloseTab, NextTab, PrevTab, QuickOpen, CommandPalette, ToggleSidebar, ToggleTerminal, ToggleAgent,
         FocusAgent, ProjectSearch, OpenFolder, InlineAssist, AcceptReview, RejectReview, NewThread, OpenSettings, Quit,
-        ToggleTheme, ShowGit, ShowFiles, ApplyLatest, GotoSymbol, GotoLine, ShowOutline,
+        ToggleTheme, FindReplace, ShowGit, ShowFiles, ApplyLatest, GotoSymbol, GotoLine, ShowOutline,
     ]
 );
 
@@ -73,6 +73,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, Some("Editor")),
         KeyBinding::new("cmd-f", FindInFile, Some("Editor")),
         KeyBinding::new("cmd-g", FindNext, Some("Editor")),
+        KeyBinding::new("alt-z", ToggleWrap, Some("Editor")),
         KeyBinding::new("cmd-shift-g", FindPrev, Some("Editor")),
         // 工作区
         KeyBinding::new("cmd-s", Save, None),
@@ -93,6 +94,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-backspace", RejectReview, Some("Review")),
         KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-alt-f", FindReplace, None),
         KeyBinding::new("cmd-shift-o", GotoSymbol, None),
         KeyBinding::new("ctrl-g", GotoLine, None),
         KeyBinding::new("cmd-shift-enter", ApplyLatest, None),

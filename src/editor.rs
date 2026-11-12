@@ -187,6 +187,59 @@ impl Editor {
 
     pub fn mark_saved(&mut self) { self.saved_text = self.buffer.text(); }
 
+    /// 磁盘上的内容和上次保存 / 打开时不一样
+    pub fn disk_differs(&self, disk: &str) -> bool { disk != self.saved_text }
+
+    /// 文件在外部被修改且这里没有未保存的改动：直接换成磁盘内容，保留光标和滚动位置
+    pub fn reload_from_disk(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        if self.is_dirty() || self.review.is_some() { return false; }
+        self.buffer = Buffer::new(text);
+        self.saved_text = text.to_string();
+        let c = self.sel.start.min(text.len());
+        let c = (0..=c).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
+        self.sel = c..c;
+        self.spans_version = u64::MAX;
+        self.head_hunks.0 = u64::MAX;
+        cx.emit(EditorEvent::Changed);
+        cx.notify();
+        true
+    }
+
+    pub fn toggle_wrap(&mut self, _: &ToggleWrap, _: &mut Window, cx: &mut Context<Self>) {
+        if self.mode.single_line || self.mode.max_lines.is_some() { return; }
+        if !self.mode.wrap && self.buffer.line_count() > 6000 { return; } // 软换行要整体排版，超大文件会卡
+        self.mode.wrap = !self.mode.wrap;
+        self.scroll_x = 0.0;
+        self.touch(cx);
+    }
+
+    /// 把当前选中的匹配替换成 `with`，然后跳到下一个
+    pub fn replace_current(&mut self, with: &str, cx: &mut Context<Self>) {
+        let ms = self.matches().to_vec();
+        if ms.iter().any(|m| *m == self.sel) {
+            let r = self.sel.clone();
+            let p = r.start + with.len();
+            self.edit(r, with, p..p, cx);
+        }
+        self.search_version = u64::MAX;
+        self.find_step(true, cx);
+    }
+
+    /// 替换全部匹配，作为一次可撤销的修改，返回替换个数
+    pub fn replace_all_matches(&mut self, with: &str, cx: &mut Context<Self>) -> usize {
+        let ms = self.matches().to_vec();
+        if ms.is_empty() { return 0; }
+        let text = self.buffer.text();
+        let mut out = String::with_capacity(text.len());
+        let mut last = 0;
+        for m in &ms { out.push_str(&text[last..m.start]); out.push_str(with); last = m.end; }
+        out.push_str(&text[last..]);
+        let n = self.buffer.len();
+        self.edit(0..n, &out, 0..0, cx);
+        self.search_version = u64::MAX;
+        ms.len()
+    }
+
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.buffer = Buffer::new("");
         self.sel = 0..0;

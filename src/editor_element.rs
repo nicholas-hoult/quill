@@ -136,6 +136,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::escape))
             .on_action(cx.listener(Self::find_next))
             .on_action(cx.listener(Self::find_prev))
+            .on_action(cx.listener(Self::toggle_wrap))
             .on_action(cx.listener(|_, _: &ShowCharacterPalette, w, _| w.show_character_palette()))
             .on_action(cx.listener(|_, _: &InlineAssist, _, cx| cx.emit(EditorEvent::InlineAssist)));
         let lh = self.mode.line_height;

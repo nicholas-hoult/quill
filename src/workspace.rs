@@ -121,7 +121,11 @@ pub struct Workspace {
     search_hits: Vec<Hit>,
     search_scroll: UniformListScrollHandle,
     find_input: Entity<Editor>,
+    replace_input: Entity<Editor>,
+    find_replace: bool,
     find_open: bool,
+    tabs_scroll: ScrollHandle,
+    warned_external: HashSet<String>,
     inline: Option<Entity<InlineView>>,
     changes: Vec<Change>,
     branch: Option<String>,
@@ -154,6 +158,7 @@ impl Workspace {
         let agent = cx.new(|cx| AgentPanel::new(weak, settings.clone(), cx));
         let search_input = cx.new(|cx| Editor::new(EditorMode::input("在项目中搜索"), cx));
         let find_input = cx.new(|cx| Editor::new(EditorMode::input("查找"), cx));
+        let replace_input = cx.new(|cx| Editor::new(EditorMode::input("替换为"), cx));
         let commit_input = cx.new(|cx| Editor::new(EditorMode::composer("提交信息…"), cx));
         let mut subs = vec![];
         subs.push(cx.subscribe_in(&agent, window, |this, _, ev: &AgentEvent, window, cx| match ev {
@@ -168,10 +173,20 @@ impl Workspace {
             EditorEvent::Cancel => this.close_find(window, cx),
             _ => {}
         }));
+        subs.push(cx.observe_window_activation(window, |this, window, cx| { if window.is_window_active() { this.check_external_changes(cx); } }));
+        subs.push(cx.subscribe_in(&replace_input, window, |this, _, ev: &EditorEvent, window, cx| match ev {
+            EditorEvent::Submit => this.do_replace(false, cx),
+            EditorEvent::Cancel => this.close_find(window, cx),
+            _ => {}
+        }));
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_millis(1500)).await;
+            if this.update(cx, |w, cx| w.check_external_changes(cx)).is_err() { break; }
+        }).detach();
         let mut this = Self {
             focus: cx.focus_handle(), root: None, files: vec![], tabs: vec![], active: None, expanded: HashSet::new(), rows: vec![], tree_scroll: UniformListScrollHandle::new(),
             selected: None, side_view: SideView::Files, sidebar: true, agent_open: true, side_w: 264.0, agent_w: 440.0, side_t: 1.0, agent_t: 1.0, resizing: None,
-            overlay: Overlay::None, menu: None, agent, terminal: None, term_open: false, term_h: 280.0, term_t: 0.0, search_input, commit_input, search_hits: vec![], search_scroll: UniformListScrollHandle::new(), find_input, find_open: false,
+            overlay: Overlay::None, menu: None, agent, terminal: None, term_open: false, term_h: 280.0, term_t: 0.0, search_input, commit_input, search_hits: vec![], search_scroll: UniformListScrollHandle::new(), find_input, replace_input, find_replace: false, find_open: false, tabs_scroll: ScrollHandle::new(), warned_external: HashSet::new(),
             inline: None, changes: vec![], branch: None, symbols: vec![], symbols_key: (String::new(), u64::MAX), outline_scroll: UniformListScrollHandle::new(), settings, toasts: vec![], toast_seq: 0, recents: load_recents(), _subs: subs,
         };
         this.apply_theme(window, cx);
@@ -195,6 +210,30 @@ impl Workspace {
         if self.symbols_key == (path.clone(), ver) { return; }
         self.symbols_key = (path, ver);
         self.symbols = match lang { Some(l) if ed.read(cx).buffer.len() < 400_000 => outline::symbols(l, &ed.read(cx).text()), _ => vec![] };
+    }
+
+    /// 回到窗口时检查外部修改：没有未保存改动就自动重载，有就提醒一次
+    fn check_external_changes(&mut self, cx: &mut Context<Self>) {
+        let mut conflicts = vec![];
+        let mut reloaded = false;
+        for t in &self.tabs {
+            let Ok(disk) = std::fs::read_to_string(&t.path) else { continue };
+            let ed = t.editor.clone();
+            if !ed.read(cx).disk_differs(&disk) { self.warned_external.remove(&t.path); continue; }
+            if ed.update(cx, |e, cx| e.reload_from_disk(&disk, cx)) { reloaded = true; }
+            else if self.warned_external.insert(t.path.clone()) { conflicts.push(t.path.rsplit('/').next().unwrap_or(&t.path).to_string()); }
+        }
+        if !conflicts.is_empty() { self.toast(format!("{} 在磁盘上被修改，而这里有未保存的改动", conflicts.join("、")), true, cx); }
+        if reloaded { self.refresh(cx); self.reload_heads(cx); }
+    }
+
+    fn do_replace(&mut self, all: bool, cx: &mut Context<Self>) {
+        let with = self.replace_input.read(cx).text();
+        let Some(ed) = self.active_editor() else { return };
+        if all {
+            let n = ed.update(cx, |e, cx| e.replace_all_matches(&with, cx));
+            self.toast(if n == 0 { "没有可替换的内容".to_string() } else { format!("已替换 {n} 处") }, false, cx);
+        } else { ed.update(cx, |e, cx| e.replace_current(&with, cx)); }
     }
 
     pub fn file_text_rel(&self, rel: &str, cx: &App) -> Option<String> {
@@ -303,6 +342,7 @@ impl Workspace {
             }
         }
         self.selected = Some(abs.to_string());
+        if let Some(i) = self.active { self.tabs_scroll.scroll_to_item(i); }
         let ed = self.active_editor().unwrap();
         if let Some(l) = line { ed.update(cx, |e, cx| e.scroll_to_line(l.saturating_sub(1), cx)); }
         window.focus(&ed.read(cx).focus);
@@ -394,9 +434,16 @@ impl Workspace {
     fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active.is_none() { return; }
         self.find_open = true;
+        self.find_replace = false;
         let sel = self.active_editor().map(|e| e.read(cx).selected_text()).unwrap_or_default();
         if !sel.is_empty() && !sel.contains('\n') { self.find_input.update(cx, |f, cx| f.set_text(&sel, cx)); }
         window.focus(&self.find_input.read(cx).focus);
+        cx.notify();
+    }
+
+    fn open_replace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_find(window, cx);
+        self.find_replace = true;
         cx.notify();
     }
 
@@ -414,7 +461,7 @@ impl Workspace {
             CommandItem { title: "切换侧栏", keys: "⌘B" }, CommandItem { title: "切换 AI 对话", keys: "⇧⌘A" }, CommandItem { title: "聚焦对话输入框", keys: "⌘L" },
             CommandItem { title: "在项目中搜索", keys: "⇧⌘F" }, CommandItem { title: "查看 Git 改动", keys: "" }, CommandItem { title: "就地改写（Inline Assist）", keys: "⌘K" },
             CommandItem { title: "在文件中查找", keys: "⌘F" }, CommandItem { title: "新建对话", keys: "" }, CommandItem { title: "打开设置", keys: "⌘," },
-            CommandItem { title: "切换深色 / 浅色", keys: "" }, CommandItem { title: "关闭当前标签页", keys: "⌘W" }, CommandItem { title: "应用最近的代码块", keys: "⇧⌘↵" }, CommandItem { title: "切换终端", keys: "⌘J" }, CommandItem { title: "跳转到符号", keys: "⇧⌘O" }, CommandItem { title: "跳转到行", keys: "⌃G" }, CommandItem { title: "查看符号大纲", keys: "" },
+            CommandItem { title: "切换深色 / 浅色", keys: "" }, CommandItem { title: "关闭当前标签页", keys: "⌘W" }, CommandItem { title: "应用最近的代码块", keys: "⇧⌘↵" }, CommandItem { title: "切换终端", keys: "⌘J" }, CommandItem { title: "跳转到符号", keys: "⇧⌘O" }, CommandItem { title: "跳转到行", keys: "⌃G" }, CommandItem { title: "查看符号大纲", keys: "" }, CommandItem { title: "查找并替换", keys: "⌥⌘F" }, CommandItem { title: "切换自动换行", keys: "⌥Z" },
         ]
     }
 
@@ -462,6 +509,8 @@ impl Workspace {
             16 => self.open_palette(PaletteMode::Symbols, window, cx),
             17 => self.open_palette(PaletteMode::Line, window, cx),
             18 => { self.sidebar = true; self.side_view = SideView::Outline; cx.notify(); }
+            19 => self.open_replace(window, cx),
+            20 => { if let Some(e) = self.active_editor() { e.update(cx, |e, cx| e.toggle_wrap(&ToggleWrap, window, cx)); } }
             _ => {}
         }
     }
@@ -789,7 +838,7 @@ impl Workspace {
 
     fn tabs_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.theme().clone();
-        div().h(px(38.)).flex_none().flex().items_end().px(px(6.)).gap(px(2.)).bg(t.panel).border_b_1().border_color(t.border).overflow_hidden().children(self.tabs.iter().enumerate().map(|(i, tab)| {
+        div().id("tabs-bar").h(px(38.)).flex_none().flex().items_end().px(px(6.)).gap(px(2.)).bg(t.panel).border_b_1().border_color(t.border).overflow_x_scroll().track_scroll(&self.tabs_scroll).children(self.tabs.iter().enumerate().map(|(i, tab)| {
             let on = self.active == Some(i);
             let dirty = tab.editor.read(cx).is_dirty();
             let reviewing = tab.editor.read(cx).in_review();
@@ -811,11 +860,18 @@ impl Workspace {
     fn find_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.theme().clone();
         let (n, cur) = self.active_editor().map(|e| e.update(cx, |e, _| { let n = e.matches().len(); (n, e.search_current) })).unwrap_or((0, 0));
-        div().absolute().top(px(10.)).right(px(22.)).h(px(34.)).pl(px(12.)).pr(px(6.)).flex().items_center().gap(px(8.)).rounded(px(10.)).bg(t.elev).border_1().border_color(t.border_strong)
+        let field = |e: &Entity<Editor>| div().w(px(190.)).child(e.clone());
+        div().absolute().top(px(10.)).right(px(22.)).py(px(4.)).pl(px(12.)).pr(px(6.)).flex().flex_col().gap(px(2.)).rounded(px(10.)).bg(t.elev).border_1().border_color(t.border_strong)
             .shadow(vec![BoxShadow { color: hsla(0., 0., 0., 0.4), offset: point(px(0.), px(8.)), blur_radius: px(24.), spread_radius: px(0.) }])
-            .child(div().w(px(190.)).child(self.find_input.clone()))
-            .child(div().text_size(px(12.)).text_color(t.faint).min_w(px(44.)).child(if n == 0 { "无结果".to_string() } else { format!("{}/{}", cur + 1, n) }))
-            .child(icon_button("find-x", "x", false, cx).size(px(24.)).on_click(cx.listener(|this, _, window, cx| this.close_find(window, cx))))
+            .child(div().h(px(28.)).flex().items_center().gap(px(8.))
+                .child(field(&self.find_input))
+                .child(div().text_size(px(12.)).text_color(t.faint).min_w(px(44.)).child(if n == 0 { "无结果".to_string() } else { format!("{}/{}", cur + 1, n) }))
+                .child(icon_button("find-toggle", "chevron_down", self.find_replace, cx).size(px(24.)).on_click(cx.listener(|this, _, _, cx| { this.find_replace = !this.find_replace; cx.notify(); })))
+                .child(icon_button("find-x", "x", false, cx).size(px(24.)).on_click(cx.listener(|this, _, window, cx| this.close_find(window, cx)))))
+            .when(self.find_replace, |d| d.child(div().h(px(28.)).flex().items_center().gap(px(8.))
+                .child(field(&self.replace_input))
+                .child(btn("rep-one", "替换", false, cx).h(px(24.)).px(px(8.)).on_click(cx.listener(|this, _, _, cx| this.do_replace(false, cx))))
+                .child(btn("rep-all", "全部", false, cx).h(px(24.)).px(px(8.)).on_click(cx.listener(|this, _, _, cx| this.do_replace(true, cx))))))
     }
 
     fn review_bar(&self, ed: &Entity<Editor>, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
@@ -987,6 +1043,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleTheme, window, cx| this.toggle_theme(window, cx)))
             .on_action(cx.listener(|this, _: &NewThread, _, cx| this.agent.update(cx, |a, cx| a.new_thread(cx))))
+            .on_action(cx.listener(|this, _: &FindReplace, window, cx| this.open_replace(window, cx)))
             .on_action(cx.listener(|this, _: &FindInFile, window, cx| this.open_find(window, cx)))
             .on_action(cx.listener(|this, _: &ApplyLatest, _, cx| this.agent.update(cx, |a, cx| a.apply_latest(cx))))
             .on_action(cx.listener(|this, _: &AcceptReview, _, cx| { if let Some(e) = this.active_editor() { e.update(cx, |e, cx| e.accept_all(cx)); } }))
