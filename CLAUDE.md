@@ -24,6 +24,12 @@ cargo build --release    # 发布构建（首次很慢）
 `lsp.rs`：JSON-RPC over stdio 客户端（纯逻辑部分——帧解析、UTF-16 列换算、响应解析——有单测）。`workspace.rs` 里按语言惰性启动服务器（rust-analyzer / typescript-language-server / pyright / gopls，环境变量 `QUILL_LSP_<RUST|TYPESCRIPT|PYTHON|GO>` 可覆盖命令），全文同步（120ms 防抖）。已实现：诊断（波浪线 + 行号栏圆点 + 状态栏计数 + 「问题」面板）、补全（输入标识符 / `.` / `:` 自动触发，⌃Space 手动）、悬停（⌘I）、转到定义（F12）。
 没装真实服务器时的验证：`QUILL_LSP_RUST="python3 private/probes/mock_lsp.py"`（模拟服务器，含 UTF-16 列校验）。本机的 `rust-analyzer` 只是 rustup 空代理，需要 `rustup component add rust-analyzer`。
 
+## 性能
+
+界面线程不做整文件解析：`analysis.rs` 的后台工作线程一次算出 高亮 + 大纲 + 折叠范围，带文本版本号回传；`Editor::sync_analysis` 每帧先用 `Buffer.edit_log` 把旧高亮平移（`shift_spans`），再按需（首次立即、之后 120ms 防抖）提交任务，版本对不上的结果直接丢弃。`is_dirty` 按版本缓存；光标闪烁只在聚焦时重绘；磁盘变更轮询先比 mtime+大小。
+测量：`QUILL_PERF=1` 在 stderr 打印 >4ms 的慢帧和 prepaint 分段耗时。大文件测试数据可自己生成（把几个源码文件循环拼接成几万行）。
+实测（release，8000 行 Rust）：翻页最慢帧 ~11ms（主要是 CoreText 排版 45 行新文字），连续打字无慢帧；打开文件后常驻内存约 118MB。
+
 ## 折叠与分屏
 
 折叠：`outline::fold_ranges`（tree-sitter 语法块）→ `Editor.folds` → `visible_lines()` 行映射，`editor_element` 的 `fold_map` 把行号映射成显示行；任何文本修改都会清空折叠。分屏：`Workspace.split / left_tab / right_tab / focus_right`，`self.active` 始终等于聚焦窗格的标签，所以其余命令不用感知分屏；同一文件不能同时出现在两个窗格（Editor 的滚动 / 布局状态是独占的）。
