@@ -1,5 +1,6 @@
 /private
-/target
+/target*
 .worktrees/
 .claude/
 .DS_Store
+/dist
