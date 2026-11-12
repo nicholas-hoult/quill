@@ -192,6 +192,12 @@ impl Workspace {
         subs.push(cx.subscribe_in(&agent, window, |this, _, ev: &AgentEvent, window, cx| match ev {
             AgentEvent::Apply { path, code } => this.apply_code(path.clone(), code.clone(), window, cx),
             AgentEvent::OpenSettings => this.open_settings(window, cx),
+            AgentEvent::ModelChanged { model, models } => {
+                this.settings.model = model.clone();
+                this.settings.models = models.clone();
+                let _ = this.settings.save();
+                cx.notify();
+            }
         }));
         subs.push(cx.subscribe(&commit_input, |this, _, ev: &EditorEvent, cx| match ev { EditorEvent::Submit => this.do_commit(cx), EditorEvent::Changed => cx.notify(), _ => {} }));
         subs.push(cx.subscribe(&search_input, |this, _, ev: &EditorEvent, cx| if let EditorEvent::Changed = ev { this.run_search(cx) }));
@@ -1526,6 +1532,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| this.toggle_terminal(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleAgent, _, cx| { this.agent_open = !this.agent_open; this.save_layout(); cx.notify(); }))
             .on_action(cx.listener(|this, _: &FocusAgent, window, cx| this.focus_agent(window, cx)))
+            .on_action(cx.listener(|this, _: &ToggleModelMenu, window, cx| { this.focus_agent(window, cx); this.agent.update(cx, |a, cx| a.toggle_model_menu(cx)); }))
             .on_action(cx.listener(|this, _: &ProjectSearch, window, cx| { this.sidebar = true; this.side_view = SideView::Search; window.focus(&this.search_input.read(cx).focus); cx.notify(); }))
             .on_action(cx.listener(|this, _: &ShowFiles, _, cx| { this.sidebar = true; this.side_view = SideView::Files; cx.notify(); }))
             .on_action(cx.listener(|this, _: &OpenFolder, window, cx| this.pick_folder(window, cx)))

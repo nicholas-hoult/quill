@@ -21,6 +21,8 @@ use std::time::Duration;
 pub enum AgentEvent {
     Apply { path: Option<String>, code: String },
     OpenSettings,
+    /// 在对话面板里切换了模型：工作区据此同步并保存设置
+    ModelChanged { model: String, models: Vec<String> },
 }
 
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize, Debug)]
@@ -98,6 +100,9 @@ pub struct AgentPanel {
     running: Option<(u64, usize)>,
     /// 本会话内「始终允许运行命令」。只存内存，重启即失效
     always_allow: bool,
+    /// 模型选择器是否展开，以及键盘选中的项
+    model_menu: bool,
+    model_sel: usize,
     _sub: Subscription,
 }
 
@@ -115,13 +120,13 @@ impl AgentPanel {
         let sub = cx.subscribe(&composer, |this, _, ev: &EditorEvent, cx| match ev {
             EditorEvent::Submit => this.send(cx),
             EditorEvent::Changed => this.update_mention(cx),
-            EditorEvent::Cancel => { if this.awaiting.is_some() { this.decide(Decision::Deny, cx); } else if this.cancel.is_some() { this.stop(cx); } }
+            EditorEvent::Cancel => { if this.model_menu { this.close_model_menu(cx); } else if this.awaiting.is_some() { this.decide(Decision::Deny, cx); } else if this.cancel.is_some() { this.stop(cx); } }
             _ => {}
         });
         let threads = load_threads();
         let active = 0;
         let next_id = threads.iter().flat_map(|t| t.messages.iter().map(|m| m.id)).max().unwrap_or(0) + 1;
-        Self { workspace, composer, threads, active, cancel: None, scroll: ScrollHandle::new(), stick: true, files: vec![], active_file: None, dropped: vec![], extra: vec![], mention: None, menu: false, settings, next_id, rounds: 0, expanded: HashSet::new(), hl_cache: Default::default(), rules_file: None, rules_root: None, awaiting: None, running: None, always_allow: false, _sub: sub }
+        Self { workspace, composer, threads, active, cancel: None, scroll: ScrollHandle::new(), stick: true, files: vec![], active_file: None, dropped: vec![], extra: vec![], mention: None, menu: false, settings, next_id, rounds: 0, expanded: HashSet::new(), hl_cache: Default::default(), rules_file: None, rules_root: None, awaiting: None, running: None, always_allow: false, model_menu: false, model_sel: 0, _sub: sub }
     }
 
     pub fn focus_composer(&self, window: &mut Window, cx: &App) { window.focus(&self.composer.read(cx).focus); }
@@ -132,6 +137,44 @@ impl AgentPanel {
             let keep: Vec<&Thread> = self.threads.iter().take(40).collect();
             let _ = std::fs::write(p, serde_json::to_string(&keep).unwrap_or_default());
         }
+    }
+
+    fn model_choices(&self) -> Vec<crate::models::ModelChoice> {
+        crate::models::choices(&self.settings.provider, &self.settings.model, &self.settings.models)
+    }
+
+    /// 打开 / 关闭模型选择器。演示模式没有可选的模型，直接带去设置页填 Key。
+    pub fn toggle_model_menu(&mut self, cx: &mut Context<Self>) {
+        if self.model_menu { self.close_model_menu(cx); return; }
+        let choices = self.model_choices();
+        if choices.is_empty() { cx.emit(AgentEvent::OpenSettings); return; }
+        self.model_sel = choices.iter().position(|c| c.id == self.settings.model.trim()).unwrap_or(0);
+        self.model_menu = true;
+        self.mention = None;
+        self.composer.update(cx, |c, _| c.intercept = true);
+        cx.notify();
+    }
+
+    fn close_model_menu(&mut self, cx: &mut Context<Self>) {
+        self.model_menu = false;
+        self.composer.update(cx, |c, _| c.intercept = false);
+        cx.notify();
+    }
+
+    fn move_model_sel(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let n = self.model_choices().len();
+        if n == 0 { return; }
+        self.model_sel = (self.model_sel as isize + delta).rem_euclid(n as isize) as usize;
+        cx.notify();
+    }
+
+    /// 选中一个模型：立即生效（之后发出的请求用它），并写入设置
+    fn choose_model(&mut self, i: usize, cx: &mut Context<Self>) {
+        let Some(c) = self.model_choices().get(i).cloned() else { return };
+        self.settings.model = c.id.clone();
+        crate::models::remember(&mut self.settings.models, &c.id);
+        cx.emit(AgentEvent::ModelChanged { model: c.id, models: self.settings.models.clone() });
+        self.close_model_menu(cx);
     }
 
     /// 项目换了就重新找规则文件（渲染时调用，只在项目根变化时读盘）。
@@ -476,6 +519,44 @@ impl AgentPanel {
             ))
     }
 
+    /// 输入框右下角的模型 chip：当前模型的简短名称；演示模式显示「演示模式」，点击去设置
+    fn model_chip(&self, t: &crate::theme::Theme, cx: &mut Context<Self>) -> Stateful<Div> {
+        let mock = self.settings.provider == "mock";
+        let name = if mock { "演示模式".to_string() } else { crate::models::label(&self.settings.model) };
+        let (hover, dim, faint, text) = (t.hover, t.dim, t.faint, t.text);
+        div().id("model-chip").flex().items_center().gap(px(4.)).h(px(26.)).px(px(8.)).mr(px(4.)).rounded(px(8.)).cursor_pointer().text_size(px(12.)).text_color(dim)
+            .hover(move |s| s.bg(hover).text_color(text))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_model_menu(cx)))
+            .child(div().max_w(px(150.)).truncate().child(name))
+            .when(!mock, |d| d.child(icon("chevron_down", 12., faint)))
+    }
+
+    /// 模型选择器浮层：当前项有对勾，键盘选中项高亮；底部可去设置页管理 Key
+    fn model_menu_view(&self, t: &crate::theme::Theme, cx: &mut Context<Self>) -> Div {
+        let choices = self.model_choices();
+        let current = self.settings.model.trim().to_string();
+        let sel = self.model_sel;
+        div().absolute().right(px(0.)).bottom_full().mb(px(8.)).w(px(290.)).p(px(5.)).rounded(px(12.)).bg(t.elev).border_1().border_color(t.border_strong)
+            .shadow(vec![BoxShadow { color: hsla(0., 0., 0., 0.4), offset: point(px(0.), px(10.)), blur_radius: px(30.), spread_radius: px(0.) }])
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_model_menu(cx)))
+            .child(div().px(px(9.)).pt(px(4.)).pb(px(5.)).text_size(px(11.)).text_color(t.faint).child("选择模型"))
+            .children(choices.into_iter().enumerate().map(|(i, c)| {
+                let on = c.id == current;
+                div().id(("model-opt", i)).flex().items_center().gap(px(8.)).h(px(30.)).px(px(9.)).rounded(px(8.)).cursor_pointer().text_size(px(13.))
+                    .text_color(if i == sel { t.text } else { t.dim }).when(i == sel, |d| d.bg(t.accent_soft)).hover(|s| s.bg(t.hover))
+                    .on_click(cx.listener(move |this, _, _, cx| this.choose_model(i, cx)))
+                    .child(div().flex_none().w(px(14.)).child(if on { icon("check", 13., t.accent).into_any_element() } else { div().into_any_element() }))
+                    .child(div().flex_1().min_w_0().truncate().child(c.label.clone()))
+                    .child(div().flex_none().text_size(px(11.5)).text_color(t.faint).when(c.note.is_empty(), |d| d.font_family(MONO_FONT).max_w(px(110.)).truncate()).child(if c.note.is_empty() { if c.label == c.id { String::new() } else { c.id.clone() } } else { c.note.clone() }))
+            }))
+            .child(
+                div().id("model-manage").mt(px(4.)).pt(px(2.)).h(px(30.)).px(px(9.)).flex().items_center().border_t_1().border_color(t.border).text_size(px(12.)).text_color(t.faint).cursor_pointer().hover(|s| s.text_color(t.dim))
+                    .on_click(cx.listener(|this, _, _, cx| { this.close_model_menu(cx); cx.emit(AgentEvent::OpenSettings); }))
+                    .child("管理模型与 Key…"),
+            )
+    }
+
     /// 一次工具调用：读类是一行紧凑的摘要；run_command 是带确认按钮和输出的终端卡片
     fn render_call(&self, msg_id: u64, i: usize, c: &ToolCall, cx: &mut Context<Self>) -> Div {
         let t = cx.theme().clone();
@@ -615,14 +696,14 @@ impl Render for AgentPanel {
             .flex_col()
             .relative()
             .bg(t.panel)
-            .on_action(cx.listener(|this, _: &crate::actions::MoveUp, _, cx| { if let Some(m) = &mut this.mention { m.sel = (m.sel + m.items.len() - 1) % m.items.len(); cx.notify(); } }))
-            .on_action(cx.listener(|this, _: &crate::actions::MoveDown, _, cx| { if let Some(m) = &mut this.mention { m.sel = (m.sel + 1) % m.items.len(); cx.notify(); } }))
+            .on_action(cx.listener(|this, _: &crate::actions::MoveUp, _, cx| { if this.model_menu { this.move_model_sel(-1, cx); } else if let Some(m) = &mut this.mention { m.sel = (m.sel + m.items.len() - 1) % m.items.len(); cx.notify(); } }))
+            .on_action(cx.listener(|this, _: &crate::actions::MoveDown, _, cx| { if this.model_menu { this.move_model_sel(1, cx); } else if let Some(m) = &mut this.mention { m.sel = (m.sel + 1) % m.items.len(); cx.notify(); } }))
             .on_action(cx.listener(|this, _: &crate::actions::AcceptReview, _, cx| {
                 // ⌘↵：有命令在等确认就允许运行；否则交给后面的处理者（接受审阅）
                 if this.awaiting.is_some() { this.decide(Decision::Once, cx); } else { cx.propagate(); }
             }))
-            .on_action(cx.listener(|this, _: &crate::actions::Enter, _, cx| this.pick_mention(cx)))
-            .on_action(cx.listener(|this, _: &crate::actions::Tab, _, cx| this.pick_mention(cx)))
+            .on_action(cx.listener(|this, _: &crate::actions::Enter, _, cx| if this.model_menu { this.choose_model(this.model_sel, cx) } else { this.pick_mention(cx) }))
+            .on_action(cx.listener(|this, _: &crate::actions::Tab, _, cx| if this.model_menu { this.choose_model(this.model_sel, cx) } else { this.pick_mention(cx) }))
             .child(
                 div().h(px(44.)).flex_none().px(px(12.)).flex().items_center().gap(px(6.)).border_b_1().border_color(t.border)
                     .child(
@@ -671,6 +752,7 @@ impl Render for AgentPanel {
                             ))
                             .when_some(self.rules_file.clone(), |d, f| d.child(div().id("rules-tag").px(px(6.)).py(px(1.)).rounded(px(5.)).bg(t.press).text_color(t.dim).child(format!("规则 · {f}"))))
                             .child(div().flex_1())
+                            .child(self.model_chip(&t, cx))
                             .child(if streaming {
                                 div().id("stop").size(px(28.)).rounded(px(9.)).flex().items_center().justify_center().bg(t.press).cursor_pointer().child(icon("stop", 14., t.text))
                                     .on_click(cx.listener(|this, _, _, cx| this.stop(cx))).into_any_element()
@@ -678,7 +760,9 @@ impl Render for AgentPanel {
                                 div().id("send").size(px(28.)).rounded(px(9.)).flex().items_center().justify_center().bg(t.accent).cursor_pointer().when(!can_send, |d| d.opacity(0.3)).child(icon("send", 15., t.accent_ink))
                                     .on_click(cx.listener(|this, _, _, cx| this.send(cx))).into_any_element()
                             }),
-                    ),
+                    )
+                    // 最后绘制，才能盖在输入框文字上面；贴着输入框上沿，向上展开
+                    .when(self.model_menu, |d| d.child(self.model_menu_view(&t, cx))),
             )
             .when(self.menu, |d| d.child(
                 div().absolute().inset_0().id("thread-scrim").on_click(cx.listener(|this, _, _, cx| { this.menu = false; cx.notify(); })).child(

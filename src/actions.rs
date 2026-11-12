@@ -18,7 +18,7 @@ actions!(
     workspace,
     [
         Save, CloseTab, NextTab, PrevTab, QuickOpen, CommandPalette, ToggleSidebar, ToggleTerminal, ToggleAgent,
-        FocusAgent, ProjectSearch, OpenFolder, InlineAssist, AcceptReview, RejectReview, NewThread, OpenSettings, Quit,
+        FocusAgent, ToggleModelMenu, ProjectSearch, OpenFolder, InlineAssist, AcceptReview, RejectReview, NewThread, OpenSettings, Quit,
         ToggleTheme, FindReplace, ShowGit, ShowFiles, ApplyLatest, GotoSymbol, GotoLine, ShowOutline, GotoDefinition, ShowHover, TriggerCompletion, ShowProblems, SplitRight,
     ]
 );
@@ -90,6 +90,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-j", ToggleTerminal, None),
         KeyBinding::new("cmd-shift-a", ToggleAgent, None),
         KeyBinding::new("cmd-l", FocusAgent, None),
+        KeyBinding::new("cmd-alt-/", ToggleModelMenu, None), // 与 Zed 一致
         KeyBinding::new("cmd-shift-f", ProjectSearch, None),
         KeyBinding::new("cmd-o", OpenFolder, None),
         KeyBinding::new("cmd-k", InlineAssist, Some("Editor")),

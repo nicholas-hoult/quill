@@ -45,6 +45,7 @@ impl SettingsView {
         s.api_key = self.key.read(cx).text();
         s.model = self.model.read(cx).text();
         s.base_url = self.base.read(cx).text();
+        if s.provider != "mock" { crate::models::remember(&mut s.models, &s.model); }
         cx.emit(SettingsEvent::Save(s));
     }
 }

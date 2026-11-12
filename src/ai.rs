@@ -26,6 +26,9 @@ pub struct Settings {
     pub sidebar: bool,
     #[serde(default = "d_true")]
     pub agent_open: bool,
+    /// 用过的模型（最近的在前），模型选择器里列出（#4）
+    #[serde(default)]
+    pub models: Vec<String>,
 }
 
 fn d_side() -> f32 { 264.0 }
@@ -35,7 +38,7 @@ fn d_true() -> bool { true }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { provider: "mock".into(), api_key: String::new(), base_url: String::new(), model: "claude-sonnet-5-5".into(), theme: "system".into(), side_w: d_side(), agent_w: d_agent(), term_h: d_term(), sidebar: true, agent_open: true }
+        Self { provider: "mock".into(), api_key: String::new(), base_url: String::new(), model: "claude-sonnet-5-5".into(), theme: "system".into(), side_w: d_side(), agent_w: d_agent(), term_h: d_term(), sidebar: true, agent_open: true, models: vec![] }
     }
 }
 
