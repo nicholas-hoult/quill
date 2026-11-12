@@ -33,6 +33,21 @@ use std::path::PathBuf;
 use std::time::Duration;
 use workspace::Workspace;
 
+/// 启动时预热字体排版：第一次排版某个字体 / 中文回退字体会有一次性的初始化成本，
+/// 放在启动阶段付掉，而不是让用户第一次打开文件时承担。
+fn warm_up_text(window: &Window) {
+    let ts = window.text_system();
+    let sample_ascii: SharedString = "fn main() { let x = 42; // abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789 +-*/=<>(){}[]:;,.\"'`_#!?@&|\\^~% }".into();
+    let sample_cjk: SharedString = "你好，世界。这是一段用来预热中文回退字体的文字：文件、编辑、搜索、对话。".into();
+    for (family, size) in [(theme::MONO_FONT, 13.0f32), (theme::MONO_FONT, 12.0), (theme::UI_FONT, 13.0), (theme::UI_FONT, 12.0)] {
+        for text in [&sample_ascii, &sample_cjk] {
+            let run = TextRun { len: text.len(), font: font(family), color: hsla(0., 0., 0., 1.), background_color: None, underline: None, strikethrough: None };
+            let _ = ts.shape_line(text.clone(), px(size), &[run.clone()], None);
+            let _ = ts.shape_text(text.clone(), px(size), &[run], None, None);
+        }
+    }
+}
+
 fn main() {
     Application::new().with_assets(assets::Assets).run(|cx: &mut App| {
         actions::bind_keys(cx);
@@ -55,6 +70,7 @@ fn main() {
                     ..Default::default()
                 },
                 |window, cx| {
+                    warm_up_text(window);
                     let ws = cx.new(|cx| Workspace::new(window, cx));
                     window.focus(&ws.read(cx).focus_handle(cx));
                     if let Ok(p) = std::env::var("QUILL_OPEN") { ws.update(cx, |w, cx| w.open_root(PathBuf::from(p), window, cx)); }

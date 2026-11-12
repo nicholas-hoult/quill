@@ -159,6 +159,8 @@ pub trait PxF { fn f(self) -> f32; }
 impl PxF for Pixels { fn f(self) -> f32 { f32::from(self) } }
 
 /// 开发用：QUILL_PERF=1 时每 90 帧在 stderr 打印编辑器 prepaint / paint 的平均耗时（毫秒）
+pub static AFTER_OPEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn perf_record(kind: usize, t0: std::time::Instant) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -166,6 +168,7 @@ fn perf_record(kind: usize, t0: std::time::Instant) {
     static US: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
     static N: AtomicU64 = AtomicU64::new(0);
     let us = t0.elapsed().as_micros() as u64;
+    if AFTER_OPEN.load(Ordering::Relaxed) > 0 { AFTER_OPEN.fetch_sub(1, Ordering::Relaxed); eprintln!("[perf] 打开后的帧 {} {:.1}ms", if kind == 0 { "prepaint" } else { "paint" }, us as f64 / 1000.0); }
     if us > 4000 { eprintln!("[perf] 慢帧 {} {:.1}ms", if kind == 0 { "prepaint" } else { "paint" }, us as f64 / 1000.0); }
     US[kind].fetch_add(us, Ordering::Relaxed);
     if kind == 1 && N.fetch_add(1, Ordering::Relaxed) % 90 == 89 {
@@ -222,6 +225,23 @@ impl Element for EditorElement {
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         let editor = self.editor.clone();
         let out = editor.update(cx, |ed, cx| {
+            if std::env::var("QUILL_BENCH").is_ok() && ed.buffer.line_count() > 200 {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    let lines: Vec<String> = (100..160).map(|l| ed.buffer.line_text(l)).collect();
+                    let f = font(MONO_FONT);
+                    let mk = |t: &str| TextRun { len: t.len(), font: f.clone(), color: theme.text, background_color: None, underline: None, strikethrough: None };
+                    for round in 0..2 {
+                        let t = std::time::Instant::now();
+                        for l in &lines { let _ = window.text_system().shape_text(SharedString::from(format!("{l} ")), px(13.), &[mk(&format!("{l} "))], None, None); }
+                        let a = t.elapsed().as_micros() as f64 / 60.0;
+                        let t = std::time::Instant::now();
+                        for l in &lines { let s = format!("{l}  "); let _ = window.text_system().shape_line(SharedString::from(s.clone()), px(13.), &[mk(&s)], None); }
+                        let b = t.elapsed().as_micros() as f64 / 60.0;
+                        eprintln!("[bench] 第{}轮 每行：shape_text {:.0}µs  shape_line {:.0}µs", round + 1, a, b);
+                    }
+                });
+            }
             let t_ck = std::time::Instant::now();
             let mut cks: Vec<(&'static str, u128)> = vec![];
             let mode = ed.mode.clone();

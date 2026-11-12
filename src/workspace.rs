@@ -682,6 +682,9 @@ impl Workspace {
     }
 
     pub fn open_file(&mut self, abs: &str, line: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let t_open = std::time::Instant::now();
+        let perf = std::env::var("QUILL_PERF").is_ok();
+        let mut stages: Vec<(&'static str, u128)> = vec![];
         if let Some(i) = self.tabs.iter().position(|t| t.path == abs) {
             self.set_active_tab(i);
         } else {
@@ -689,7 +692,9 @@ impl Workspace {
                 Ok(b) => match String::from_utf8(b) { Ok(s) => s, Err(_) => { self.toast("不是 UTF-8 文本文件，无法打开", true, cx); return; } },
                 Err(e) => { self.toast(format!("无法打开：{e}"), true, cx); return; }
             };
+            stages.push(("读文件", t_open.elapsed().as_micros()));
             let editor = cx.new(|cx| { let mut e = Editor::new(EditorMode::code(), cx); e.open(Some(abs.to_string()), &text, cx); e });
+            stages.push(("创建编辑器", t_open.elapsed().as_micros()));
             let sub = cx.subscribe_in(&editor, window, |this, ed, ev: &EditorEvent, window, cx| match ev {
                 EditorEvent::InlineAssist => this.open_inline(window, cx),
                 EditorEvent::Changed => { let p = ed.read(cx).path.clone().unwrap_or_default(); this.on_editor_changed(&p, ed, cx); cx.notify(); }
@@ -700,7 +705,12 @@ impl Workspace {
             });
             if let Ok(m) = std::fs::metadata(abs) { self.stamps.insert(abs.to_string(), (m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len())); }
             self.tabs.push(Tab { path: abs.to_string(), editor: editor.clone(), _sub: sub });
-            self.lsp_did_open(abs, &text, cx);
+            // 语言服务器的启动（拉起子进程）不能占打开文件的关键路径：等首帧画完再做
+            let p = abs.to_string();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(Duration::from_millis(30)).await;
+                let _ = this.update(cx, |w, cx| { if let Some(t) = w.tabs.iter().find(|t| t.path == p) { let text = t.editor.read(cx).text(); w.lsp_did_open(&p, &text, cx); } });
+            }).detach();
             self.set_active_tab(self.tabs.len() - 1);
             if let Some(root) = self.root.clone() {
                 let rel = self.rel(abs);
@@ -720,6 +730,7 @@ impl Workspace {
         let rel = self.rel(abs);
         self.agent.update(cx, |a, _| { a.active_file = Some(rel); });
         cx.notify();
+        if perf { crate::editor_element::AFTER_OPEN.store(4, std::sync::atomic::Ordering::Relaxed); stages.push(("其余", t_open.elapsed().as_micros())); eprintln!("[perf] 打开文件（同步部分）{:?}", stages); }
     }
 
     fn save_active(&mut self, cx: &mut Context<Self>) {
