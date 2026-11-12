@@ -213,6 +213,7 @@ pub struct Prepaint {
     eol_marks: Vec<Bounds<Pixels>>,
     dots: Vec<(Bounds<Pixels>, Hsla)>,
     extra_cursors: Vec<Bounds<Pixels>>,
+    caret_alpha: f32,
     chips: Vec<(Bounds<Pixels>, ShapedLine)>,
     chevrons: Vec<(Pixels, ShapedLine)>,
 }
@@ -471,16 +472,20 @@ impl Element for EditorElement {
                 let next = if dx.abs() < 0.4 && dy.abs() < 0.4 || dy.abs() > 200.0 { target } else { point(cur.x + px(dx * 0.55), cur.y + px(dy * 0.55)) };
                 if next != target { window.request_animation_frame(); }
                 ed.cursor_anim = Some(next);
-                cursor_box = Some(Bounds::new(next, size(px(2.), px(mode.line_height - 2.))));
-                let _ = cursor_box;
-                cursor_box = Some(Bounds::new(point(next.x, next.y + px(1.)), size(px(2.), px(mode.line_height - 2.))));
+                let (cw, ch, cdy) = crate::caret::geometry(mode.font_size, mode.line_height);
+                // 向左挪半个像素：细光标压在字符边界上，而不是侵入下一个字符
+                cursor_box = Some(Bounds::new(point(next.x - px(0.5), next.y + px(cdy)), size(px(cw), px(ch))));
             }
-            if ed.blink_on || !focused { /* 保持 */ }
-            let extra_cursors: Vec<Bounds<Pixels>> = if focused && ed.blink_on {
-                ed.extra.iter().filter_map(|r| ed.layout_position(&rows, text_left, scroll_x, r.end, lh).map(|(x, y)| Bounds::new(point(x, y + px(1.)), size(px(2.), px(mode.line_height - 2.))))).collect()
+            // 闪烁走渐隐渐现：过渡期间继续请求下一帧，稳定后不再重绘
+            let since = ed.blink_at.elapsed();
+            let caret_a = if focused { crate::caret::alpha(ed.blink_on, since) } else { 0.0 };
+            if focused && crate::caret::animating(since) { window.request_animation_frame(); }
+            let extra_cursors: Vec<Bounds<Pixels>> = if focused && caret_a > 0.01 {
+                let (cw, ch, cdy) = crate::caret::geometry(mode.font_size, mode.line_height);
+                ed.extra.iter().filter_map(|r| ed.layout_position(&rows, text_left, scroll_x, r.end, lh).map(|(x, y)| Bounds::new(point(x - px(0.5), y + px(cdy)), size(px(cw), px(ch))))).collect()
             } else { vec![] };
             let show_cursor = focused && ed.sel.is_empty() || (focused && ed.marked.is_some());
-            let cursor_out = if show_cursor && ed.blink_on { cursor_box } else { None };
+            let cursor_out = if show_cursor && caret_a > 0.01 { cursor_box } else { None };
 
             // ---- 滚动条 ----
             let thumb = if total_h > view_h.f() + 1.0 && !mode.single_line && mode.gutter {
@@ -499,7 +504,7 @@ impl Element for EditorElement {
             if t_ck.elapsed().as_micros() > 9000 && std::env::var("QUILL_PERF").is_ok() { eprintln!("[perf] 分段(累计µs) {:?} runs={}µs shape={}µs", cks, PERF_RUNS.swap(0, std::sync::atomic::Ordering::Relaxed), PERF_SHAPE.swap(0, std::sync::atomic::Ordering::Relaxed)); } else { PERF_RUNS.store(0, std::sync::atomic::Ordering::Relaxed); PERF_SHAPE.store(0, std::sync::atomic::Ordering::Relaxed); }
             if (ed.layout.total_h - total_h).abs() > 0.5 && mode.max_lines.is_some() { cx.notify(); }
             ed.layout = LastLayout { bounds, text_left: text_origin_x, rows, hunk_buttons, total_h, gutter_w };
-            Prepaint { hitbox, gutter_w, numbers, cursor: cursor_out, marks, row_bgs, thumb, buttons, placeholder, focused, eol_marks, dots, chips, chevrons, extra_cursors }
+            Prepaint { hitbox, gutter_w, numbers, cursor: cursor_out, marks, row_bgs, thumb, buttons, placeholder, focused, eol_marks, dots, chips, chevrons, extra_cursors, caret_alpha: caret_a }
         });
         perf_record(0, t0);
         out
@@ -543,8 +548,19 @@ impl Element for EditorElement {
             if let Some(p) = &pre.placeholder {
                 let _ = p.paint(point(text_left, bounds.top() + px(padding) + px((lh - font_size * 1.25) / 2.0)), lhp, window, cx);
             }
-            if let Some(c) = pre.cursor { window.paint_quad(fill(c, theme.accent)); }
-            for c in &pre.extra_cursors { window.paint_quad(fill(*c, theme.accent)); }
+            // 光标：细、圆头、带一圈很淡的光晕，闪烁时渐隐渐现
+            let paint_caret = |window: &mut Window, b: Bounds<Pixels>| {
+                let a = pre.caret_alpha;
+                let mut body = theme.accent;
+                body.a *= a;
+                let mut glow = theme.accent;
+                glow.a = 0.38 * a;
+                let r = b.size.width / 2.;
+                window.paint_shadows(b, Corners::all(r), &[BoxShadow { color: glow, offset: point(px(0.), px(0.)), blur_radius: px(7.), spread_radius: px(0.) }]);
+                window.paint_quad(quad(b, r, body, px(0.), gpui::transparent_black(), BorderStyle::default()));
+            };
+            if let Some(c) = pre.cursor { paint_caret(window, c); }
+            for c in &pre.extra_cursors { paint_caret(window, *c); }
             // 行号栏盖在滚动后的文本之上
             if mode_gutter {
                 window.paint_quad(fill(Bounds::new(bounds.origin, size(px(pre.gutter_w), bounds.size.height)), theme.bg));

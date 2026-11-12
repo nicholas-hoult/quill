@@ -103,6 +103,8 @@ pub struct Editor {
     pub head: Option<String>,
     head_hunks: (u64, Vec<Hunk>),
     pub blink_on: bool,
+    /// 上一次切换亮 / 灭的时间：光标按它做渐隐渐现（见 caret.rs）
+    pub blink_at: Instant,
     blink_epoch: u64,
     pub dragging: bool,
     pub layout: crate::editor_element::LastLayout,
@@ -184,6 +186,7 @@ impl Editor {
             head: None,
             head_hunks: (u64::MAX, vec![]),
             blink_on: true,
+            blink_at: Instant::now(),
             blink_epoch: 0,
             dragging: false,
             layout: Default::default(),
@@ -210,7 +213,7 @@ impl Editor {
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_millis(530)).await;
-                if this.update(cx, |e, cx| { if e.was_focused { e.blink_on = !e.blink_on; cx.notify(); } else if !e.blink_on { e.blink_on = true; } }).is_err() { break; }
+                if this.update(cx, |e, cx| { if e.was_focused { e.blink_on = !e.blink_on; e.blink_at = Instant::now(); cx.notify(); } else if !e.blink_on { e.blink_on = true; } }).is_err() { break; }
             }
         })
         .detach();
@@ -643,6 +646,8 @@ impl Editor {
         self.reveal_cursor_in_folds();
         cx.emit(EditorEvent::Moved);
         self.blink_on = true;
+        // 打字 / 移动后立刻满亮（不走渐变）：把「距离上次切换」设成很久以前
+        self.blink_at = Instant::now().checked_sub(Duration::from_secs(10)).unwrap_or_else(Instant::now);
         self.blink_epoch += 1;
         self.reveal = true;
         cx.notify();

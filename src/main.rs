@@ -8,6 +8,7 @@ mod assets;
 mod blocks;
 mod checkpoint;
 mod buffer;
+mod caret;
 mod context;
 mod diff;
 mod editor;
