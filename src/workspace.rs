@@ -514,6 +514,11 @@ impl Workspace {
         div().id("problems").flex_1().min_h_0().overflow_y_scroll().pb(px(10.)).children(rows).into_any_element()
     }
 
+    /// 开发脚本用：对当前编辑器做一次鼠标按下（和真实点击走同一条代码路径）
+    pub fn debug_click(&mut self, x: f32, y: f32, clicks: usize, cx: &mut Context<Self>) {
+        if let Some(e) = self.active_editor() { e.update(cx, |e, cx| { e.mouse_down(point(px(x), px(y)), clicks, false, cx); e.dragging = false; }); }
+    }
+
     pub fn root_path(&self) -> Option<PathBuf> { self.root.clone() }
 
     fn active_editor(&self) -> Option<Entity<Editor>> { self.active.and_then(|i| self.tabs.get(i)).map(|t| t.editor.clone()) }

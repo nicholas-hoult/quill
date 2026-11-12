@@ -276,6 +276,29 @@ impl Editor {
         cx.notify();
     }
 
+    /// 鼠标按下：审阅按钮 / 定位光标 / 双击选词 / 三击选行。返回是否命中编辑内容。
+    pub fn mouse_down(&mut self, position: Point<Pixels>, click_count: usize, shift: bool, cx: &mut Context<Self>) -> bool {
+        if let Some(b) = self.layout.hunk_buttons.iter().find(|b| b.rect.contains(&position)) {
+            let (k, accept) = (b.hunk, b.accept);
+            if accept { self.accept_hunk(k, cx) } else { self.reject_hunk(k, cx) }
+            return true;
+        }
+        let lh = self.mode.line_height;
+        let len = self.buffer.len();
+        let Some(o) = self.layout.offset_at(position, lh, len) else { return false };
+        self.dragging = true;
+        match click_count {
+            2 => { let r = self.buffer.word_range(o); self.sel = r; self.reversed = false; cx.notify(); }
+            3 => {
+                let l = self.buffer.line_of(o);
+                let e = if l + 1 < self.buffer.line_count() { self.buffer.line_start(l + 1) } else { len };
+                self.sel = self.buffer.line_start(l)..e; self.reversed = false; cx.notify();
+            }
+            _ => if shift { self.select_to(o, cx) } else { self.move_to(o, cx) },
+        }
+        true
+    }
+
     /// 把语言服务器给的诊断（行 + UTF-16 列）换成字节范围
     pub fn set_diagnostics(&mut self, raw: &[crate::lsp::RawDiag], cx: &mut Context<Self>) {
         let b = &self.buffer;

@@ -72,6 +72,11 @@ fn main() {
                         "wait" => cx.background_executor().timer(Duration::from_millis(arg.parse().unwrap_or(500))).await,
                         "key" => { let k = arg.to_string(); let _ = cx.update_window(any, |_, window, cx| { if let Ok(ks) = Keystroke::parse(&k) { window.dispatch_keystroke(ks, cx); } }); }
                         "text" => { for ch in arg.chars() { let _ = cx.update_window(any, |_, window, cx| window.dispatch_keystroke(Keystroke { modifiers: Modifiers::default(), key: ch.to_string(), key_char: Some(ch.to_string()) }, cx)); cx.background_executor().timer(Duration::from_millis(15)).await; } }
+                        "click" | "dblclick" => {
+                            let (x, y) = arg.split_once(',').map(|(a, b)| (a.parse::<f32>().unwrap_or(0.), b.parse::<f32>().unwrap_or(0.))).unwrap_or((0., 0.));
+                            let n = if cmd == "dblclick" { 2 } else { 1 };
+                            let _ = handle.update(cx, |ws, _, cx| ws.debug_click(x, y, n, cx));
+                        }
                         "shot" => { if let Err(e) = shot::capture_own_window(arg) { eprintln!("截图失败：{e}"); } }
                         "quit" => { let _ = cx.update(|cx| cx.quit()); }
                         _ => eprintln!("未知步骤：{step}"),

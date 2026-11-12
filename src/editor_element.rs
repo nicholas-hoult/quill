@@ -470,25 +470,7 @@ impl Element for EditorElement {
                 let _ = hitbox_id;
                 editor.update(cx, |ed, cx| {
                     window.focus(&ed.focus);
-                    // 审阅按钮
-                    if let Some(b) = ed.layout.hunk_buttons.iter().find(|b| b.rect.contains(&ev.position)) {
-                        let (k, accept) = (b.hunk, b.accept);
-                        if accept { ed.accept_hunk(k, cx) } else { ed.reject_hunk(k, cx) }
-                        return;
-                    }
-                    let lh = ed.mode.line_height;
-                    let len = ed.buffer.len();
-                    let Some(o) = ed.layout.offset_at(ev.position, lh, len) else { return };
-                    ed.dragging = true;
-                    match ev.click_count {
-                        2 => { let r = ed.buffer.word_range(o); ed.sel = r; ed.reversed = false; cx.notify(); }
-                        3 => {
-                            let l = ed.buffer.line_of(o);
-                            let e = if l + 1 < ed.buffer.line_count() { ed.buffer.line_start(l + 1) } else { len };
-                            ed.sel = ed.buffer.line_start(l)..e; ed.reversed = false; cx.notify();
-                        }
-                        _ => if ev.modifiers.shift { ed.select_to(o, cx) } else { ed.move_to(o, cx) },
-                    }
+                    ed.mouse_down(ev.position, ev.click_count, ev.modifiers.shift, cx);
                 });
             });
         }
