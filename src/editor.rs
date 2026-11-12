@@ -16,6 +16,16 @@ pub enum EditorEvent {
     /// 请求打开行内改写
     InlineAssist,
     ReviewEnded,
+    /// 光标或内容变化（用于关闭补全 / 悬停弹窗）
+    Moved,
+}
+
+#[derive(Clone, Debug)]
+pub struct Diagnostic {
+    pub range: Range<usize>,
+    /// 1 错误 / 2 警告 / 3 信息 / 4 提示
+    pub severity: u8,
+    pub message: String,
 }
 
 #[derive(Clone)]
@@ -92,6 +102,7 @@ pub struct Editor {
     pub read_only: bool,
     /// 外部（如 @ 提及弹窗）接管 上/下/回车/Tab 时置位，编辑器把这些键交还给父级
     pub intercept: bool,
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 impl EventEmitter<EditorEvent> for Editor {}
@@ -148,6 +159,7 @@ impl Editor {
             cursor_anim: None,
             read_only: false,
             intercept: false,
+            diagnostics: vec![],
         };
         // 光标闪烁：输入后停 0.5s 再开始闪
         cx.spawn(async move |this, cx| {
@@ -264,6 +276,61 @@ impl Editor {
         cx.notify();
     }
 
+    /// 把语言服务器给的诊断（行 + UTF-16 列）换成字节范围
+    pub fn set_diagnostics(&mut self, raw: &[crate::lsp::RawDiag], cx: &mut Context<Self>) {
+        let b = &self.buffer;
+        let n = b.line_count();
+        self.diagnostics = raw.iter().filter(|d| d.start.0 < n).map(|d| {
+            let s = b.line_start(d.start.0) + crate::lsp::byte_col(&b.line_text(d.start.0), d.start.1);
+            let el = d.end.0.min(n - 1);
+            let mut e = b.line_start(el) + crate::lsp::byte_col(&b.line_text(el), d.end.1);
+            if e <= s { e = b.next_boundary(s).min(b.len()); }
+            Diagnostic { range: s..e.max(s), severity: d.severity, message: d.message.clone() }
+        }).collect();
+        cx.notify();
+    }
+
+    /// 字节偏移 → LSP 位置（行，UTF-16 列）
+    pub fn lsp_position(&self, offset: usize) -> (usize, usize) {
+        let l = self.buffer.line_of(offset);
+        let text = self.buffer.line_text(l);
+        let col = (offset.min(self.buffer.len()) - self.buffer.line_start(l)).min(text.len());
+        (l, crate::lsp::utf16_col(&text, col))
+    }
+
+    /// 跳到 LSP 位置并居中
+    pub fn goto_lsp(&mut self, line: usize, utf16: usize, cx: &mut Context<Self>) {
+        let l = line.min(self.buffer.line_count().saturating_sub(1));
+        let o = self.buffer.line_start(l) + crate::lsp::byte_col(&self.buffer.line_text(l), utf16);
+        let h = f32::from(self.layout.bounds.size.height).max(300.0);
+        self.scroll_y = (l as f32 * self.mode.line_height - h / 2.0).max(0.0);
+        self.move_to(o, cx);
+    }
+
+    /// 光标所在位置的诊断（优先覆盖光标的，其次同一行的）
+    pub fn diagnostic_near_cursor(&self) -> Option<&Diagnostic> {
+        let c = self.cursor();
+        let line = self.buffer.line_of(c);
+        self.diagnostics.iter().find(|d| d.range.start <= c && c <= d.range.end)
+            .or_else(|| self.diagnostics.iter().find(|d| self.buffer.line_of(d.range.start.min(self.buffer.len())) == line))
+    }
+
+    /// 光标前的标识符前缀起点（补全用）
+    pub fn word_start(&self) -> usize {
+        let c = self.cursor();
+        let text = self.buffer.slice(self.buffer.line_start(self.buffer.line_of(c))..c);
+        let tail: usize = text.chars().rev().take_while(|ch| ch.is_alphanumeric() || *ch == '_').map(|ch| ch.len_utf8()).sum();
+        c - tail
+    }
+
+    /// 用补全文本替换 [from, 光标)
+    pub fn accept_completion(&mut self, from: usize, text: &str, cx: &mut Context<Self>) {
+        let c = self.cursor();
+        let p = from + text.len();
+        self.sel = from..c;
+        self.edit(from..c, text, p..p, cx);
+    }
+
     pub fn cursor(&self) -> usize { if self.reversed { self.sel.start } else { self.sel.end } }
 
     pub fn cursor_line_col(&self) -> (usize, usize) {
@@ -304,6 +371,7 @@ impl Editor {
     // ---------- 选区 / 光标 ----------
 
     fn touch(&mut self, cx: &mut Context<Self>) {
+        cx.emit(EditorEvent::Moved);
         self.blink_on = true;
         self.blink_epoch += 1;
         self.reveal = true;

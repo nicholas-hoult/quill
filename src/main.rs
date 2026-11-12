@@ -13,6 +13,7 @@ mod editor_element;
 mod fuzzy;
 mod git;
 mod inline;
+mod lsp;
 mod md;
 mod outline;
 mod palette;

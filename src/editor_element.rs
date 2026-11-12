@@ -174,6 +174,7 @@ pub struct Prepaint {
     placeholder: Option<ShapedLine>,
     focused: bool,
     eol_marks: Vec<Bounds<Pixels>>,
+    dots: Vec<(Bounds<Pixels>, Hsla)>,
 }
 
 impl Element for EditorElement {
@@ -301,6 +302,9 @@ impl Element for EditorElement {
             let mut marks: Vec<(Bounds<Pixels>, Hsla)> = vec![];
             let mut numbers: Vec<(Pixels, ShapedLine, bool)> = vec![];
             let mut eol_marks: Vec<Bounds<Pixels>> = vec![];
+            let mut dots: Vec<(Bounds<Pixels>, Hsla)> = vec![];
+            let mut line_sev: std::collections::HashMap<usize, u8> = Default::default();
+            for d in &ed.diagnostics { let l = ed.buffer.line_of(d.range.start.min(ed.buffer.len())); let e = line_sev.entry(l).or_insert(d.severity); if d.severity < *e { *e = d.severity; } }
             let hunks_new: Vec<std::ops::Range<usize>> = ed.review.as_ref().map(|r| r.hunks.iter().map(|h| h.new.clone()).collect()).unwrap_or_default();
             let in_review = ed.review.is_some();
             for r in &rows {
@@ -322,6 +326,9 @@ impl Element for EditorElement {
                                     marks.push((Bounds::new(point(bounds.left() + px(gutter_w - 8.0), r.y - px(1.)), size(px(7.), px(2.))), theme.del));
                                 }
                             }
+                        }
+                        if let Some(sev) = line_sev.get(l) {
+                            if mode.gutter { dots.push((Bounds::new(point(bounds.left() + px(9.), r.y + px((mode.line_height - 6.0) / 2.0)), size(px(6.), px(6.))), diag_color(&theme, *sev))); }
                         }
                         if mode.gutter {
                             let s = (l + 1).to_string();
@@ -401,7 +408,7 @@ impl Element for EditorElement {
 
             if (ed.layout.total_h - total_h).abs() > 0.5 && mode.max_lines.is_some() { cx.notify(); }
             ed.layout = LastLayout { bounds, text_left: text_origin_x, rows, hunk_buttons, total_h };
-            Prepaint { hitbox, gutter_w, numbers, cursor: cursor_out, marks, row_bgs, thumb, buttons, placeholder, focused, eol_marks }
+            Prepaint { hitbox, gutter_w, numbers, cursor: cursor_out, marks, row_bgs, thumb, buttons, placeholder, focused, eol_marks, dots }
         })
     }
 
@@ -441,6 +448,7 @@ impl Element for EditorElement {
                     let _ = s.paint(point(x, *y + px(0.5)), lhp, window, cx);
                 }
                 for (b, c) in &pre.marks { window.paint_quad(fill(*b, *c)); }
+                for (b, c) in &pre.dots { window.paint_quad(quad(*b, px(3.), *c, px(0.), *c, BorderStyle::default())); }
             } else {
                 for (b, c) in &pre.marks { window.paint_quad(fill(*b, *c)); }
             }
@@ -564,6 +572,10 @@ fn shape_row(ed: &Editor, theme: &crate::theme::Theme, base_font: &Font, fsize: 
     }
 }
 
+pub fn diag_color(t: &crate::theme::Theme, sev: u8) -> Hsla {
+    match sev { 1 => t.del, 2 => t.modified, 3 => t.syntax(crate::syntax::Kind::Function), _ => t.dim }
+}
+
 fn expand_tabs(s: &str) -> (String, Vec<usize>) {
     if !s.contains('\t') { return (s.to_string(), vec![]); }
     let tabs: Vec<usize> = s.match_indices('\t').map(|(i, _)| i).collect();
@@ -583,6 +595,7 @@ fn line_runs(ed: &Editor, theme: &crate::theme::Theme, font: &Font, ls: usize, l
         for r in matches[f..].iter().take_while(|r| r.start < le) { cuts.push(r.start.clamp(ls, le)); cuts.push(r.end.clamp(ls, le)); }
     }
     if let Some(m) = &ed.marked { if m.start < le && m.end > ls { cuts.push(m.start.clamp(ls, le)); cuts.push(m.end.clamp(ls, le)); } }
+    for d in &ed.diagnostics { if d.range.start < le && d.range.end > ls { cuts.push(d.range.start.clamp(ls, le)); cuts.push(d.range.end.clamp(ls, le)); } }
     cuts.sort_unstable();
     cuts.dedup();
     let mut runs = Vec::with_capacity(cuts.len());
@@ -597,7 +610,8 @@ fn line_runs(ed: &Editor, theme: &crate::theme::Theme, font: &Font, ls: usize, l
             else if ed.search_matches.iter().any(|r| r.start <= a && b <= r.end) {
                 Some(if cur_match.map(|r: &Range<usize>| r.start <= a && b <= r.end).unwrap_or(false) { theme.accent_line } else { theme.accent_soft })
             } else { None };
-        let underline = ed.marked.as_ref().filter(|m| a >= m.start && b <= m.end).map(|_| UnderlineStyle { color: Some(theme.dim), thickness: px(1.), wavy: false });
+        let underline = ed.marked.as_ref().filter(|m| a >= m.start && b <= m.end).map(|_| UnderlineStyle { color: Some(theme.dim), thickness: px(1.), wavy: false })
+            .or_else(|| ed.diagnostics.iter().filter(|d| d.range.start <= a && b <= d.range.end).min_by_key(|d| d.severity).map(|d| UnderlineStyle { color: Some(diag_color(theme, d.severity)), thickness: px(1.3), wavy: true }));
         // 排版文本里 tab 被展开成 4 个空格，长度要按展开后计算
         let len_disp = to_display(tabs, b - ls) - to_display(tabs, a - ls);
         let _ = text;

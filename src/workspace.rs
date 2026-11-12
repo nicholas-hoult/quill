@@ -7,6 +7,7 @@ use crate::git::{self, Change};
 use crate::palette::{CommandItem, Palette, PaletteEvent, PaletteMode};
 use crate::settings_view::{SettingsEvent, SettingsView};
 use crate::inline::{InlineAssist as InlineView, InlineEvent};
+use crate::lsp::{self, LspEvent};
 use crate::outline::{self, Symbol};
 use crate::syntax;
 use crate::terminal::TerminalView;
@@ -14,12 +15,13 @@ use crate::theme::{ActiveTheme, MONO_FONT, Theme, UI_FONT};
 use crate::tree::{self, Hit, TreeRow};
 use crate::ui::{btn, file_icon, icon, icon_button, kbd};
 use gpui::{prelude::*, *};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Clone, Copy, PartialEq)]
-enum SideView { Files, Search, Git, Outline }
+enum SideView { Files, Search, Git, Outline, Problems }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Resize { Side, Agent, Term }
@@ -38,6 +40,10 @@ enum Overlay {
     Settings(Entity<SettingsView>),
     Prompt(Entity<PromptView>),
 }
+
+struct HoverCard { text: String, x: Pixels, y: Pixels }
+
+struct Completion { items: Vec<lsp::CompletionItem>, sel: usize, anchor: usize, line: usize, x: Pixels, y: Pixels }
 
 /// 文件树右键菜单
 struct ContextMenu { pos: Point<Pixels>, path: String, is_dir: bool }
@@ -134,6 +140,16 @@ pub struct Workspace {
     inline: Option<Entity<InlineView>>,
     changes: Vec<Change>,
     branch: Option<String>,
+    lsp_tx: async_channel::Sender<LspEvent>,
+    lsp: HashMap<&'static str, Option<Arc<lsp::Client>>>,
+    lsp_ready: HashSet<String>,
+    diags: HashMap<String, Vec<lsp::RawDiag>>,
+    doc_versions: HashMap<String, i64>,
+    change_seq: HashMap<String, u64>,
+    last_len: HashMap<String, usize>,
+    hover: Option<HoverCard>,
+    completion: Option<Completion>,
+    comp_seq: u64,
     symbols: Vec<Symbol>,
     symbols_key: (String, u64),
     outline_scroll: UniformListScrollHandle,
@@ -193,11 +209,17 @@ impl Workspace {
         window.on_window_should_close(cx, move |window, cx| {
             weak_self.update(cx, |w, cx| { if w.has_dirty(cx) { w.request_quit(window, cx); false } else { true } }).unwrap_or(true)
         });
+        let (lsp_tx, lsp_rx) = async_channel::unbounded::<LspEvent>();
+        cx.spawn(async move |this, cx| {
+            while let Ok(ev) = lsp_rx.recv().await {
+                if this.update(cx, |w, cx| w.on_lsp_event(ev, cx)).is_err() { break; }
+            }
+        }).detach();
         let mut this = Self {
             focus: cx.focus_handle(), root: None, files: vec![], tabs: vec![], active: None, expanded: HashSet::new(), rows: vec![], tree_scroll: UniformListScrollHandle::new(),
             selected: None, side_view: SideView::Files, sidebar: settings.sidebar, agent_open: settings.agent_open, side_w: settings.side_w.clamp(180.0, 520.0), agent_w: settings.agent_w.clamp(320.0, 900.0), side_t: if settings.sidebar { 1.0 } else { 0.0 }, agent_t: if settings.agent_open { 1.0 } else { 0.0 }, resizing: None,
             overlay: Overlay::None, menu: None, agent, terminal: None, term_open: false, term_h: settings.term_h.clamp(120.0, 620.0), term_t: 0.0, search_input, commit_input, search_hits: vec![], search_scroll: UniformListScrollHandle::new(), find_input, replace_input, find_replace: false, find_open: false, tabs_scroll: ScrollHandle::new(), warned_external: HashSet::new(),
-            inline: None, changes: vec![], branch: None, symbols: vec![], symbols_key: (String::new(), u64::MAX), outline_scroll: UniformListScrollHandle::new(), settings, toasts: vec![], toast_seq: 0, recents: load_recents(), _subs: subs,
+            inline: None, changes: vec![], branch: None, lsp_tx, lsp: HashMap::new(), lsp_ready: HashSet::new(), diags: HashMap::new(), doc_versions: HashMap::new(), change_seq: HashMap::new(), last_len: HashMap::new(), hover: None, completion: None, comp_seq: 0, symbols: vec![], symbols_key: (String::new(), u64::MAX), outline_scroll: UniformListScrollHandle::new(), settings, toasts: vec![], toast_seq: 0, recents: load_recents(), _subs: subs,
         };
         this.apply_theme(window, cx);
         this
@@ -219,6 +241,277 @@ impl Workspace {
         self.settings.sidebar = self.sidebar;
         self.settings.agent_open = self.agent_open;
         let _ = self.settings.save();
+    }
+
+
+    // ---------- 语言服务（LSP）----------
+
+    fn lang_key(path: &str) -> Option<&'static str> {
+        Some(match syntax::lang_for_path(path)? {
+            syntax::Lang::Rust => "rust",
+            syntax::Lang::JavaScript | syntax::Lang::TypeScript | syntax::Lang::Tsx => "typescript",
+            syntax::Lang::Python => "python",
+            syntax::Lang::Go => "go",
+            _ => return None,
+        })
+    }
+
+    fn language_id(path: &str) -> &'static str {
+        match path.rsplit('.').next().unwrap_or("") { "rs" => "rust", "ts" => "typescript", "tsx" => "typescriptreact", "js" | "mjs" | "cjs" => "javascript", "jsx" => "javascriptreact", "py" => "python", "go" => "go", _ => "plaintext" }
+    }
+
+    /// 取（必要时启动）该文件语言对应的语言服务器；没装 / 启动失败就记一笔，不再重试
+    fn lsp_client(&mut self, path: &str) -> Option<Arc<lsp::Client>> {
+        let key = Self::lang_key(path)?;
+        if let Some(slot) = self.lsp.get(key) { return slot.clone(); }
+        let root = self.root.clone()?;
+        let client = lsp::server_command(key).and_then(|(cmd, args)| lsp::Client::start(&cmd, &args, &root, key, self.lsp_tx.clone()).ok());
+        self.lsp.insert(key, client.clone());
+        client
+    }
+
+    fn on_lsp_event(&mut self, ev: LspEvent, cx: &mut Context<Self>) {
+        match &ev {
+            LspEvent::Ready(tag) => { self.lsp_ready.insert(tag.clone()); }
+            LspEvent::Exited(tag) => {
+                let hint = match tag.as_str() { "rust" => "rust-analyzer（运行 rustup component add rust-analyzer 安装）", "typescript" => "typescript-language-server（npm i -g typescript-language-server typescript）", "python" => "pyright-langserver（npm i -g pyright）", "go" => "gopls（go install golang.org/x/tools/gopls@latest）", _ => "语言服务器" };
+                let msg = if self.lsp_ready.remove(tag) { format!("{tag} 语言服务器已退出") } else { format!("没能启动 {hint}") };
+                if let Some(k) = ["rust", "typescript", "python", "go"].into_iter().find(|k| *k == tag) { self.lsp.insert(k, None); }
+                self.toast(msg, true, cx);
+            }
+            _ => {}
+        }
+        if let LspEvent::Diagnostics { uri, diags } = ev {
+            let Some(path) = lsp::uri_to_path(&uri) else { return };
+            if let Some(t) = self.tabs.iter().find(|t| t.path == path) { let d = diags.clone(); t.editor.update(cx, |e, cx| e.set_diagnostics(&d, cx)); }
+            if diags.is_empty() { self.diags.remove(&path); } else { self.diags.insert(path, diags); }
+            cx.notify();
+        }
+    }
+
+    fn lsp_did_open(&mut self, path: &str, text: &str, _cx: &mut Context<Self>) {
+        let Some(c) = self.lsp_client(path) else { return };
+        self.doc_versions.insert(path.to_string(), 1);
+        self.last_len.insert(path.to_string(), text.len());
+        c.notify("textDocument/didOpen", serde_json::json!({ "textDocument": { "uri": lsp::path_to_uri(path), "languageId": Self::language_id(path), "version": 1, "text": text } }));
+    }
+
+    fn lsp_did_close(&mut self, path: &str) {
+        if let Some(Some(c)) = Self::lang_key(path).and_then(|k| self.lsp.get(k)) { c.notify("textDocument/didClose", serde_json::json!({ "textDocument": { "uri": lsp::path_to_uri(path) } })); }
+        self.doc_versions.remove(path);
+        self.diags.remove(path);
+    }
+
+    /// 内容变化：防抖后把全文同步给语言服务器；输入标识符 / `.` / `::` 时自动触发补全
+    fn on_editor_changed(&mut self, path: &str, ed: &Entity<Editor>, cx: &mut Context<Self>) {
+        if path.is_empty() || !self.doc_versions.contains_key(path) { return; }
+        let seq = self.change_seq.entry(path.to_string()).or_insert(0);
+        *seq += 1;
+        let (my, p) = (*seq, path.to_string());
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(120)).await;
+            let _ = this.update(cx, |w, cx| {
+                if w.change_seq.get(&p) != Some(&my) { return; }
+                let Some(text) = w.file_text(&p, cx) else { return };
+                let v = w.doc_versions.entry(p.clone()).or_insert(1);
+                *v += 1;
+                let ver = *v;
+                if let Some(Some(c)) = Self::lang_key(&p).and_then(|k| w.lsp.get(k)) {
+                    c.notify("textDocument/didChange", serde_json::json!({ "textDocument": { "uri": lsp::path_to_uri(&p), "version": ver }, "contentChanges": [{ "text": text }] }));
+                }
+            });
+        }).detach();
+        // 自动补全：只在「刚输入了 1~2 个字符」且光标前是标识符字符、`.` 或 `:` 时
+        let (len, trigger, reviewing) = ed.read_with(cx, |e, _| {
+            let c = e.cursor();
+            let prev = e.buffer.slice(e.buffer.prev_boundary(c)..c);
+            (e.buffer.len(), prev.chars().next().map(|ch| ch.is_alphanumeric() || ch == '_' || ch == '.' || ch == ':').unwrap_or(false), e.in_review())
+        });
+        let old = self.last_len.insert(path.to_string(), len).unwrap_or(len);
+        let typed = len > old && len - old <= 2;
+        if (typed && trigger && !reviewing) || (self.completion.is_some() && !reviewing) {
+            self.comp_seq += 1;
+            let my = self.comp_seq;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(Duration::from_millis(160)).await;
+                let _ = this.update(cx, |w, cx| { if w.comp_seq == my { w.request_completion(false, cx); } });
+            }).detach();
+        }
+    }
+
+    fn on_editor_moved(&mut self, ed: &Entity<Editor>, cx: &mut Context<Self>) {
+        let (line, c) = ed.read_with(cx, |e, _| (e.buffer.line_of(e.cursor()), e.cursor()));
+        let close = self.completion.as_ref().map(|k| k.line != line || c < k.anchor).unwrap_or(false);
+        if close || self.hover.is_some() { self.close_popups(cx); }
+    }
+
+    fn close_popups(&mut self, cx: &mut Context<Self>) {
+        self.hover = None;
+        self.completion = None;
+        if let Some(e) = self.active_editor() { e.update(cx, |e, _| e.intercept = false); }
+        cx.notify();
+    }
+
+    fn request_completion(&mut self, explicit: bool, cx: &mut Context<Self>) {
+        let Some(ed) = self.active_editor() else { return };
+        let Some(path) = ed.read(cx).path.clone() else { return };
+        let Some(c) = self.lsp_client(&path) else { return };
+        if !c.ready.load(std::sync::atomic::Ordering::SeqCst) { return; }
+        let (line, col) = ed.read_with(cx, |e, _| e.lsp_position(e.cursor()));
+        let rx = c.request("textDocument/completion", serde_json::json!({ "textDocument": { "uri": lsp::path_to_uri(&path) }, "position": { "line": line, "character": col }, "context": { "triggerKind": 1 } }));
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(resp)) = rx.recv().await else { return };
+            let items = lsp::parse_completion(&resp);
+            let _ = this.update(cx, |w, cx| w.show_completion(items, explicit, cx));
+        }).detach();
+    }
+
+    fn show_completion(&mut self, items: Vec<lsp::CompletionItem>, explicit: bool, cx: &mut Context<Self>) {
+        let Some(ed) = self.active_editor() else { return };
+        let (anchor, prefix, line, pos, origin, lh, prev) = ed.read_with(cx, |e, _| {
+            let a = e.word_start();
+            let c = e.cursor();
+            (a, e.buffer.slice(a..c), e.buffer.line_of(c), e.layout.position_of(c, e.mode.line_height), e.layout.bounds.origin, e.mode.line_height, e.buffer.slice(e.buffer.prev_boundary(c)..c))
+        });
+        // 没有前缀时，只有刚输入 `.` / `:` 或手动触发才显示；数字开头不是标识符
+        if (prefix.is_empty() && !explicit && prev != "." && prev != ":") || prefix.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) { self.close_popups(cx); return; }
+        let pl = prefix.to_lowercase();
+        let items: Vec<lsp::CompletionItem> = items.into_iter().filter(|i| i.label.to_lowercase().starts_with(&pl) && i.insert != prefix).take(60).collect();
+        let Some((x, y)) = pos else { return };
+        if items.is_empty() { self.close_popups(cx); return; }
+        ed.update(cx, |e, _| e.intercept = true);
+        self.hover = None;
+        self.completion = Some(Completion { items, sel: 0, anchor, line, x: x - origin.x, y: y - origin.y + px(lh) });
+        cx.notify();
+    }
+
+    fn completion_step(&mut self, d: isize, cx: &mut Context<Self>) {
+        if let Some(c) = &mut self.completion {
+            let n = c.items.len() as isize;
+            c.sel = ((c.sel as isize + d).rem_euclid(n)) as usize;
+            cx.notify();
+        }
+    }
+
+    fn accept_selected_completion(&mut self, cx: &mut Context<Self>) {
+        let Some(c) = self.completion.take() else { return };
+        let Some(item) = c.items.get(c.sel).cloned() else { return };
+        if let Some(ed) = self.active_editor() { ed.update(cx, |e, cx| { e.intercept = false; e.accept_completion(c.anchor, &item.insert, cx); }); }
+        cx.notify();
+    }
+
+    fn show_hover(&mut self, cx: &mut Context<Self>) {
+        let Some(ed) = self.active_editor() else { return };
+        let Some(path) = ed.read(cx).path.clone() else { return };
+        let Some(c) = self.lsp_client(&path) else { self.toast("这个语言没有可用的语言服务器", true, cx); return };
+        let (line, col) = ed.read_with(cx, |e, _| e.lsp_position(e.cursor()));
+        let rx = c.request("textDocument/hover", serde_json::json!({ "textDocument": { "uri": lsp::path_to_uri(&path) }, "position": { "line": line, "character": col } }));
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(resp)) = rx.recv().await else { return };
+            let text = lsp::parse_hover(&resp);
+            let _ = this.update(cx, |w, cx| {
+                let Some(text) = text else { w.toast("这里没有悬停信息", false, cx); return };
+                let Some(ed) = w.active_editor() else { return };
+                let (pos, origin, lh) = ed.read_with(cx, |e, _| (e.layout.position_of(e.cursor(), e.mode.line_height), e.layout.bounds.origin, e.mode.line_height));
+                let Some((x, y)) = pos else { return };
+                w.completion = None;
+                w.hover = Some(HoverCard { text, x: x - origin.x, y: y - origin.y + px(lh) });
+                cx.notify();
+            });
+        }).detach();
+    }
+
+    fn goto_definition(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ed) = self.active_editor() else { return };
+        let Some(path) = ed.read(cx).path.clone() else { return };
+        let Some(c) = self.lsp_client(&path) else { self.toast("这个语言没有可用的语言服务器", true, cx); return };
+        let (line, col) = ed.read_with(cx, |e, _| e.lsp_position(e.cursor()));
+        let rx = c.request("textDocument/definition", serde_json::json!({ "textDocument": { "uri": lsp::path_to_uri(&path) }, "position": { "line": line, "character": col } }));
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(resp)) = rx.recv().await else { return };
+            let _ = this.update_in(cx, |w, window, cx| match lsp::parse_definition(&resp).and_then(|(u, l, c)| Some((lsp::uri_to_path(&u)?, l, c))) {
+                Some((p, l, c)) => {
+                    w.open_file(&p, None, window, cx);
+                    if let Some(e) = w.active_editor() { e.update(cx, |e, cx| e.goto_lsp(l, c, cx)); }
+                }
+                None => w.toast("没有找到定义", false, cx),
+            });
+        }).detach();
+    }
+
+    fn diag_counts(&self) -> (usize, usize) {
+        let all = self.diags.values().flatten();
+        let (mut e, mut w) = (0, 0);
+        for d in all { if d.severity == 1 { e += 1; } else if d.severity == 2 { w += 1; } }
+        (e, w)
+    }
+
+    fn completion_view(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let t = cx.theme().clone();
+        let c = self.completion.as_ref()?;
+        let rows = c.items.len().min(8);
+        let h = rows as f32 * 28.0 + 10.0;
+        let avail = self.active_editor().map(|e| f32::from(e.read(cx).layout.bounds.size.height)).unwrap_or(600.0);
+        let top = if f32::from(c.y) + h > avail - 8.0 { (f32::from(c.y) - 22.0 - h - 6.0).max(4.0) } else { f32::from(c.y) + 2.0 };
+        let start = if c.sel >= rows { c.sel + 1 - rows } else { 0 };
+        Some(
+            div().absolute().left(c.x.max(px(8.))).top(px(top)).w(px(380.)).p(px(5.)).rounded(px(11.)).bg(t.elev).border_1().border_color(t.border_strong).overflow_hidden()
+                .shadow(vec![BoxShadow { color: hsla(0., 0., 0., 0.4), offset: point(px(0.), px(12.)), blur_radius: px(32.), spread_radius: px(0.) }])
+                .children(c.items.iter().enumerate().skip(start).take(rows).map(|(i, it)| {
+                    let sel = i == c.sel;
+                    let kcol = match it.kind { 2 | 3 | 4 => t.syntax(syntax::Kind::Function), 7 | 8 | 13 | 22 => t.syntax(syntax::Kind::Type), 6 | 5 | 10 => t.syntax(syntax::Kind::Property), 14 => t.syntax(syntax::Kind::Keyword), 21 => t.syntax(syntax::Kind::Constant), _ => t.dim };
+                    div().h(px(28.)).px(px(8.)).flex().items_center().gap(px(10.)).rounded(px(7.)).when(sel, |d| d.bg(t.accent_soft))
+                        .child(div().w(px(36.)).flex_none().text_size(px(10.5)).font_family(MONO_FONT).text_color(kcol).child(lsp::kind_label(it.kind)))
+                        .child(div().flex_none().font_family(MONO_FONT).text_size(px(12.5)).text_color(if sel { t.text } else { t.dim }).child(it.label.clone()))
+                        .child(div().flex_1().min_w_0().truncate().text_size(px(11.5)).text_color(t.faint).text_right().child(it.detail.clone()))
+                }))
+                .into_any_element(),
+        )
+    }
+
+    fn hover_view(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let t = cx.theme().clone();
+        let h = self.hover.as_ref()?;
+        let mut col = div().flex().flex_col().gap(px(8.));
+        for seg in crate::blocks::parse_segments(&h.text) {
+            col = col.child(match seg {
+                crate::blocks::Segment::Code { block, .. } => crate::ui::code_snippet(&block.code, &block.lang, cx),
+                crate::blocks::Segment::Text(tx) => crate::ui::md_text(&tx, cx),
+            });
+        }
+        Some(
+            div().absolute().left(h.x.max(px(8.))).top(h.y + px(4.)).w(px(520.)).max_h(px(300.)).p(px(12.)).rounded(px(12.)).bg(t.elev).border_1().border_color(t.border_strong).overflow_hidden()
+                .text_size(px(12.5)).line_height(px(19.)).text_color(t.text)
+                .shadow(vec![BoxShadow { color: hsla(0., 0., 0., 0.4), offset: point(px(0.), px(12.)), blur_radius: px(32.), spread_radius: px(0.) }])
+                .child(col).into_any_element(),
+        )
+    }
+
+    fn problems_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = cx.theme().clone();
+        let mut files: Vec<(String, Vec<lsp::RawDiag>)> = self.diags.iter().map(|(p, d)| (p.clone(), d.clone())).collect();
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        if files.is_empty() { return div().p(px(24.)).text_color(t.faint).flex().flex_col().items_center().gap(px(6.)).child(icon("check", 20., t.add)).child("没有问题").into_any_element(); }
+        let mut rows: Vec<AnyElement> = vec![];
+        for (fi, (path, diags)) in files.iter().enumerate() {
+            let name = path.rsplit('/').next().unwrap_or(path).to_string();
+            rows.push(div().px(px(10.)).pt(px(10.)).pb(px(3.)).flex().items_center().gap(px(6.)).child(file_icon(&name, cx)).child(div().font_weight(FontWeight::MEDIUM).child(name)).child(div().text_color(t.faint).text_size(px(11.)).child(self.rel(path))).into_any_element());
+            for (di, d) in diags.iter().enumerate() {
+                let (p2, line, col) = (path.clone(), d.start.0, d.start.1);
+                let color = match d.severity { 1 => t.del, 2 => t.modified, _ => t.dim };
+                rows.push(
+                    div().id(("prob", fi * 10_000 + di)).mx(px(6.)).px(px(10.)).py(px(5.)).flex().gap(px(8.)).rounded(px(7.)).cursor_pointer().hover(|s| s.bg(t.hover))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_file(&p2, None, window, cx);
+                            if let Some(e) = this.active_editor() { e.update(cx, |e, cx| e.goto_lsp(line, col, cx)); }
+                        }))
+                        .child(div().mt(px(5.)).size(px(7.)).flex_none().rounded_full().bg(color))
+                        .child(div().flex_1().min_w_0().flex().flex_col().child(div().text_color(t.text).child(d.message.lines().next().unwrap_or("").to_string())).child(div().text_size(px(11.)).text_color(t.faint).child(format!("第 {} 行{}", d.start.0 + 1, if d.source.is_empty() { String::new() } else { format!(" · {}", d.source) }))))
+                        .into_any_element(),
+                );
+            }
+        }
+        div().id("problems").flex_1().min_h_0().overflow_y_scroll().pb(px(10.)).children(rows).into_any_element()
     }
 
     pub fn root_path(&self) -> Option<PathBuf> { self.root.clone() }
@@ -291,6 +584,12 @@ impl Workspace {
         self.active = None;
         self.terminal = None;
         self.term_open = false;
+        self.lsp.clear();
+        self.lsp_ready.clear();
+        self.diags.clear();
+        self.doc_versions.clear();
+        self.hover = None;
+        self.completion = None;
         self.expanded.clear();
         self.root = Some(path.clone());
         let s = path.to_string_lossy().to_string();
@@ -347,11 +646,14 @@ impl Workspace {
             let editor = cx.new(|cx| { let mut e = Editor::new(EditorMode::code(), cx); e.open(Some(abs.to_string()), &text, cx); e });
             let sub = cx.subscribe_in(&editor, window, |this, ed, ev: &EditorEvent, window, cx| match ev {
                 EditorEvent::InlineAssist => this.open_inline(window, cx),
-                EditorEvent::Changed | EditorEvent::ReviewEnded => cx.notify(),
-                EditorEvent::Cancel => { if this.find_open { this.close_find(window, cx); } else { let _ = ed; } }
+                EditorEvent::Changed => { let p = ed.read(cx).path.clone().unwrap_or_default(); this.on_editor_changed(&p, ed, cx); cx.notify(); }
+                EditorEvent::ReviewEnded => cx.notify(),
+                EditorEvent::Moved => this.on_editor_moved(ed, cx),
+                EditorEvent::Cancel => { if this.completion.is_some() || this.hover.is_some() { this.close_popups(cx); } else if this.find_open { this.close_find(window, cx); } }
                 _ => {}
             });
             self.tabs.push(Tab { path: abs.to_string(), editor: editor.clone(), _sub: sub });
+            self.lsp_did_open(abs, &text, cx);
             self.active = Some(self.tabs.len() - 1);
             if let Some(root) = self.root.clone() {
                 let rel = self.rel(abs);
@@ -380,6 +682,7 @@ impl Workspace {
         match std::fs::write(&path, &text) {
             Ok(()) => {
                 ed.update(cx, |e, cx| { e.mark_saved(); cx.notify(); });
+                if let Some(Some(c)) = Self::lang_key(&path).and_then(|k| self.lsp.get(k)) { c.notify("textDocument/didSave", serde_json::json!({ "textDocument": { "uri": lsp::path_to_uri(&path) }, "text": text })); }
                 self.refresh(cx);
                 if let Some(root) = self.root.clone() {
                     let rel = self.rel(&path);
@@ -416,7 +719,8 @@ impl Workspace {
 
     fn close_tab_now(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
         if i >= self.tabs.len() { return; }
-        self.tabs.remove(i);
+        let closed = self.tabs.remove(i).path.clone();
+        self.lsp_did_close(&closed);
         self.active = if self.tabs.is_empty() { None } else { Some(match self.active { Some(a) if a > i => a - 1, Some(a) if a == i => i.min(self.tabs.len() - 1), Some(a) => a, None => 0 }) };
         if let Some(ed) = self.active_editor() {
             window.focus(&ed.read(cx).focus);
@@ -502,7 +806,7 @@ impl Workspace {
             CommandItem { title: "切换侧栏", keys: "⌘B" }, CommandItem { title: "切换 AI 对话", keys: "⇧⌘A" }, CommandItem { title: "聚焦对话输入框", keys: "⌘L" },
             CommandItem { title: "在项目中搜索", keys: "⇧⌘F" }, CommandItem { title: "查看 Git 改动", keys: "" }, CommandItem { title: "就地改写（Inline Assist）", keys: "⌘K" },
             CommandItem { title: "在文件中查找", keys: "⌘F" }, CommandItem { title: "新建对话", keys: "" }, CommandItem { title: "打开设置", keys: "⌘," },
-            CommandItem { title: "切换深色 / 浅色", keys: "" }, CommandItem { title: "关闭当前标签页", keys: "⌘W" }, CommandItem { title: "应用最近的代码块", keys: "⇧⌘↵" }, CommandItem { title: "切换终端", keys: "⌘J" }, CommandItem { title: "跳转到符号", keys: "⇧⌘O" }, CommandItem { title: "跳转到行", keys: "⌃G" }, CommandItem { title: "查看符号大纲", keys: "" }, CommandItem { title: "查找并替换", keys: "⌥⌘F" }, CommandItem { title: "切换自动换行", keys: "⌥Z" },
+            CommandItem { title: "切换深色 / 浅色", keys: "" }, CommandItem { title: "关闭当前标签页", keys: "⌘W" }, CommandItem { title: "应用最近的代码块", keys: "⇧⌘↵" }, CommandItem { title: "切换终端", keys: "⌘J" }, CommandItem { title: "跳转到符号", keys: "⇧⌘O" }, CommandItem { title: "跳转到行", keys: "⌃G" }, CommandItem { title: "查看符号大纲", keys: "" }, CommandItem { title: "查找并替换", keys: "⌥⌘F" }, CommandItem { title: "切换自动换行", keys: "⌥Z" }, CommandItem { title: "转到定义", keys: "F12" }, CommandItem { title: "显示悬停信息", keys: "⌘I" }, CommandItem { title: "触发补全", keys: "⌃Space" }, CommandItem { title: "查看问题", keys: "" },
         ]
     }
 
@@ -552,6 +856,10 @@ impl Workspace {
             18 => { self.sidebar = true; self.side_view = SideView::Outline; cx.notify(); }
             19 => self.open_replace(window, cx),
             20 => { if let Some(e) = self.active_editor() { e.update(cx, |e, cx| e.toggle_wrap(&ToggleWrap, window, cx)); } }
+            21 => self.goto_definition(window, cx),
+            22 => self.show_hover(cx),
+            23 => self.request_completion(true, cx),
+            24 => { self.sidebar = true; self.side_view = SideView::Problems; cx.notify(); }
             _ => {}
         }
     }
@@ -695,7 +1003,7 @@ impl Workspace {
 
     fn sidebar_view(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.theme().clone();
-        let tabs = [(SideView::Files, "文件"), (SideView::Search, "搜索"), (SideView::Git, "改动"), (SideView::Outline, "大纲")];
+        let tabs = [(SideView::Files, "文件"), (SideView::Search, "搜索"), (SideView::Git, "改动"), (SideView::Outline, "大纲"), (SideView::Problems, "问题")];
         let nchanges = self.changes.len();
         div().size_full().flex().flex_col()
             .child(div().flex().gap(px(2.)).px(px(10.)).pt(px(8.)).pb(px(6.)).children(tabs.iter().map(|(v, label)| {
@@ -711,6 +1019,7 @@ impl Workspace {
                 SideView::Search => self.search_panel(cx).into_any_element(),
                 SideView::Git => self.git_panel(cx).into_any_element(),
                 SideView::Outline => self.outline_panel(cx).into_any_element(),
+                SideView::Problems => self.problems_panel(cx).into_any_element(),
             })
     }
 
@@ -938,11 +1247,18 @@ impl Workspace {
         let t = cx.theme().clone();
         let ed = self.active_editor();
         let (pos, lang) = ed.as_ref().map(|e| { let e = e.read(cx); (Some(e.cursor_line_col()), syntax::lang_label(e.lang)) }).unwrap_or((None, ""));
+        let near = ed.as_ref().and_then(|e| e.read(cx).diagnostic_near_cursor().map(|d| (d.severity, d.message.lines().next().unwrap_or("").to_string())));
         let provider = if self.settings.provider == "mock" { "演示模式".to_string() } else { self.settings.model.clone() };
         div().h(px(26.)).flex_none().flex().items_center().gap(px(14.)).px(px(12.)).bg(t.panel).border_t_1().border_color(t.border).text_size(px(12.)).text_color(t.dim)
             .when_some(self.branch.clone(), |d, b| d.child(div().flex().items_center().gap(px(5.)).child(icon("branch", 13., t.dim)).child(b)))
             .when(!self.changes.is_empty(), |d| d.child(div().id("st-chg").cursor_pointer().hover(|s| s.text_color(t.text)).on_click(cx.listener(|this, _, _, cx| { this.sidebar = true; this.side_view = SideView::Git; cx.notify(); })).child(format!("{} 处改动", self.changes.len()))))
-            .child(div().flex_1())
+            .when(self.diag_counts() != (0, 0), |d| { let (ne, nw) = self.diag_counts(); d.child(
+                div().id("st-diag").flex().items_center().gap(px(10.)).cursor_pointer().hover(|s| s.text_color(t.text))
+                    .on_click(cx.listener(|this, _, _, cx| { this.sidebar = true; this.side_view = SideView::Problems; cx.notify(); }))
+                    .when(ne > 0, |d| d.child(div().flex().items_center().gap(px(5.)).child(div().size(px(7.)).rounded_full().bg(t.del)).child(format!("{ne}"))))
+                    .when(nw > 0, |d| d.child(div().flex().items_center().gap(px(5.)).child(div().size(px(7.)).rounded_full().bg(t.modified)).child(format!("{nw}")))))
+            })
+            .child(div().flex_1().min_w_0().truncate().text_color(match near.as_ref().map(|n| n.0) { Some(1) => t.del, Some(2) => t.modified, _ => t.dim }).child(near.map(|n| n.1).unwrap_or_default()))
             .when_some(pos, |d, (l, c)| d.child(format!("行 {l}，列 {c}")).child(lang))
             .child(div().id("st-ai").flex().items_center().gap(px(6.)).cursor_pointer().hover(|s| s.text_color(t.text)).on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)))
                 .child(div().size(px(6.)).rounded_full().bg(if self.settings.provider == "mock" { t.modified } else { t.add })).child(provider))
@@ -1049,7 +1365,7 @@ impl Render for Workspace {
                 .child(self.tabs_bar(cx))
                 .children(self.breadcrumbs(cx))
                 .child(match &editor {
-                    Some(e) => div().flex_1().min_h_0().relative().child(e.clone()).when(self.find_open, |d| d.child(self.find_bar(cx))).children(review).when_some(self.inline.clone(), |d, i| d.child(i)).into_any_element(),
+                    Some(e) => div().flex_1().min_h_0().relative().child(e.clone()).when(self.find_open, |d| d.child(self.find_bar(cx))).children(review).when_some(self.inline.clone(), |d, i| d.child(i)).children(self.completion_view(cx)).children(self.hover_view(cx)).into_any_element(),
                     None => div().flex_1().flex().items_center().justify_center().flex_col().gap(px(6.)).child(div().text_size(px(26.)).font_weight(FontWeight::BOLD).child("选一个文件开始")).child(div().text_color(t.dim).child("⌘P 跳转文件 · ⌘L 和 AI 对话")).into_any_element(),
                 })
                 .when(self.term_t > 0.01, |d| d
@@ -1077,6 +1393,14 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &CommandPalette, window, cx| this.open_palette(PaletteMode::Commands, window, cx)))
             .on_action(cx.listener(|this, _: &Quit, window, cx| this.request_quit(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| { this.sidebar = !this.sidebar; this.save_layout(); cx.notify(); }))
+            .on_action(cx.listener(|this, _: &GotoDefinition, window, cx| this.goto_definition(window, cx)))
+            .on_action(cx.listener(|this, _: &ShowHover, _, cx| this.show_hover(cx)))
+            .on_action(cx.listener(|this, _: &TriggerCompletion, _, cx| this.request_completion(true, cx)))
+            .on_action(cx.listener(|this, _: &ShowProblems, _, cx| { this.sidebar = true; this.side_view = SideView::Problems; cx.notify(); }))
+            .on_action(cx.listener(|this, _: &MoveUp, _, cx| this.completion_step(-1, cx)))
+            .on_action(cx.listener(|this, _: &MoveDown, _, cx| this.completion_step(1, cx)))
+            .on_action(cx.listener(|this, _: &Enter, _, cx| this.accept_selected_completion(cx)))
+            .on_action(cx.listener(|this, _: &crate::actions::Tab, _, cx| this.accept_selected_completion(cx)))
             .on_action(cx.listener(|this, _: &GotoSymbol, window, cx| this.open_palette(PaletteMode::Symbols, window, cx)))
             .on_action(cx.listener(|this, _: &GotoLine, window, cx| this.open_palette(PaletteMode::Line, window, cx)))
             .on_action(cx.listener(|this, _: &ShowOutline, _, cx| { this.sidebar = true; this.side_view = SideView::Outline; cx.notify(); }))

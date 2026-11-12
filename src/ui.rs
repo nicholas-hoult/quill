@@ -56,3 +56,39 @@ pub fn btn(id: impl Into<ElementId>, label: &str, primary: bool, cx: &App) -> St
         d.bg(h).border_1().border_color(b).text_color(tx).hover(move |s| s.bg(p)).active(move |s| s.opacity(0.85))
     }
 }
+
+/// 轻量 Markdown 渲染（段落 / 列表 / 行内代码 / 粗体），悬停卡片等处使用。
+pub fn md_text(text: &str, cx: &App) -> Div {
+    use crate::md::{self, Block};
+    let t = cx.theme();
+    let inline = |s: &str| -> StyledText {
+        let (plain, spans) = md::parse_inline(s);
+        let hl: Vec<(std::ops::Range<usize>, HighlightStyle)> = spans.into_iter().map(|sp| {
+            let st = if sp.code { HighlightStyle { color: Some(t.accent), background_color: Some(t.hover), ..Default::default() } } else { HighlightStyle { font_weight: Some(FontWeight::BOLD), ..Default::default() } };
+            (sp.range, st)
+        }).collect();
+        StyledText::new(plain).with_highlights(hl)
+    };
+    let mut col = div().flex().flex_col().gap(px(6.));
+    for b in md::parse_blocks(text) {
+        col = col.child(match b {
+            Block::Heading(_, s) => div().font_weight(FontWeight::BOLD).child(inline(&s)),
+            Block::Bullet(s) => div().flex().gap(px(6.)).pl(px(2.)).child(div().flex_none().text_color(t.faint).child("•")).child(div().flex_1().min_w_0().child(inline(&s))),
+            Block::Numbered(n, s) => div().flex().gap(px(6.)).child(div().flex_none().text_color(t.faint).child(n)).child(div().flex_1().min_w_0().child(inline(&s))),
+            Block::Paragraph(s) => div().child(inline(&s)),
+        });
+    }
+    col
+}
+
+/// 带语法高亮的代码片段（等宽）
+pub fn code_snippet(code: &str, lang: &str, cx: &App) -> Div {
+    let t = cx.theme();
+    let l = crate::syntax::lang_for_name(lang);
+    let hl: Vec<(std::ops::Range<usize>, HighlightStyle)> = match l {
+        Some(l) => crate::syntax::highlight(l, code).into_iter().map(|(r, k)| (r, HighlightStyle { color: Some(t.syntax(k)), ..Default::default() })).collect(),
+        None => vec![],
+    };
+    div().px(px(10.)).py(px(7.)).rounded(px(8.)).bg(t.bg).border_1().border_color(t.border).font_family(crate::theme::MONO_FONT).text_size(px(12.)).line_height(px(18.)).text_color(t.text)
+        .child(StyledText::new(code.to_string()).with_highlights(hl))
+}

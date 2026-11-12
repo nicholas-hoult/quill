@@ -19,6 +19,11 @@ cargo build --release    # 发布构建（首次很慢）
 * 界面：`editor` + `editor_element`（自绘编辑器；同一套代码也当单行输入框和聊天输入框，见 `EditorMode`）、`workspace`（标题栏 / 侧栏 / 标签 / 状态栏 / 面板开合动画 / 拖拽分栏 / 浮层）、`agent`（对话面板）、`palette`、`settings_view`、`inline`（⌘K）、`terminal`（alacritty_terminal 内核）、`theme`（深浅两套）、`ui`（小组件）、`assets`（内嵌 SVG 图标）
 * AI 改动的落地：`Editor::apply_with_review` / `replace_range_streaming` 把新文本写进缓冲区并进入审阅，`refresh_review` 按 `diff::hunks` 生成显示行（含被删除行），`accept_hunk` / `reject_hunk` 逐块处理
 
+## 语言服务（LSP）
+
+`lsp.rs`：JSON-RPC over stdio 客户端（纯逻辑部分——帧解析、UTF-16 列换算、响应解析——有单测）。`workspace.rs` 里按语言惰性启动服务器（rust-analyzer / typescript-language-server / pyright / gopls，环境变量 `QUILL_LSP_<RUST|TYPESCRIPT|PYTHON|GO>` 可覆盖命令），全文同步（120ms 防抖）。已实现：诊断（波浪线 + 行号栏圆点 + 状态栏计数 + 「问题」面板）、补全（输入标识符 / `.` / `:` 自动触发，⌃Space 手动）、悬停（⌘I）、转到定义（F12）。
+没装真实服务器时的验证：`QUILL_LSP_RUST="python3 private/probes/mock_lsp.py"`（模拟服务器，含 UTF-16 列校验）。本机的 `rust-analyzer` 只是 rustup 空代理，需要 `rustup component add rust-analyzer`。
+
 ## Agent 工具调用
 
 `agent.rs` 的 `start_round` → `ai::run_agent_stream`（Anthropic 带 tools；mock 用 `agent_proto::mock_turn`；OpenAI 兼容退回纯文本）。遇到 `stop_reason == tool_use` 时 `run_tools` 执行工具并回填，再发起下一轮（上限 8 轮）。`edit_file` **不直接写盘**，发 `AgentEvent::Apply` 让工作区走逐块审阅。
