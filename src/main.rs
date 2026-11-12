@@ -19,6 +19,7 @@ mod md;
 mod multicursor;
 mod outline;
 mod palette;
+mod rules;
 mod settings_view;
 mod shot;
 mod syntax;

@@ -54,7 +54,7 @@ QUILL_OPEN=/某项目 QUILL_SCRIPT="wait:2000;key:cmd-p;text:app;key:enter;wait:
 ```
 
 步骤：`wait:毫秒` / `key:cmd-p`（GPUI 键位写法）/ `text:字符串` / `shot:路径.png`（CoreGraphics 只截本进程窗口，不需要权限）/ `quit`。没有鼠标步骤。
-跑完会在 `~/Library/Application Support/Quill/` 留下最近项目、对话记录，**测完要删**，别污染用户数据。
+应用会读写 `~/Library/Application Support/Quill/`（设置含 API Key、对话记录、最近项目）。**测试一律加 `HOME=<临时目录>` 隔离**（路径都由 `$HOME` 推出），既不污染也不会读到用户的真实数据；**绝不要对真实目录 `rm -rf`**——用户的 Quill 可能正开着，数据一删就没了（2026-11-12 出过这个事故）。
 
 ## 坑
 

@@ -88,6 +88,9 @@ pub struct AgentPanel {
     expanded: HashSet<(u64, usize)>,
     /// 代码块语法高亮缓存：(内容哈希) → 区间。流式回复时每个分片都会重绘整个面板，不能每次都重新解析
     hl_cache: std::cell::RefCell<std::collections::HashMap<u64, Vec<(std::ops::Range<usize>, syntax::Kind)>>>,
+    /// 当前项目生效的规则文件名（#2），以及它是按哪个项目根读出来的
+    rules_file: Option<String>,
+    rules_root: Option<std::path::PathBuf>,
     _sub: Subscription,
 }
 
@@ -105,7 +108,7 @@ impl AgentPanel {
         let threads = load_threads();
         let active = 0;
         let next_id = threads.iter().flat_map(|t| t.messages.iter().map(|m| m.id)).max().unwrap_or(0) + 1;
-        Self { workspace, composer, threads, active, cancel: None, scroll: ScrollHandle::new(), stick: true, files: vec![], active_file: None, dropped: vec![], extra: vec![], mention: None, menu: false, settings, next_id, rounds: 0, expanded: HashSet::new(), hl_cache: Default::default(), _sub: sub }
+        Self { workspace, composer, threads, active, cancel: None, scroll: ScrollHandle::new(), stick: true, files: vec![], active_file: None, dropped: vec![], extra: vec![], mention: None, menu: false, settings, next_id, rounds: 0, expanded: HashSet::new(), hl_cache: Default::default(), rules_file: None, rules_root: None, _sub: sub }
     }
 
     pub fn focus_composer(&self, window: &mut Window, cx: &App) { window.focus(&self.composer.read(cx).focus); }
@@ -116,6 +119,15 @@ impl AgentPanel {
             let keep: Vec<&Thread> = self.threads.iter().take(40).collect();
             let _ = std::fs::write(p, serde_json::to_string(&keep).unwrap_or_default());
         }
+    }
+
+    /// 项目换了就重新找规则文件（渲染时调用，只在项目根变化时读盘）。
+    /// 渲染中父视图可能正被占用，读不到就跳过，下一帧再试。
+    fn sync_rules(&mut self, cx: &mut Context<Self>) {
+        let Ok(root) = self.workspace.read_with(cx, |w, _| w.root_path()) else { return };
+        if root == self.rules_root { return; }
+        self.rules_file = root.as_ref().and_then(|r| crate::rules::load(r)).map(|r| r.file);
+        self.rules_root = root;
     }
 
     fn thread(&mut self) -> &mut Thread { &mut self.threads[self.active] }
@@ -207,6 +219,13 @@ impl AgentPanel {
         let messages = api_messages(&hist);
         let tools_on = self.settings.provider != "openai";
         let system = if tools_on { format!("{}\n{}", context::SYSTEM_PROMPT, context::TOOL_HINT) } else { context::SYSTEM_PROMPT.to_string() };
+        // 项目规则文件（#2）：每轮重新读，用户改了规则下一轮就生效
+        let root = self.workspace.update(cx, |w, _| w.root_path()).ok().flatten();
+        let rules = root.as_ref().and_then(|r| crate::rules::load(r));
+        self.rules_file = rules.as_ref().map(|r| r.file.clone());
+        self.rules_root = root;
+        let system = crate::rules::with_rules(&system, rules.as_ref());
+        if std::env::var("QUILL_DEBUG_SYSTEM").is_ok() { eprintln!("[system]\n{system}\n[/system]"); }
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = Some(cancel.clone());
         let (tx, rx) = async_channel::unbounded();
@@ -431,6 +450,7 @@ const SUGGESTS: [&str; 4] = ["解释一下当前文件做了什么", "找出这�
 
 impl Render for AgentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_rules(cx);
         let t = cx.theme().clone();
         let streaming = self.cancel.is_some();
         let thread = self.threads[self.active].clone();
@@ -489,6 +509,7 @@ impl Render for AgentPanel {
                     .child(
                         div().flex().items_center().gap(px(6.)).px(px(8.)).pb(px(8.)).pl(px(12.)).text_size(px(12.)).text_color(t.faint)
                             .child("↵ 发送 · ⇧↵ 换行")
+                            .when_some(self.rules_file.clone(), |d, f| d.child(div().id("rules-tag").px(px(6.)).py(px(1.)).rounded(px(5.)).bg(t.press).text_color(t.dim).child(format!("规则 · {f}"))))
                             .child(div().flex_1())
                             .child(if streaming {
                                 div().id("stop").size(px(28.)).rounded(px(9.)).flex().items_center().justify_center().bg(t.press).cursor_pointer().child(icon("stop", 14., t.text))
