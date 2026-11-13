@@ -100,6 +100,7 @@ impl AgentPanel {
 
     /// 发送一条消息给 Claude Code。会话没起来就先起（异步握手），消息排队等就绪
     pub(super) fn acp_send(&mut self, prompt: String, cx: &mut Context<Self>) {
+        acp_client::log_mark(if self.acp.is_some() { "SEND（进程已在）" } else { "SEND（进程未启动）" });
         let root = self.workspace.update(cx, |w, _| w.root_path()).ok().flatten();
         let Some(root) = root else { self.acp_fail("没有打开项目：Claude Code 需要一个工作目录".into(), cx); return };
         if self.acp.as_ref().map(|a| a.root != root).unwrap_or(false) { self.acp = None; }

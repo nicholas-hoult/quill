@@ -670,6 +670,8 @@ impl AgentPanel {
     fn abort_pending(&mut self, cx: &mut Context<Self>) {
         if self.awaiting.is_some() || self.running.is_some() || self.acp.is_some() { self.stop(cx); }
         self.acp_reset();
+        // 每个对话一个 ACP 会话，进程刚被关掉：稍后给最终选中的那个对话预热（#8），别让下一条消息从头等
+        self.acp_prewarm_soon(cx);
     }
 
     /// 应用最近一条回复里还没应用的代码块（⌘⇧↵）

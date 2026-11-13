@@ -98,6 +98,16 @@ fn shell_command(command: &str) -> Command {
     c
 }
 
+/// 开发日志用的绝对时间（毫秒）：`QUILL_ACP_LOG` 里每行都带，才能把「按下发送」和「收到第一个字」对上
+fn epoch_ms() -> u128 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0) }
+
+/// 往 `QUILL_ACP_LOG` 追加一行标记（只在设了该变量时；开发测量用，比如「用户按下了发送」）
+pub fn log_mark(text: &str) {
+    if let Some(mut f) = std::env::var("QUILL_ACP_LOG").ok().and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok()) {
+        let _ = writeln!(f, "{} ## {text}", epoch_ms());
+    }
+}
+
 /// 起进程。成功返回句柄；读到的每一行（解析后）和进程退出都通过 `events` 送出。
 pub fn spawn(command: &str, cwd: &Path, events: async_channel::Sender<Event>) -> Result<Handle, String> {
     let mut cmd = shell_command(command);
@@ -113,7 +123,7 @@ pub fn spawn(command: &str, cwd: &Path, events: async_channel::Sender<Event>) ->
         let mut stdin = stdin;
         let log = std::env::var("QUILL_ACP_LOG").ok().and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
         while let Ok(line) = rx.recv() {
-            if let Some(mut f) = log.as_ref() { let _ = writeln!(f, "→ {line}"); }
+            if let Some(mut f) = log.as_ref() { let _ = writeln!(f, "{} → {line}", epoch_ms()); }
             if stdin.write_all(line.as_bytes()).and_then(|_| stdin.write_all(b"\n")).and_then(|_| stdin.flush()).is_err() { break; }
         }
     });
@@ -143,7 +153,7 @@ pub fn spawn(command: &str, cwd: &Path, events: async_channel::Sender<Event>) ->
         let log = std::env::var("QUILL_ACP_LOG").ok().and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
         let log = log.map(|f| Arc::new(Mutex::new(f)));
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if let Some(f) = &log { if let Ok(mut f) = f.lock() { let _ = writeln!(f, "← {line}"); } }
+            if let Some(f) = &log { if let Ok(mut f) = f.lock() { let _ = writeln!(f, "{} ← {line}", epoch_ms()); } }
             let ev = acp::parse_line(&line);
             if ev == Incoming::Ignore { continue; }
             if events.send_blocking(Event::Line(ev)).is_err() { return; }
