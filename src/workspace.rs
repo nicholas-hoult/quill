@@ -191,6 +191,7 @@ impl Workspace {
         let mut subs = vec![];
         subs.push(cx.subscribe_in(&agent, window, |this, _, ev: &AgentEvent, window, cx| match ev {
             AgentEvent::Apply { path, code, write_through } => this.apply_code(path.clone(), code.clone(), *write_through, window, cx),
+            AgentEvent::ReviewFile { path, before } => this.review_written_file(path.clone(), before.clone(), window, cx),
             AgentEvent::OpenSettings => this.open_settings(window, cx),
             AgentEvent::Restore(plan) => this.restore_files(plan.clone(), window, cx),
             AgentEvent::ModelChanged { model, models } => {
@@ -764,6 +765,28 @@ impl Workspace {
         self.agent.update(cx, |a, _| { a.active_file = Some(rel); });
         cx.notify();
         if perf { crate::editor_element::AFTER_OPEN.store(4, std::sync::atomic::Ordering::Relaxed); stages.push(("其余", t_open.elapsed().as_micros())); eprintln!("[perf] 打开文件（同步部分）{:?}", stages); }
+    }
+
+    /// Agent（Claude Code）已经把文件写到磁盘：打开它，以改动前的内容为基线进入审阅（对标 Zed 的事后审阅）。
+    /// 用户在这个文件里有未保存的修改时不进入审阅，免得覆盖用户的输入。
+    fn review_written_file(&mut self, rel: String, before: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else { return };
+        let Ok(abs) = crate::tools::apply_target(&root, &rel) else { return };
+        let abs = abs.to_string_lossy().to_string();
+        let Ok(now) = std::fs::read_to_string(&abs) else { return };
+        self.refresh(cx);
+        if let Some(i) = self.tabs.iter().position(|t| t.path == abs) {
+            let ed = self.tabs[i].editor.clone();
+            ed.update(cx, |e, cx| e.accept_all(cx)); // 上一次的审阅先结束（改动已经在磁盘上）
+            if ed.read(cx).is_dirty() { self.toast(format!("「{rel}」有未保存的修改，Agent 的改动没有进入审阅"), true, cx); return; }
+            ed.update(cx, |e, cx| { e.reload_from_disk(&now, cx); });
+        }
+        self.open_file(&abs, None, window, cx);
+        if let Ok(m) = std::fs::metadata(&abs) { self.stamps.insert(abs.clone(), (m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len())); }
+        if let Some(ed) = self.tabs.iter().find(|t| t.path == abs).map(|t| t.editor.clone()) {
+            ed.update(cx, |e, cx| { e.review_against(before.unwrap_or_default(), cx); });
+        }
+        cx.notify();
     }
 
     fn save_active(&mut self, cx: &mut Context<Self>) {

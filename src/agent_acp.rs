@@ -194,8 +194,11 @@ impl AgentPanel {
             Update::ToolCall(tc) => { self.acp_set_tool(tc); }
             Update::ToolUpdate(p) => {
                 let Some(a) = self.acp.as_mut() else { return };
+                let was_done = a.tools.get(&p.id).map(|t| t.is_done()).unwrap_or(false);
                 let tc = match a.tools.get_mut(&p.id) { Some(t) => { t.apply(&p); t.clone() } None => acp::ToolCall::from_patch(&p) };
-                self.acp_set_tool(tc);
+                let finished = !was_done && tc.status == acp::Status::Completed;
+                self.acp_set_tool(tc.clone());
+                if finished { self.acp_review(&tc, cx); }
             }
             Update::Plan(es) => {
                 let (name, input, result) = acp::project_plan(&es);
@@ -228,6 +231,23 @@ impl AgentPanel {
         let m = self.msg_mut(mid)?;
         m.calls.push(ToolCall { id, name, input, result });
         Some((mid, m.calls.len() - 1))
+    }
+
+    /// 工具完成且带整文件 diff：Agent 已经自己改了磁盘，把改动放进编辑器审阅（并记检查点）。
+    /// 只在磁盘上的内容确实等于 diff 的新文本时才进入——片段级的 diff 没法当整文件基线。
+    fn acp_review(&mut self, tc: &acp::ToolCall, cx: &mut Context<Self>) {
+        let Some(root) = self.acp.as_ref().map(|a| a.root.clone()) else { return };
+        let mid = self.acp.as_ref().and_then(|a| a.cur);
+        for (rel, before, after) in acp::review_targets(tc, &root) {
+            let Ok(disk) = std::fs::read_to_string(root.join(&rel)) else { continue };
+            let Some(before) = acp::reconcile_before(before.as_deref(), &after, &disk) else { continue };
+            if before == disk { continue; } // 没有实际改动
+            let before = if before.is_empty() && !disk.is_empty() { None } else { Some(before) }; // 空基线 = 新建的文件
+            if let Some(owner) = mid.and_then(|m| self.owner_user(m)) {
+                if let Some(m) = self.msg_mut(owner) { crate::checkpoint::record(&mut m.snapshots, &rel, before.clone()); }
+            }
+            cx.emit(AgentEvent::ReviewFile { path: rel, before });
+        }
     }
 
     fn acp_reply(&mut self, line: String) { if let Some(a) = self.acp.as_ref() { a.handle.send(line); } }
@@ -343,6 +363,16 @@ impl AgentPanel {
                 div().flex().gap(px(7.)).px(px(11.)).py(px(6.)).border_t_1().border_color(t.border).bg(t.bg).font_family(MONO_FONT).text_size(px(12.)).line_height(px(18.))
                     .child(div().flex_none().text_color(t.accent).child("$")).child(div().flex_1().min_w_0().text_color(t.text).child(cmd)),
             ))
+            .children(c.input["diffs"].as_array().cloned().unwrap_or_default().into_iter().take(3).map(|df| {
+                let name = df["path"].as_str().unwrap_or("").rsplit('/').next().unwrap_or("").to_string();
+                let lines: Vec<(String, String)> = df["preview"].as_array().map(|a| a.iter().map(|p| (p[0].as_str().unwrap_or("").to_string(), p[1].as_str().unwrap_or("").to_string())).collect()).unwrap_or_default();
+                div().flex().flex_col().border_t_1().border_color(t.border).bg(t.bg).font_family(MONO_FONT).text_size(px(11.5)).line_height(px(17.))
+                    .child(div().px(px(11.)).py(px(4.)).text_color(t.faint).child(name))
+                    .children(lines.into_iter().map(|(m, l)| {
+                        let (bg, fg, mark) = match m.as_str() { "-" => (t.del_bg, t.del, "−"), "+" => (t.add_bg, t.add, "+"), _ => (t.bg, t.faint, "…") };
+                        div().flex().gap(px(8.)).px(px(11.)).bg(bg).text_color(fg).child(div().flex_none().w(px(10.)).child(mark)).child(div().flex_1().min_w_0().child(if l.is_empty() { " ".to_string() } else { l }))
+                    }))
+            }))
             .when(show_body, |d| d.child(
                 div().flex().flex_col().px(px(11.)).py(px(7.)).border_t_1().border_color(t.border).bg(t.bg).font_family(MONO_FONT).text_size(px(11.5)).line_height(px(17.)).text_color(if failed { t.del } else { t.dim })
                     .when(hidden > 0, |d| d.child(div().text_color(t.faint).child(format!("… 前面还有 {hidden} 行"))))

@@ -1120,6 +1120,18 @@ impl Editor {
         if self.review.as_ref().map(|r| r.hunks.is_empty()).unwrap_or(false) { self.review = None; cx.emit(EditorEvent::ReviewEnded); }
     }
 
+    /// 以 `original` 为基线进入审阅：磁盘上（和这里的缓冲区）已经是新内容，用于 Claude Code 后端——
+    /// Agent 自己写了文件，改动是事后审阅的（对标 Zed）。拒绝时回退并自动存盘。没有差异时返回 false。
+    pub fn review_against(&mut self, original: String, cx: &mut Context<Self>) -> bool {
+        self.review = Some(Review { original, hunks: vec![], rows: vec![], line_row: vec![], version: u64::MAX });
+        self.refresh_review();
+        if self.review.as_ref().map(|r| r.hunks.is_empty()).unwrap_or(true) { self.review = None; cx.notify(); return false; }
+        self.write_through = true;
+        self.scroll_to_first_hunk();
+        cx.notify();
+        true
+    }
+
     fn scroll_to_first_hunk(&mut self) {
         if let Some(r) = &self.review {
             if let Some(h) = r.hunks.first() {

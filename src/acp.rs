@@ -344,7 +344,7 @@ fn tail_chars(s: &str, max: usize) -> String {
 /// 结果在进行中是 None，完成是正文（可能为空），失败是「错误：…」。
 pub fn project(tc: &ToolCall) -> (String, Value, Option<String>) {
     let body = tc.content.iter().filter_map(|c| match c {
-        ToolContent::Text(t) if !t.trim().is_empty() => Some(t.clone()),
+        ToolContent::Text(t) if !t.trim().is_empty() => Some(strip_fence(t)),
         ToolContent::Diff { path, .. } => Some(format!("修改 {path}")),
         _ => None,
     }).collect::<Vec<_>>().join("\n");
@@ -354,7 +354,12 @@ pub fn project(tc: &ToolCall) -> (String, Value, Option<String>) {
         Status::Completed => Some(body),
         Status::Failed => Some(format!("错误：{}", if body.trim().is_empty() { "失败".to_string() } else { body })),
     };
-    (format!("acp:{}", tc.kind.as_str()), json!({"title": tc.title, "paths": tc.paths, "raw": tc.raw_input}), result)
+    let diffs: Vec<Value> = tc.content.iter().filter_map(|c| match c {
+        ToolContent::Diff { path, old, new } => Some(json!({"path": path, "preview": diff_preview(old.as_deref().unwrap_or(""), new, PREVIEW_LINES)
+            .into_iter().map(|(m, l)| json!([m.to_string(), l])).collect::<Vec<_>>()})),
+        _ => None,
+    }).collect();
+    (format!("acp:{}", tc.kind.as_str()), json!({"title": tc.title, "paths": tc.paths, "raw": tc.raw_input, "diffs": diffs}), result)
 }
 
 /// 计划（TODO）：作为一条特殊的「工具调用」展示；全部完成后才算有结果
@@ -363,6 +368,54 @@ pub fn project_plan(entries: &[PlanEntry]) -> (String, Value, Option<String>) {
         Status::Pending => "pending", Status::InProgress => "in_progress", Status::Completed => "completed", Status::Failed => "failed" }})).collect();
     let done = !entries.is_empty() && entries.iter().all(|e| matches!(e.status, Status::Completed));
     ("acp:plan".to_string(), json!({"entries": list}), if done { Some(String::new()) } else { None })
+}
+
+/// Claude Code 把命令输出包在代码围栏里（```console … ```），在卡片里显示时去掉围栏
+pub fn strip_fence(text: &str) -> String {
+    let t = text.trim_matches('\n');
+    let mut lines: Vec<&str> = t.lines().collect();
+    if lines.len() >= 2 && lines[0].trim_start().starts_with("```") && lines[lines.len() - 1].trim() == "```" {
+        lines.remove(0);
+        lines.pop();
+        return lines.join("\n");
+    }
+    text.to_string()
+}
+
+/// 卡片里 diff 预览最多显示的行数（删除 + 新增合计）
+pub const PREVIEW_LINES: usize = 14;
+
+/// 新旧文本的差异预览：去掉相同的开头和结尾行，只留中间不同的部分——先是删除（'-'），再是新增（'+'），
+/// 超过 `max` 行时截断并补一行 '…'。权限卡片里用它让用户在批准前看到「要改什么」。
+pub fn diff_preview(old: &str, new: &str, max: usize) -> Vec<(char, String)> {
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    let pre = a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count();
+    let suf = a[pre..].iter().rev().zip(b[pre..].iter().rev()).take_while(|(x, y)| x == y).count();
+    let removed = &a[pre..a.len() - suf];
+    let added = &b[pre..b.len() - suf];
+    let mut out: Vec<(char, String)> = removed.iter().map(|l| ('-', l.to_string())).chain(added.iter().map(|l| ('+', l.to_string()))).collect();
+    if out.len() > max { out.truncate(max); out.push(('…', String::new())); }
+    out
+}
+
+/// Agent 改完文件（工具完成）后要进入审阅的文件：(相对路径, 改动前的内容, 改动后的内容)。
+/// 只取项目内的；`old` 为 None 表示新建的文件。对标 Zed：改动已经在磁盘上，审阅是事后的，拒绝时回写。
+pub fn review_targets(tc: &ToolCall, root: &std::path::Path) -> Vec<(String, Option<String>, String)> {
+    tc.content.iter().filter_map(|c| match c {
+        ToolContent::Diff { path, old, new } => Some((rel_path(root, path)?, old.clone(), new.clone())),
+        _ => None,
+    }).collect()
+}
+
+/// Agent 的 diff 与磁盘内容对账：真实适配器给的整文件 diff 常常少了结尾换行，而磁盘上有。
+/// 忽略结尾换行比较「磁盘 == diff 的新文本」，不相等（片段级 diff / 之后又被改过）返回 None；
+/// 相等时返回补齐结尾换行的改动前内容（磁盘以换行结尾而 before 没有时补上，避免审阅里多出一个假改动）。
+pub fn reconcile_before(before: Option<&str>, after: &str, disk: &str) -> Option<String> {
+    if disk.trim_end_matches('\n') != after.trim_end_matches('\n') { return None; }
+    let mut b = before.unwrap_or("").to_string();
+    if !b.is_empty() && disk.ends_with('\n') && !b.ends_with('\n') { b.push('\n'); }
+    Some(b)
 }
 
 /// 绝对路径 → 相对项目根的路径；不在项目内返回 None
@@ -636,5 +689,79 @@ mod tests {
         assert_eq!(rel_path(root, "/p/proj"), None);
         assert_eq!(rel_path(root, "/p/project/a.rs"), None); // 前缀相同但不是子目录
         assert_eq!(rel_path(root, "relative/a.rs"), None);
+    }
+
+    #[test]
+    fn 去掉命令输出的代码围栏() {
+        assert_eq!(strip_fence("```console\nacp_out.txt\nREADME.md\n```"), "acp_out.txt\nREADME.md");
+        assert_eq!(strip_fence("```\n1\tline1\n```"), "1\tline1");
+        assert_eq!(strip_fence("没有围栏\n第二行"), "没有围栏\n第二行");
+        assert_eq!(strip_fence("```rust\nfn a(){}"), "```rust\nfn a(){}"); // 没有结束围栏：原样
+        assert_eq!(strip_fence("```\n```"), "");
+    }
+
+    #[test]
+    fn diff_预览只留不同的中间部分() {
+        let p = diff_preview("line1\nhello\nline3\n", "line1\nworld\nline3\n", 14);
+        assert_eq!(p, vec![('-', "hello".to_string()), ('+', "world".to_string())]);
+        // 新建文件：全是新增
+        let p = diff_preview("", "a\nb\n", 14);
+        assert_eq!(p, vec![('+', "a".to_string()), ('+', "b".to_string())]);
+        // 删除
+        assert_eq!(diff_preview("a\nb\nc", "a\nc", 14), vec![('-', "b".to_string())]);
+        // 没有差异
+        assert!(diff_preview("same\n", "same\n", 14).is_empty());
+        // 前后都有相同行时，中间多行替换
+        let p = diff_preview("h\nx\ny\nt", "h\nz\nt", 14);
+        assert_eq!(p, vec![('-', "x".into()), ('-', "y".into()), ('+', "z".into())]);
+    }
+
+    #[test]
+    fn diff_预览超长截断() {
+        let new: String = (0..100).map(|i| format!("l{i}\n")).collect();
+        let p = diff_preview("", &new, 5);
+        assert_eq!(p.len(), 6);
+        assert_eq!(p[4], ('+', "l4".to_string()));
+        assert_eq!(p[5].0, '…');
+    }
+
+    #[test]
+    fn 投影带出_diff_预览() {
+        let tc = ToolCall { id: "t".into(), title: "Edit a.txt".into(), kind: ToolKind::Edit, status: Status::Pending,
+            content: vec![ToolContent::Diff { path: "/p/a.txt".into(), old: Some("hello".into()), new: "world".into() }], paths: vec![], raw_input: None };
+        let (_, input, _) = project(&tc);
+        assert_eq!(input["diffs"][0]["path"], "/p/a.txt");
+        assert_eq!(input["diffs"][0]["preview"][0], json!(["-", "hello"]));
+        assert_eq!(input["diffs"][0]["preview"][1], json!(["+", "world"]));
+    }
+
+    #[test]
+    fn 审阅目标_只取项目内的_新建文件旧内容为空() {
+        let root = std::path::Path::new("/p/proj");
+        let tc = ToolCall { id: "t".into(), title: "".into(), kind: ToolKind::Edit, status: Status::Completed, paths: vec![], raw_input: None,
+            content: vec![
+                ToolContent::Diff { path: "/p/proj/a.txt".into(), old: Some("old".into()), new: "new".into() },
+                ToolContent::Diff { path: "/p/proj/src/n.rs".into(), old: None, new: "fresh".into() },
+                ToolContent::Diff { path: "/etc/hosts".into(), old: Some("x".into()), new: "y".into() },
+                ToolContent::Text("忽略".into()),
+            ] };
+        assert_eq!(review_targets(&tc, root), vec![
+            ("a.txt".to_string(), Some("old".to_string()), "new".to_string()),
+            ("src/n.rs".to_string(), None, "fresh".to_string()),
+        ]);
+    }
+
+    #[test]
+    fn 对账_结尾换行不一致也算同一份() {
+        // 真实适配器：diff 的新旧文本都没有结尾换行，磁盘上有
+        let b = reconcile_before(Some("line1\nhello\nline3"), "line1\nworld\nline3", "line1\nworld\nline3\n");
+        assert_eq!(b.as_deref(), Some("line1\nhello\nline3\n"));
+        // 磁盘本来就没有结尾换行：不补
+        assert_eq!(reconcile_before(Some("a"), "b", "b").as_deref(), Some("a"));
+        // 新建文件：基线是空串
+        assert_eq!(reconcile_before(None, "hello", "hello\n").as_deref(), Some(""));
+        // 片段级 diff（磁盘比新文本长得多）/ 之后又被改过：对不上
+        assert_eq!(reconcile_before(Some("hello"), "world", "line1\nworld\nline3\n"), None);
+        assert_eq!(reconcile_before(Some("a"), "b", "c"), None);
     }
 }

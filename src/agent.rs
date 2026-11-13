@@ -24,6 +24,8 @@ mod acp_impl;
 pub enum AgentEvent {
     /// `write_through`：先写盘再审阅（Claude Code 后端用，Agent 之后读到的必须是新内容）；否则只放进编辑器等审阅
     Apply { path: Option<String>, code: String, write_through: bool },
+    /// Agent 已经自己改好了磁盘上的文件（路径相对项目根）：打开并以改动前的内容为基线进入审阅，拒绝时回写
+    ReviewFile { path: String, before: Option<String> },
     OpenSettings,
     /// 在对话面板里切换了模型：工作区据此同步并保存设置
     ModelChanged { model: String, models: Vec<String> },

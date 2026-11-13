@@ -73,7 +73,9 @@ pub fn spawn(command: &str, cwd: &Path, events: async_channel::Sender<Event>) ->
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
         let mut stdin = stdin;
+        let log = std::env::var("QUILL_ACP_LOG").ok().and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
         while let Ok(line) = rx.recv() {
+            if let Some(mut f) = log.as_ref() { let _ = writeln!(f, "→ {line}"); }
             if stdin.write_all(line.as_bytes()).and_then(|_| stdin.write_all(b"\n")).and_then(|_| stdin.flush()).is_err() { break; }
         }
     });
@@ -99,7 +101,11 @@ pub fn spawn(command: &str, cwd: &Path, events: async_channel::Sender<Event>) ->
     // 读线程：逐行解析；EOF = 进程结束
     let c2 = child.clone();
     std::thread::spawn(move || {
+        // 调试：QUILL_ACP_LOG=文件 时把双方的原始 JSON 行记下来（→ 是我们发的，← 是 Agent 发的）
+        let log = std::env::var("QUILL_ACP_LOG").ok().and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
+        let log = log.map(|f| Arc::new(Mutex::new(f)));
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(f) = &log { if let Ok(mut f) = f.lock() { let _ = writeln!(f, "← {line}"); } }
             let ev = acp::parse_line(&line);
             if ev == Incoming::Ignore { continue; }
             if events.send_blocking(Event::Line(ev)).is_err() { return; }
