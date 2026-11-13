@@ -9,8 +9,9 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-/// 默认启动命令：适配器基于 Claude Agent SDK，沿用本机 Claude Code 的登录
-pub const DEFAULT_COMMAND: &str = "npx -y @agentclientprotocol/claude-agent-acp";
+/// 默认启动命令：适配器基于 Claude Agent SDK，沿用本机 Claude Code 的登录。
+/// **固定版本**（对标 Zed，agent_servers 里固定的也是 0.94.0）：适配器还在变（v2 草案），不跟 latest 走
+pub const DEFAULT_COMMAND: &str = "npx -y @agentclientprotocol/claude-agent-acp@0.94.0";
 
 pub enum Event {
     Line(Incoming),
@@ -117,6 +118,15 @@ pub fn spawn(command: &str, cwd: &Path, events: async_channel::Sender<Event>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 默认命令固定了适配器版本() {
+        // 版本号必须写死：npx 不带版本会取 latest，适配器一升级协议行为就可能变
+        let pkg = DEFAULT_COMMAND.split_whitespace().last().unwrap();
+        let (name, ver) = pkg.rsplit_once('@').unwrap();
+        assert_eq!(name, "@agentclientprotocol/claude-agent-acp");
+        assert!(ver.split('.').count() == 3 && ver.split('.').all(|p| p.parse::<u32>().is_ok()), "{ver}");
+    }
 
     #[test]
     fn 命令优先级_环境变量_设置_默认() {

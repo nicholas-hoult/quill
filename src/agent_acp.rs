@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 pub(super) struct AcpPerm {
     pub(super) rpc_id: Value,
+    pub(super) tool_id: String,
     pub(super) options: Vec<acp::PermOption>,
     pub(super) msg_id: u64,
     pub(super) call: usize,
@@ -33,7 +34,8 @@ pub(super) struct AcpState {
     cur: Option<u64>,
     /// toolCallId → 合并后的完整工具调用
     tools: HashMap<String, acp::ToolCall>,
-    pub(super) perm: Option<AcpPerm>,
+    /// 等待用户确认的权限请求（可能同时有多个：Agent 会并行调用工具）
+    pub(super) perms: acp::PermQueue<AcpPerm>,
 }
 
 impl AgentPanel {
@@ -41,7 +43,7 @@ impl AgentPanel {
         self.threads.iter_mut().flat_map(|t| t.messages.iter_mut()).find(|m| m.id == id)
     }
 
-    pub(super) fn acp_perm_pending(&self) -> bool { self.acp.as_ref().map(|a| a.perm.is_some()).unwrap_or(false) }
+    pub(super) fn acp_perm_pending(&self) -> bool { self.acp.as_ref().map(|a| !a.perms.is_empty()).unwrap_or(false) }
 
     /// 关掉 Agent 进程（切换 / 新建 / 删除对话时调用：每个对话一个独立会话）
     pub(super) fn acp_reset(&mut self) { self.acp = None; }
@@ -53,7 +55,7 @@ impl AgentPanel {
         self.acp_epoch += 1;
         let epoch = self.acp_epoch;
         handle.send(acp::initialize(1));
-        self.acp = Some(AcpState { handle, root, epoch, next_rpc: 3, init_id: 1, new_id: 0, session: None, prompt_id: None, ignored: HashSet::new(), queued: None, cur: None, tools: HashMap::new(), perm: None });
+        self.acp = Some(AcpState { handle, root, epoch, next_rpc: 3, init_id: 1, new_id: 0, session: None, prompt_id: None, ignored: HashSet::new(), queued: None, cur: None, tools: HashMap::new(), perms: Default::default() });
         cx.spawn(async move |this, cx| {
             while let Ok(ev) = rx.recv().await {
                 if this.update(cx, |p, cx| p.on_acp(epoch, ev, cx)).is_err() { break; }
@@ -117,7 +119,7 @@ impl AgentPanel {
             self.thread().messages.push(Message { id, calls: vec![], role: Role::Assistant, content: String::new(), refs: vec![], status: Status::Error(text), applied: HashSet::new(), snapshots: vec![] });
         }
         self.cancel = None;
-        if let Some(a) = self.acp.as_mut() { a.perm = None; a.queued = None; a.prompt_id = None; a.cur = None; }
+        if let Some(a) = self.acp.as_mut() { a.perms.drain(); a.queued = None; a.prompt_id = None; a.cur = None; }
         self.save();
         cx.notify();
     }
@@ -131,7 +133,7 @@ impl AgentPanel {
             if let Some(m) = id.and_then(|id| self.msg_mut(id)) { m.content.push_str(&format!("\n\n（{note}）")); }
         }
         self.cancel = None;
-        if let Some(a) = self.acp.as_mut() { a.perm = None; a.cur = None; }
+        if let Some(a) = self.acp.as_mut() { a.perms.drain(); a.cur = None; }
         self.save();
         self.acp_flush();
         cx.notify();
@@ -241,25 +243,37 @@ impl AgentPanel {
                     self.acp_reply(acp::respond(&id, acp::permission_result(opt.as_deref())));
                     self.acp_set_tool(tc);
                 } else if let Some((msg_id, call)) = self.acp_set_tool(tc) {
-                    if let Some(a) = self.acp.as_mut() { a.perm = Some(AcpPerm { rpc_id: id, options, msg_id, call }); }
+                    let tool_id = tool.id.clone();
+                    // 同一个工具调用又来一个请求：旧的作废，要回「取消」，否则 Agent 会一直等它
+                    let old = self.acp.as_mut().and_then(|a| a.perms.push(&tool_id, AcpPerm { rpc_id: id, tool_id: tool_id.clone(), options, msg_id, call }));
+                    if let Some(old) = old { self.acp_reply(acp::respond(&old.rpc_id, acp::permission_result(None))); }
                     if self.stick { self.scroll.scroll_to_bottom(); }
                 }
             }
             Request::ReadFile { path, line, limit } => {
-                let text = self.workspace.update(cx, |w, cx| w.file_text(&path, cx)).ok().flatten();
-                let line = match text {
-                    Some(t) => acp::respond(&id, json!({"content": acp::slice_lines(&t, line, limit)})),
-                    None => acp::respond_err(&id, -32002, &format!("无法读取 {path}")),
+                // 对标 Zed：只读项目内的文件（经编辑器缓冲区，含未保存的修改）；起始行越界是错误
+                let root = self.acp.as_ref().map(|a| a.root.clone());
+                let reply = if root.as_ref().and_then(|r| acp::rel_path(r, &path)).is_none() {
+                    acp::respond_err(&id, -32002, &format!("资源不存在或不在项目内：{path}"))
+                } else {
+                    match self.workspace.update(cx, |w, cx| w.file_text(&path, cx)).ok().flatten() {
+                        Some(t) => match acp::slice_lines(&t, line, limit) {
+                            Ok(c) => acp::respond(&id, json!({"content": c})),
+                            Err(e) => acp::respond_err(&id, -32602, &e),
+                        },
+                        None => acp::respond_err(&id, -32002, &format!("无法读取 {path}")),
+                    }
                 };
-                self.acp_reply(line);
+                self.acp_reply(reply);
             }
             Request::WriteFile { path, content } => {
                 let root = self.acp.as_ref().map(|a| a.root.clone());
                 match root.and_then(|r| acp::rel_path(&r, &path)) {
                     Some(rel) => {
-                        // 和 edit_file 一样走逐块审阅（并记检查点）；Agent 要立刻拿到成功才会继续，所以先回应
+                        // 对标 Zed：先写盘（Agent 之后用 Bash / 再读到的一定是新内容），审阅在事后：
+                        // 编辑器里照常逐块接受 / 拒绝，拒绝会自动再存一次；并记检查点，可整体回退
                         let mid = self.acp_target(false);
-                        self.emit_apply(mid, Some(rel), content, cx);
+                        self.emit_apply_ex(mid, Some(rel), content, true, cx);
                         self.acp_reply(acp::respond(&id, json!({})));
                     }
                     None => self.acp_reply(acp::respond_err(&id, -32602, &format!("路径不在项目内：{path}"))),
@@ -273,7 +287,7 @@ impl AgentPanel {
     /// 用户对权限卡片的选择
     pub(super) fn acp_decide(&mut self, d: Decision, cx: &mut Context<Self>) {
         let Some(a) = self.acp.as_mut() else { return };
-        let Some(p) = a.perm.take() else { return };
+        let Some(p) = a.perms.pop_front() else { return };
         let choice = match d { Decision::Once => Choice::Allow, Decision::Always => Choice::AllowAlways, Decision::Deny => Choice::Reject };
         let opt = acp::pick_option(&p.options, choice).map(|o| o.id.clone());
         a.handle.send(acp::respond(&p.rpc_id, acp::permission_result(opt.as_deref())));
@@ -283,7 +297,7 @@ impl AgentPanel {
     /// 停止按钮 / Esc：通知 Agent 取消，并回应还在等的权限请求
     pub(super) fn acp_stop(&mut self) {
         let Some(a) = self.acp.as_mut() else { return };
-        if let Some(p) = a.perm.take() { a.handle.send(acp::respond(&p.rpc_id, acp::permission_result(None))); }
+        for p in a.perms.drain() { a.handle.send(acp::respond(&p.rpc_id, acp::permission_result(None))); }
         if let (Some(sid), Some(pid)) = (a.session.clone(), a.prompt_id) {
             a.handle.send(acp::cancel(&sid));
             a.ignored.insert(pid);
@@ -301,7 +315,10 @@ impl AgentPanel {
         if kind == "plan" { return self.render_plan(c, &t); }
         let title = c.input["title"].as_str().unwrap_or("").to_string();
         let title = if title.is_empty() { kind.clone() } else { title };
-        let perm = self.acp.as_ref().and_then(|a| a.perm.as_ref()).map(|p| p.msg_id == msg_id && p.call == i).unwrap_or(false);
+        let here = |p: &AcpPerm| p.msg_id == msg_id && p.call == i;
+        let perm = self.acp.as_ref().map(|a| a.perms.is_front(here)).unwrap_or(false);
+        // 排在后面的请求：只显示「排队中」，轮到它时才出现按钮
+        let queued = !perm && self.acp.as_ref().map(|a| a.perms.contains(here)).unwrap_or(false);
         let failed = c.result.as_deref().map(|r| r.starts_with("错误")).unwrap_or(false);
         let ic = match kind.as_str() { "execute" => "terminal", "search" => "search", "edit" | "delete" | "move" => "agent", "think" | "other" | "switch_mode" => "alert", _ => "file" };
         let body: Vec<String> = c.result.as_deref().filter(|_| !failed || kind == "execute").map(|r| r.lines().map(str::to_string).collect()).unwrap_or_default();
@@ -317,6 +334,7 @@ impl AgentPanel {
                     .child(icon(ic, 13., if perm { t.accent } else { t.faint }))
                     .child(div().flex_1().min_w_0().truncate().font_family(MONO_FONT).text_size(px(12.)).text_color(t.text).child(title))
                     .child(if perm { div().flex_none().text_size(px(11.5)).text_color(t.accent).child("等待确认").into_any_element() }
+                        else if queued { div().flex_none().text_size(px(11.5)).text_color(t.faint).child("排队等待确认").into_any_element() }
                         else if failed { icon("x", 13., t.del).into_any_element() }
                         else if c.result.is_some() { icon("check", 13., t.add).into_any_element() }
                         else { div().text_color(t.faint).child("…").into_any_element() }),

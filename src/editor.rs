@@ -19,6 +19,8 @@ pub enum EditorEvent {
     /// 请求打开行内改写
     InlineAssist,
     ReviewEnded,
+    /// 先落盘后审阅的改动被拒绝了：工作区要把现在的内容再存一次，让磁盘和用户接受的结果一致
+    NeedSave,
     /// 后台语法分析结果已到（符号大纲 / 折叠范围更新）
     Analyzed,
     /// 光标或内容变化（用于关闭补全 / 悬停弹窗）
@@ -100,6 +102,8 @@ pub struct Editor {
     pub scroll_x: f32,
     pub reveal: bool,
     pub review: Option<Review>,
+    /// 这次审阅的改动已经先写进磁盘（Claude Code 后端，#7）：拒绝时要再存一次
+    pub write_through: bool,
     pub head: Option<String>,
     head_hunks: (u64, Vec<Hunk>),
     /// 闪烁周期的起点：打字 / 移动 / 刚获得焦点时重置，光标总是先满亮（见 caret.rs）
@@ -181,6 +185,7 @@ impl Editor {
             scroll_x: 0.0,
             reveal: false,
             review: None,
+            write_through: false,
             head: None,
             head_hunks: (u64::MAX, vec![]),
             blink_at: Instant::now(),
@@ -1135,16 +1140,18 @@ impl Editor {
     }
 
     pub fn accept_all(&mut self, cx: &mut Context<Self>) {
-        if self.review.take().is_some() { cx.emit(EditorEvent::ReviewEnded); cx.notify(); }
+        if self.review.take().is_some() { self.write_through = false; cx.emit(EditorEvent::ReviewEnded); cx.notify(); }
     }
 
     pub fn reject_all(&mut self, cx: &mut Context<Self>) {
         if let Some(r) = self.review.take() {
+            let save = std::mem::take(&mut self.write_through);
             let now = self.now_ms();
             self.buffer.replace_all(&r.original, now);
             self.sel = 0..0;
             self.after_change(cx);
             cx.emit(EditorEvent::ReviewEnded);
+            if save { cx.emit(EditorEvent::NeedSave); }
         }
     }
 
@@ -1165,6 +1172,7 @@ impl Editor {
     }
 
     pub fn reject_hunk(&mut self, k: usize, cx: &mut Context<Self>) {
+        let save = self.write_through && self.review.is_some();
         self.refresh_review();
         let Some(r) = &self.review else { return };
         let Some(h) = r.hunks.get(k).cloned() else { return };
@@ -1178,10 +1186,11 @@ impl Editor {
         self.refresh_review();
         self.after_change(cx);
         self.finish_hunk_action(cx);
+        if save { cx.emit(EditorEvent::NeedSave); }
     }
 
     fn finish_hunk_action(&mut self, cx: &mut Context<Self>) {
-        if self.review.as_ref().map(|r| r.hunks.is_empty()).unwrap_or(false) { self.review = None; cx.emit(EditorEvent::ReviewEnded); }
+        if self.review.as_ref().map(|r| r.hunks.is_empty()).unwrap_or(false) { self.review = None; self.write_through = false; cx.emit(EditorEvent::ReviewEnded); }
         cx.notify();
     }
 

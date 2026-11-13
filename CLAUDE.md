@@ -54,7 +54,7 @@ cargo build --release    # 发布构建（首次很慢）
 ## Claude Code 后端（#7，ACP）
 
 设置里「模型服务」选 Claude Code：Quill 当 ACP Client，起本机 Claude Code 适配器当 Agent（默认 `npx -y @agentclientprotocol/claude-agent-acp`，设置里可改；沿用本机 Claude Code 登录，不填 Key）。分三层：`acp.rs`（纯逻辑：JSON-RPC 编解码、`session/update` 解析、工具调用合并、权限选项、`fs/read_text_file` 切片、投影成面板卡片；有单测）→ `acp_client.rs`（子进程：用 `$SHELL -l -c exec <命令>` 起，保证 PATH；读 / 写 / stderr 三个线程；释放时杀整个进程组）→ `agent_acp.rs`（`agent.rs` 的子模块，`#[path]` 引入，能用面板私有字段：握手状态机、消息 / 工具卡片 / 计划 / 权限卡片）。
-要点：每个对话一个 ACP 会话，切换 / 新建 / 删除对话会关掉进程（二期用 `session/load` 恢复）；文字紧跟在工具调用后面时另起一条助手消息，保持先后顺序；`fs/write_text_file` 走 `emit_apply`（逐块审阅 + 检查点）并立即回成功；`terminal/*` 不声明，Agent 用自带 Bash；工具名统一 `acp:<kind>`，面板历史转 API 请求时会过滤掉；被用户停止的 prompt 记进 `ignored`，它迟到的 cancelled 响应不能当成新一轮的结束；进程异常退出会把 stderr 末尾显示在错误卡片里。
+要点：每个对话一个 ACP 会话，切换 / 新建 / 删除对话会关掉进程（二期用 `session/load` 恢复）；文字紧跟在工具调用后面时另起一条助手消息，保持先后顺序；`fs/write_text_file` 对标 Zed「先落盘、事后审阅」：`emit_apply_ex(.., write_through=true)` → `Workspace::apply_code` 进入逐块审阅并**立即写盘**（Agent 随后读磁盘 / 跑 Bash 一定是新内容），拒绝（`reject_hunk` / `reject_all`，`Editor.write_through`）会发 `EditorEvent::NeedSave` 再存一次；仍记检查点；内置后端的 `edit_file` 仍是先审阅后存盘；`fs/read_text_file` 只读项目内文件、起始行越界报错（同 Zed）；权限请求用 `PermQueue` 排队（Agent 会并行调用工具，单槽位会丢请求），同一工具调用的新请求作废旧的；适配器版本固定（`acp_client::DEFAULT_COMMAND`，Zed 固定的也是 0.94.0）；`terminal/*` 不声明，Agent 用自带 Bash；工具名统一 `acp:<kind>`，面板历史转 API 请求时会过滤掉；被用户停止的 prompt 记进 `ignored`，它迟到的 cancelled 响应不能当成新一轮的结束；进程异常退出会把 stderr 末尾显示在错误卡片里。
 验证：`QUILL_ACP="python3 private/probes/mock_acp.py"` 用模拟 Agent（消息含 `[acp-tool]` 走 读文件 → 计划 → 权限 → 写文件；`[acp-cancel]` 等取消；`[acp-die]` 崩溃）；测试用的 HOME 里要放 `settings.json`，`provider` 写 `claude-code`。注意 Rust 2024 里 `gen` 是保留字。
 
 ## 打包

@@ -190,7 +190,7 @@ impl Workspace {
         let commit_input = cx.new(|cx| Editor::new(EditorMode::composer("提交信息…"), cx));
         let mut subs = vec![];
         subs.push(cx.subscribe_in(&agent, window, |this, _, ev: &AgentEvent, window, cx| match ev {
-            AgentEvent::Apply { path, code } => this.apply_code(path.clone(), code.clone(), window, cx),
+            AgentEvent::Apply { path, code, write_through } => this.apply_code(path.clone(), code.clone(), *write_through, window, cx),
             AgentEvent::OpenSettings => this.open_settings(window, cx),
             AgentEvent::Restore(plan) => this.restore_files(plan.clone(), window, cx),
             AgentEvent::ModelChanged { model, models } => {
@@ -731,6 +731,7 @@ impl Workspace {
                 EditorEvent::InlineAssist => this.open_inline(window, cx),
                 EditorEvent::Changed => { let p = ed.read(cx).path.clone().unwrap_or_default(); this.on_editor_changed(&p, ed, cx); cx.notify(); }
                 EditorEvent::ReviewEnded | EditorEvent::Analyzed => cx.notify(),
+                EditorEvent::NeedSave => this.save_editor(ed.clone(), cx),
                 EditorEvent::Moved => this.on_editor_moved(ed, cx),
                 EditorEvent::Cancel => { if this.completion.is_some() || this.hover.is_some() { this.close_popups(cx); } else if this.find_open { this.close_find(window, cx); } }
                 _ => {}
@@ -767,6 +768,10 @@ impl Workspace {
 
     fn save_active(&mut self, cx: &mut Context<Self>) {
         let Some(ed) = self.active_editor() else { return };
+        self.save_editor(ed, cx);
+    }
+
+    fn save_editor(&mut self, ed: Entity<Editor>, cx: &mut Context<Self>) {
         let (path, text) = ed.read_with(cx, |e, _| (e.path.clone(), e.text()));
         let Some(path) = path else { return };
         match std::fs::write(&path, &text) {
@@ -874,7 +879,7 @@ impl Workspace {
         cx.notify();
     }
 
-    fn apply_code(&mut self, path: Option<String>, code: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn apply_code(&mut self, path: Option<String>, code: String, write_through: bool, window: &mut Window, cx: &mut Context<Self>) {
         let abs = match (&path, &self.root) {
             (Some(p), Some(root)) => {
                 // 路径来自模型：不能用 .. 逃出项目根，否则会在项目外建目录、写文件
@@ -898,6 +903,12 @@ impl Workspace {
                     e.replace_range_streaming(s, l, &code, cx);
                 } else { e.apply_with_review(&code, cx); }
             });
+            // 先落盘后审阅（Claude Code 后端，对标 Zed）：Agent 之后读到 / 运行的是新内容；
+            // 审阅照常，拒绝时会自动再存一次（EditorEvent::NeedSave）
+            if write_through {
+                ed.update(cx, |e, _| e.write_through = true);
+                self.save_editor(ed, cx);
+            }
         }
     }
 

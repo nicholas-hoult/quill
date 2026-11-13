@@ -267,14 +267,42 @@ pub fn pick_option(options: &[PermOption], c: Choice) -> Option<&PermOption> {
     }
 }
 
-/// `fs/read_text_file` 的 line（1 起）/ limit：只返回请求的那一段，而不是整份文件
-pub fn slice_lines(content: &str, line: Option<usize>, limit: Option<usize>) -> String {
-    if line.is_none() && limit.is_none() { return content.to_string(); }
+/// `fs/read_text_file` 的 line（1 起）/ limit：只返回请求的那一段，而不是整份文件。
+/// 对标 Zed：起始行超出文件末尾是错误（行数 = 换行数 + 1，文件末尾的空行也算一行）。
+pub fn slice_lines(content: &str, line: Option<usize>, limit: Option<usize>) -> Result<String, String> {
     let start = line.unwrap_or(1).max(1) - 1;
+    let rows = content.matches('\n').count() + 1;
+    if start >= rows { return Err(format!("起始行超出文件末尾（文件共 {rows} 行，请求第 {} 行）", start + 1)); }
+    if line.is_none() && limit.is_none() { return Ok(content.to_string()); }
     let lines: Vec<&str> = content.split_inclusive('\n').collect();
     let end = limit.map(|l| (start + l).min(lines.len())).unwrap_or(lines.len());
-    if start >= lines.len() { return String::new(); }
-    lines[start..end].concat()
+    if start >= lines.len() { return Ok(String::new()); } // 恰好是末尾那个空行
+    Ok(lines[start..end].concat())
+}
+
+/// 等待用户确认的权限请求队列。Agent 可能并行调用工具，同时发来多个请求：
+/// 只有一个槽位的话后来的会把前面的覆盖掉，被覆盖的那个永远得不到回应，Agent 就一直卡住。
+/// 对标 Zed：按请求排队；同一个工具调用再来一个请求，旧的作废（调用方要对旧的回「取消」）。
+pub struct PermQueue<T> { items: std::collections::VecDeque<(String, T)> }
+
+impl<T> Default for PermQueue<T> { fn default() -> Self { Self { items: Default::default() } } }
+
+impl<T> PermQueue<T> {
+    /// 入队；如果同一工具调用已有排队的请求，把旧的取出来还给调用方
+    pub fn push(&mut self, tool_id: &str, item: T) -> Option<T> {
+        let old = self.items.iter().position(|(id, _)| id == tool_id).and_then(|i| self.items.remove(i)).map(|(_, t)| t);
+        self.items.push_back((tool_id.to_string(), item));
+        old
+    }
+    pub fn front(&self) -> Option<&T> { self.items.front().map(|(_, t)| t) }
+    pub fn pop_front(&mut self) -> Option<T> { self.items.pop_front().map(|(_, t)| t) }
+    /// 取出全部（停止 / 出错时统一回应「取消」）
+    pub fn drain(&mut self) -> Vec<T> { self.items.drain(..).map(|(_, t)| t).collect() }
+    pub fn is_empty(&self) -> bool { self.items.is_empty() }
+    pub fn len(&self) -> usize { self.items.len() }
+    /// 是不是排在最前面的那个（界面上只给它显示确认按钮）
+    pub fn is_front(&self, f: impl Fn(&T) -> bool) -> bool { self.front().map(f).unwrap_or(false) }
+    pub fn contains(&self, f: impl Fn(&T) -> bool) -> bool { self.items.iter().any(|(_, t)| f(t)) }
 }
 
 /// 一次回合结束的原因，转成给用户看的话；正常结束返回 None
@@ -501,14 +529,53 @@ mod tests {
     #[test]
     fn 按行读取切片() {
         let c = "a\nb\nc\nd\n";
-        assert_eq!(slice_lines(c, None, None), c);
-        assert_eq!(slice_lines(c, Some(2), None), "b\nc\nd\n");
-        assert_eq!(slice_lines(c, Some(2), Some(2)), "b\nc\n");
-        assert_eq!(slice_lines(c, None, Some(1)), "a\n");
-        assert_eq!(slice_lines(c, Some(3), Some(100)), "c\nd\n"); // limit 超出文件末尾
-        assert_eq!(slice_lines(c, Some(99), Some(1)), "");
-        assert_eq!(slice_lines(c, Some(0), Some(1)), "a\n"); // 0 当 1
-        assert_eq!(slice_lines("x", Some(1), Some(1)), "x"); // 没有结尾换行
+        assert_eq!(slice_lines(c, None, None).unwrap(), c);
+        assert_eq!(slice_lines(c, Some(2), None).unwrap(), "b\nc\nd\n");
+        assert_eq!(slice_lines(c, Some(2), Some(2)).unwrap(), "b\nc\n");
+        assert_eq!(slice_lines(c, None, Some(1)).unwrap(), "a\n");
+        assert_eq!(slice_lines(c, Some(3), Some(100)).unwrap(), "c\nd\n"); // limit 超出文件末尾
+        assert_eq!(slice_lines(c, Some(0), Some(1)).unwrap(), "a\n"); // 0 当 1
+        assert_eq!(slice_lines("x", Some(1), Some(1)).unwrap(), "x"); // 没有结尾换行
+    }
+
+    #[test]
+    fn 读取越界是错误_对标_zed() {
+        let c = "a\nb\n"; // 3 行：a、b、末尾空行
+        assert_eq!(slice_lines(c, Some(3), None).unwrap(), ""); // 末尾那个空行本身可以读
+        let e = slice_lines(c, Some(4), Some(1)).unwrap_err();
+        assert!(e.contains("超出文件末尾") && e.contains('3'), "{e}");
+        assert!(slice_lines(c, Some(99), None).is_err());
+        assert!(slice_lines("", Some(2), None).is_err()); // 空文件只有 1 行
+        assert_eq!(slice_lines("", None, None).unwrap(), "");
+    }
+
+    #[test]
+    fn 权限队列_并发请求不丢() {
+        let mut q: PermQueue<&str> = PermQueue::default();
+        assert!(q.is_empty());
+        assert_eq!(q.push("t1", "第一个"), None);
+        assert_eq!(q.push("t2", "第二个"), None);
+        assert_eq!(q.len(), 2);
+        // 前面的先处理，后面的不会被覆盖
+        assert_eq!(q.front(), Some(&"第一个"));
+        assert!(q.is_front(|s| *s == "第一个"));
+        assert!(!q.is_front(|s| *s == "第二个"));
+        assert!(q.contains(|s| *s == "第二个"));
+        assert_eq!(q.pop_front(), Some("第一个"));
+        assert_eq!(q.front(), Some(&"第二个"));
+        assert_eq!(q.pop_front(), Some("第二个"));
+        assert_eq!(q.pop_front(), None);
+    }
+
+    #[test]
+    fn 权限队列_同一工具调用再来请求_旧的作废并还给调用方() {
+        let mut q: PermQueue<&str> = PermQueue::default();
+        q.push("t1", "旧");
+        q.push("t2", "别的");
+        assert_eq!(q.push("t1", "新"), Some("旧")); // 调用方要对「旧」回取消
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.drain(), vec!["别的", "新"]); // 新的排到后面，顺序按到达时间
+        assert!(q.is_empty());
     }
 
     #[test]

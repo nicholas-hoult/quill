@@ -22,7 +22,8 @@ use std::time::Duration;
 mod acp_impl;
 
 pub enum AgentEvent {
-    Apply { path: Option<String>, code: String },
+    /// `write_through`：先写盘再审阅（Claude Code 后端用，Agent 之后读到的必须是新内容）；否则只放进编辑器等审阅
+    Apply { path: Option<String>, code: String, write_through: bool },
     OpenSettings,
     /// 在对话面板里切换了模型：工作区据此同步并保存设置
     ModelChanged { model: String, models: Vec<String> },
@@ -163,7 +164,9 @@ impl AgentPanel {
     }
 
     /// 应用 Agent 的改动前，先把目标文件现在的内容记到所属那一轮的检查点里，再发出 Apply
-    fn emit_apply(&mut self, msg_id: u64, path: Option<String>, code: String, cx: &mut Context<Self>) {
+    fn emit_apply(&mut self, msg_id: u64, path: Option<String>, code: String, cx: &mut Context<Self>) { self.emit_apply_ex(msg_id, path, code, false, cx) }
+
+    fn emit_apply_ex(&mut self, msg_id: u64, path: Option<String>, code: String, write_through: bool, cx: &mut Context<Self>) {
         if let (Some(rel), Some(owner)) = (path.clone().or_else(|| self.active_file.clone()), self.owner_user(msg_id)) {
             let before = self.workspace.update(cx, |w, cx| {
                 let root = w.root_path();
@@ -182,7 +185,7 @@ impl AgentPanel {
                 }
             }
         }
-        cx.emit(AgentEvent::Apply { path, code });
+        cx.emit(AgentEvent::Apply { path, code, write_through });
     }
 
     /// 回退到某条用户消息之前要做的事：这条消息及之后各轮改过的文件，每个取最早的改动前内容
