@@ -583,6 +583,9 @@ impl Workspace {
     }
 
     /// 回到窗口时检查外部修改：没有未保存改动就自动重载，有就提醒一次
+    /// 聊天面板是否打开（面板据此决定要不要提前起 Agent，#8）
+    pub fn agent_is_open(&self) -> bool { self.agent_open }
+
     fn check_external_changes(&mut self, cx: &mut Context<Self>) {
         let mut conflicts = vec![];
         let mut reloaded = false;

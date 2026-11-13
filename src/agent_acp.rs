@@ -73,13 +73,24 @@ impl AgentPanel {
         Ok(())
     }
 
-    /// 用户开始打字时提前起 Agent、握手、建会话（#8）。预热期间出任何错都不往对话里写：用户还没发消息，
-    /// 真正发送时会重新起一次，那时的错误才该让他看到。
+    /// 有使用意图时提前起 Agent、握手、建会话（#8）：输入框开始有字立即起；聊天面板开着则见 `acp_prewarm_soon`。
+    /// 预热期间出任何错都不往对话里写：用户还没发消息，真正发送时会重新起一次，那时的错误才该让他看到。
     pub(super) fn acp_prewarm(&mut self, cx: &mut Context<Self>) {
         let empty = self.composer.read(cx).is_empty();
+        let open = self.workspace.update(cx, |w, _| w.agent_is_open()).unwrap_or(false);
         let root = self.workspace.update(cx, |w, _| w.root_path()).ok().flatten();
-        if !acp::should_prewarm(&self.settings.provider, self.acp.is_some(), root.is_some(), self.cancel.is_some(), empty) { return; }
+        if !acp::should_prewarm(&self.settings.provider, self.acp.is_some(), root.is_some(), self.cancel.is_some(), acp::prewarm_intent(empty, open)) { return; }
         if let Some(root) = root { let _ = self.acp_start(root, cx); }
+    }
+
+    /// 项目加载好、聊天面板开着时，稍等一会再预热：让启动先把编辑器画出来，别和它抢 CPU。
+    /// 反复调用无害（到点再检查一次条件，已经起了就什么都不做）。
+    pub(super) fn acp_prewarm_soon(&mut self, cx: &mut Context<Self>) {
+        if self.acp.is_some() || self.settings.provider != "claude-code" { return; }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
+            let _ = this.update(cx, |p, cx| p.acp_prewarm(cx));
+        }).detach();
     }
 
     /// 预热期间（没有在等回复）的失败：悄悄丢掉进程，下次发送会重来；在等回复时才走正常的报错

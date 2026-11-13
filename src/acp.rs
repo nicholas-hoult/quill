@@ -331,10 +331,14 @@ impl<T> PermQueue<T> {
     pub fn contains(&self, f: impl Fn(&T) -> bool) -> bool { self.items.iter().any(|(_, t)| f(t)) }
 }
 
-/// 是否该提前把 Agent 拉起来（#8）：启动进程 + 握手 + 建会话要好几秒，等用户按下发送再起会让他干等。
-/// 以「输入框开始有字」作为发送意图——只点一下输入框、切换对话都不起进程（它们很频繁，每次起一个 node 太浪费）。
-pub fn should_prewarm(provider: &str, has_agent: bool, has_root: bool, busy: bool, composer_empty: bool) -> bool {
-    provider == "claude-code" && !has_agent && has_root && !busy && !composer_empty
+/// 有没有使用 Claude Code 的意图（#8）：输入框开始有字，或聊天面板开着。
+/// 只点一下输入框、切换对话不算——它们很频繁，每次起一个 node + claude 太浪费；面板关着也不起
+pub fn prewarm_intent(composer_empty: bool, panel_open: bool) -> bool { !composer_empty || panel_open }
+
+/// 是否该提前把 Agent 拉起来（#8）：启动进程 + 握手 + 建会话实测要好几秒（建会话 4–5s 是 Claude Code 自己的启动），
+/// 等用户按下发送再起会让他干等「思考中…」
+pub fn should_prewarm(provider: &str, has_agent: bool, has_root: bool, busy: bool, intent: bool) -> bool {
+    provider == "claude-code" && !has_agent && has_root && !busy && intent
 }
 
 /// 一次回合结束的原因，转成给用户看的话；正常结束返回 None
@@ -962,22 +966,31 @@ mod tests {
         assert_eq!(argv, vec!["pwd"]);
     }
 
-    // ---- 预热（#8）：Agent 启动 + 握手 + 建会话要好几秒，用户开始打字时就先拉起来，发送时已经就绪 ----
+    // ---- 预热（#8）：Agent 启动 + 握手 + 建会话要好几秒，有使用意图时就先拉起来，发送时已经就绪 ----
 
     #[test]
-    fn 预热_只在有发送意图时触发() {
-        // 用 Claude Code、有项目、没有进程、不忙、输入框有字：预热
-        assert!(should_prewarm("claude-code", false, true, false, false));
-        // 输入框还是空的：没有发送意图（点一下输入框、切换对话都不该起进程）
-        assert!(!should_prewarm("claude-code", false, true, false, true));
+    fn 预热意图_打字或聊天面板开着() {
+        assert!(prewarm_intent(false, false), "输入框有字");
+        assert!(prewarm_intent(true, true), "聊天面板开着（启动时面板就是开的）");
+        assert!(prewarm_intent(false, true));
+        // 面板关着、输入框也是空的：没有使用意图（只点一下输入框、切换对话都不算）
+        assert!(!prewarm_intent(true, false));
+    }
+
+    #[test]
+    fn 预热_条件() {
+        // 用 Claude Code、有项目、没有进程、不忙、有意图：预热
+        assert!(should_prewarm("claude-code", false, true, false, true));
+        // 没有意图
+        assert!(!should_prewarm("claude-code", false, true, false, false));
         // 已经有进程（预热过 / 正在用）：不重复起
-        assert!(!should_prewarm("claude-code", true, true, false, false));
+        assert!(!should_prewarm("claude-code", true, true, false, true));
         // 没打开项目：Agent 没有工作目录可用
-        assert!(!should_prewarm("claude-code", false, false, false, false));
+        assert!(!should_prewarm("claude-code", false, false, false, true));
         // 正在回复中：不碰
-        assert!(!should_prewarm("claude-code", false, true, true, false));
+        assert!(!should_prewarm("claude-code", false, true, true, true));
         // 用 API Key 的后端：根本没有这个进程
-        assert!(!should_prewarm("anthropic", false, true, false, false));
-        assert!(!should_prewarm("", false, true, false, false));
+        assert!(!should_prewarm("anthropic", false, true, false, true));
+        assert!(!should_prewarm("", false, true, false, true));
     }
 }

@@ -159,6 +159,7 @@ impl AgentPanel {
     pub fn set_files(&mut self, files: Vec<String>, root: Option<std::path::PathBuf>, cx: &mut Context<Self>) {
         self.files = files.clone();
         let Some(root) = root else { return };
+        self.acp_prewarm_soon(cx);
         let cache = self.sym_cache.clone();
         cx.spawn(async move |this, cx| {
             let syms = cx.background_executor().spawn(async move {
