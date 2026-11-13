@@ -59,20 +59,62 @@ pub struct Hit { pub path: String, pub line: usize, pub text: String }
 pub fn match_lines(content: &str, query: &str) -> Vec<(usize, String)> {
     if query.is_empty() { return vec![]; }
     let q = query.to_lowercase();
+    // 绝大多数文件没有命中：整文件小写一次做快速排除，省掉逐行分配小写字符串（整库搜索时是大头）
+    if !content.to_lowercase().contains(&q) { return vec![]; }
     content.lines().enumerate().filter(|(_, l)| l.to_lowercase().contains(&q)).map(|(i, l)| (i + 1, l.chars().take(240).collect())).collect()
 }
 
-/// 项目内文本搜索（不区分大小写，最多 `limit` 条）
+/// 能搜索的文件（遵守 .gitignore；跳过 .git、超过 2MB 的文件），顺序即遍历顺序。惰性：不需要的部分不会被遍历
+fn searchable_files(root: &Path) -> impl Iterator<Item = std::path::PathBuf> {
+    ignore::WalkBuilder::new(root).hidden(false).filter_entry(|e| e.file_name() != ".git").build().flatten().filter_map(|e| {
+        if !e.file_type().map(|t| t.is_file()).unwrap_or(false) { return None; }
+        if e.metadata().map(|m| m.len() > 2 * 1024 * 1024).unwrap_or(true) { return None; }
+        Some(e.into_path())
+    })
+}
+
+/// 多线程 map：结果顺序与输入一致。线程从共享计数器里领下一项，所以耗时不均也不会让某个线程闲着
+fn par_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let threads = threads.min(items.len()).max(1);
+    if threads == 1 { return items.iter().map(&f).collect(); }
+    let next = AtomicUsize::new(0);
+    let mut parts: Vec<Vec<(usize, R)>> = std::thread::scope(|sc| {
+        let handles: Vec<_> = (0..threads).map(|_| sc.spawn(|| {
+            let mut mine = vec![];
+            loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= items.len() { break; }
+                mine.push((i, f(&items[i])));
+            }
+            mine
+        })).collect();
+        handles.into_iter().map(|h| h.join().expect("搜索线程不应 panic")).collect()
+    });
+    let mut all: Vec<(usize, R)> = parts.drain(..).flatten().collect();
+    all.sort_unstable_by_key(|(i, _)| *i);
+    all.into_iter().map(|(_, r)| r).collect()
+}
+
+/// 项目内文本搜索（不区分大小写，最多 `limit` 条）。
+/// 文件分批多线程读取（读文件和 UTF-8 校验是大头），批内结果按遍历顺序合并，所以结果顺序确定，
+/// 等于顺序扫描的前 `limit` 条；凑够 `limit` 条后不再处理后面的批
 pub fn search_text(root: &Path, query: &str, limit: usize) -> Vec<Hit> {
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
+    let mut files = searchable_files(root);
     let mut hits = vec![];
-    for e in ignore::WalkBuilder::new(root).hidden(false).filter_entry(|e| e.file_name() != ".git").build().flatten() {
-        if !e.file_type().map(|t| t.is_file()).unwrap_or(false) { continue; }
-        if e.metadata().map(|m| m.len() > 2 * 1024 * 1024).unwrap_or(true) { continue; }
-        let Ok(content) = std::fs::read_to_string(e.path()) else { continue };
-        let rel = e.path().strip_prefix(root).unwrap_or(e.path()).to_string_lossy().to_string();
-        for (line, text) in match_lines(&content, query) {
-            hits.push(Hit { path: rel.clone(), line, text });
-            if hits.len() >= limit { return hits; }
+    loop {
+        // 边遍历边处理：常见词凑够 limit 条后，目录剩下的部分根本不会被遍历
+        let batch: Vec<std::path::PathBuf> = files.by_ref().take(threads * 32).collect();
+        if batch.is_empty() { break; }
+        let found = par_map(&batch, threads, |p| std::fs::read_to_string(p).map(|c| match_lines(&c, query)).unwrap_or_default());
+        for (p, lines) in batch.iter().zip(found) {
+            if lines.is_empty() { continue; }
+            let rel = p.strip_prefix(root).unwrap_or(p).to_string_lossy().to_string();
+            for (line, text) in lines {
+                hits.push(Hit { path: rel.clone(), line, text });
+                if hits.len() >= limit { return hits; }
+            }
         }
     }
     hits
@@ -81,6 +123,108 @@ pub fn search_text(root: &Path, query: &str, limit: usize) -> Vec<Hit> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 行搜索_不区分大小写_行号从1开始() {
+        let r = match_lines("Hello\nworld\nHELLO again", "hello");
+        assert_eq!(r, vec![(1, "Hello".to_string()), (3, "HELLO again".to_string())]);
+    }
+
+    #[test]
+    fn 行搜索_非ascii大小写与中文() {
+        // 优化成「整文件先小写做快速排除」后，Unicode 的大小写折叠结果必须和逐行一致
+        assert_eq!(match_lines("Straße\nÄpfel\n你好 World", "äPFEL"), vec![(2, "Äpfel".to_string())]);
+        assert_eq!(match_lines("a\n你好 World", "你好"), vec![(2, "你好 World".to_string())]);
+    }
+
+    #[test]
+    fn 行搜索_没有命中和空查询() {
+        assert!(match_lines("abc\ndef", "zzz").is_empty());
+        assert!(match_lines("abc", "").is_empty());
+    }
+
+    #[test]
+    fn 行搜索_长行只取前240个字符_不会在多字节字符中间截断() {
+        let line = "好".repeat(300);
+        let r = match_lines(&line, "好");
+        assert_eq!(r[0].1.chars().count(), 240);
+    }
+
+    #[test]
+    fn 行搜索_跨行的词不会误命中() {
+        // 查询里没有换行，不能因为整文件快速排除而把相邻两行拼起来命中
+        assert!(match_lines("ab\ncd", "b\nc").is_empty());
+    }
+
+    #[test]
+    fn 并行映射_结果顺序与输入一致() {
+        let items: Vec<usize> = (0..1000).collect();
+        // 故意让不同项耗时不同，顺序仍必须按输入排
+        let r = par_map(&items, 8, |&i| { if i % 7 == 0 { std::thread::sleep(std::time::Duration::from_micros(200)); } i * 2 });
+        assert_eq!(r, items.iter().map(|i| i * 2).collect::<Vec<_>>());
+        assert_eq!(par_map::<usize, usize>(&[], 4, |&i| i), Vec::<usize>::new());
+        assert_eq!(par_map(&[5usize], 8, |&i| i + 1), vec![6]); // 线程数多于项数
+    }
+
+    #[test]
+    fn 搜索_命中顺序确定且等于顺序扫描的前N条() {
+        let d = tempfile::tempdir().unwrap();
+        for i in 0..300 { std::fs::write(d.path().join(format!("f{i:03}.txt")), format!("x\nhit {i}\nhit again {i}\n")).unwrap(); }
+        // 参照：按同一份文件清单顺序、单线程逐个文件匹配
+        let mut want = vec![];
+        for f in searchable_files(d.path()) {
+            let rel = f.strip_prefix(d.path()).unwrap().to_string_lossy().to_string();
+            for (line, text) in match_lines(&std::fs::read_to_string(&f).unwrap(), "hit") { want.push(Hit { path: rel.clone(), line, text }); }
+        }
+        want.truncate(100);
+        let a = search_text(d.path(), "hit", 100);
+        let b = search_text(d.path(), "hit", 100);
+        assert_eq!(a.len(), 100);
+        assert_eq!(a, want, "并行扫描的结果必须和顺序扫描的前 100 条完全一致（含顺序）");
+        assert_eq!(a, b, "两次结果必须一致");
+    }
+
+    #[test]
+    fn 搜索_跳过大文件和非utf8() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("big.txt"), "needle ".repeat(400_000)).unwrap(); // > 2MB
+        std::fs::write(d.path().join("bin.dat"), [0xffu8, 0xfe, b'n', b'e', b'e', b'd', b'l', b'e']).unwrap();
+        std::fs::write(d.path().join("ok.txt"), "a needle b").unwrap();
+        let hits = search_text(d.path(), "needle", 10);
+        assert_eq!(hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(), vec!["ok.txt"]);
+    }
+
+    /// 度量（不进常规测试）：`SEARCH_BENCH_DIR=<目录> cargo test --release search_bench -- --ignored --nocapture`
+    /// 搜一个不存在的词 = 最坏情况（要读完所有文件）
+    #[test]
+    #[ignore]
+    fn search_bench() {
+        let Ok(dir) = std::env::var("SEARCH_BENCH_DIR") else { return };
+        let root = Path::new(&dir);
+        for round in 0..3 {
+            let t = std::time::Instant::now();
+            let hits = search_text(root, "zzqq_不存在的词_xx", 600);
+            eprintln!("[bench] 第{}轮 无命中全库扫描 {:.0}ms（命中 {}）", round + 1, t.elapsed().as_secs_f64() * 1000., hits.len());
+        }
+        // 拆开看：纯遍历 / 遍历+读文件
+        let t = std::time::Instant::now();
+        let (mut n, mut bytes) = (0usize, 0u64);
+        for e in ignore::WalkBuilder::new(root).hidden(false).filter_entry(|e| e.file_name() != ".git").build().flatten() {
+            if e.file_type().map(|t| t.is_file()).unwrap_or(false) { n += 1; bytes += e.metadata().map(|m| m.len()).unwrap_or(0); }
+        }
+        eprintln!("[bench] 纯遍历 {:.0}ms：{} 个文件 {:.0}MB", t.elapsed().as_secs_f64() * 1000., n, bytes as f64 / 1e6);
+        let t = std::time::Instant::now();
+        let mut read = 0u64;
+        for e in ignore::WalkBuilder::new(root).hidden(false).filter_entry(|e| e.file_name() != ".git").build().flatten() {
+            if !e.file_type().map(|t| t.is_file()).unwrap_or(false) { continue; }
+            if e.metadata().map(|m| m.len() > 2 * 1024 * 1024).unwrap_or(true) { continue; }
+            if let Ok(c) = std::fs::read_to_string(e.path()) { read += c.len() as u64; }
+        }
+        eprintln!("[bench] 遍历+读文件 {:.0}ms：读入 {:.0}MB 文本", t.elapsed().as_secs_f64() * 1000., read as f64 / 1e6);
+        let t = std::time::Instant::now();
+        let hits = search_text(root, "fn ", 600);
+        eprintln!("[bench] 常见词（达到上限提前结束）{:.0}ms（命中 {}）", t.elapsed().as_secs_f64() * 1000., hits.len());
+    }
 
     fn setup() -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();
