@@ -13,8 +13,8 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub fn initialize(id: u64) -> String {
     json!({"jsonrpc":"2.0","id":id,"method":"initialize","params":{
         "protocolVersion": PROTOCOL_VERSION,
-        // 读写文件走 Quill（能读到未保存的修改、写入进审阅）；terminal 一期不声明，Agent 用自带的 Bash
-        "clientCapabilities":{"fs":{"readTextFile":true,"writeTextFile":true},"terminal":false},
+        // 读写文件走 Quill（能读到未保存的修改、写入进审阅）；terminal：Agent 的命令由 Quill 起进程，输出实时显示在卡片里（对标 Zed）
+        "clientCapabilities":{"fs":{"readTextFile":true,"writeTextFile":true},"terminal":true},
         "clientInfo":{"name":"quill","title":"Quill","version":env!("CARGO_PKG_VERSION")}
     }}).to_string()
 }
@@ -140,6 +140,11 @@ pub enum Request {
     Permission { tool: ToolPatch, options: Vec<PermOption> },
     ReadFile { path: String, line: Option<usize>, limit: Option<usize> },
     WriteFile { path: String, content: String },
+    TermCreate { command: String, args: Vec<String>, env: Vec<(String, String)>, cwd: Option<String>, limit: Option<usize> },
+    TermOutput { id: String },
+    TermWait { id: String },
+    TermKill { id: String },
+    TermRelease { id: String },
     Unknown(String),
 }
 
@@ -235,6 +240,17 @@ fn request_of(method: &str, p: &Value) -> Request {
             line: p.get("line").and_then(|x| x.as_u64()).map(|x| x as usize),
             limit: p.get("limit").and_then(|x| x.as_u64()).map(|x| x as usize),
         },
+        "terminal/create" => Request::TermCreate {
+            command: s(p, "command").unwrap_or_default(),
+            args: p.get("args").and_then(|a| a.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default(),
+            env: p.get("env").and_then(|a| a.as_array()).map(|a| a.iter().filter_map(|e| Some((s(e, "name")?, s(e, "value").unwrap_or_default()))).collect()).unwrap_or_default(),
+            cwd: s(p, "cwd"),
+            limit: p.get("outputByteLimit").and_then(|x| x.as_u64()).map(|x| x as usize),
+        },
+        "terminal/output" => Request::TermOutput { id: s(p, "terminalId").unwrap_or_default() },
+        "terminal/wait_for_exit" => Request::TermWait { id: s(p, "terminalId").unwrap_or_default() },
+        "terminal/kill" => Request::TermKill { id: s(p, "terminalId").unwrap_or_default() },
+        "terminal/release" => Request::TermRelease { id: s(p, "terminalId").unwrap_or_default() },
         "fs/write_text_file" => Request::WriteFile { path: s(p, "path").unwrap_or_default(), content: s(p, "content").unwrap_or_default() },
         other => Request::Unknown(other.to_string()),
     }
@@ -369,7 +385,8 @@ pub fn project(tc: &ToolCall) -> (String, Value, Option<String>) {
             .into_iter().map(|(m, l)| json!([m.to_string(), l])).collect::<Vec<_>>()})),
         _ => None,
     }).collect();
-    (format!("acp:{}", tc.kind.as_str()), json!({"title": tc.title, "paths": tc.paths, "raw": tc.raw_input, "diffs": diffs}), result)
+    let terminal = tc.content.iter().find_map(|c| if let ToolContent::Terminal(id) = c { Some(id.clone()) } else { None });
+    (format!("acp:{}", tc.kind.as_str()), json!({"title": tc.title, "paths": tc.paths, "raw": tc.raw_input, "diffs": diffs, "terminal": terminal}), result)
 }
 
 /// 计划（TODO）：作为一条特殊的「工具调用」展示；全部完成后才算有结果
@@ -428,6 +445,73 @@ pub fn reconcile_before(before: Option<&str>, after: &str, disk: &str) -> Option
     Some(b)
 }
 
+// ---------- 终端（Agent 的命令由 Quill 起进程）----------
+
+/// 命令输出缓冲：超过上限时从**开头**丢（ACP 约定），在字符边界上截断；
+/// 管道一次读到的字节可能把一个多字节字符切成两半，所以不完整的结尾先留着，下次凑齐了再转。
+pub struct OutputBuf { text: String, limit: usize, truncated: bool, pending: Vec<u8> }
+
+/// 没指定 outputByteLimit 时的上限
+pub const DEFAULT_OUTPUT_LIMIT: usize = 1024 * 1024;
+
+impl OutputBuf {
+    pub fn new(limit: Option<usize>) -> Self { Self { text: String::new(), limit: limit.unwrap_or(DEFAULT_OUTPUT_LIMIT).max(1), truncated: false, pending: vec![] } }
+
+    pub fn push(&mut self, bytes: &[u8]) {
+        self.pending.extend_from_slice(bytes);
+        // 取出能完整转成 UTF-8 的前缀；结尾不完整的字符留到下次
+        let valid = match std::str::from_utf8(&self.pending) {
+            Ok(_) => self.pending.len(),
+            Err(e) if e.error_len().is_none() => e.valid_up_to(), // 只是结尾被切断
+            Err(_) => self.pending.len(),                          // 真的有非法字节：整体宽容转换
+        };
+        let chunk: Vec<u8> = self.pending.drain(..valid).collect();
+        self.text.push_str(&String::from_utf8_lossy(&chunk));
+        if self.text.len() > self.limit {
+            let mut cut = self.text.len() - self.limit;
+            while !self.text.is_char_boundary(cut) { cut += 1; }
+            self.text.drain(..cut);
+            self.truncated = true;
+        }
+    }
+
+    pub fn text(&self) -> &str { &self.text }
+    pub fn truncated(&self) -> bool { self.truncated }
+}
+
+/// 进程退出状态
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Exit { pub code: Option<i32>, pub signal: Option<i32> }
+
+impl Exit {
+    pub fn json(&self) -> Value {
+        json!({"exitCode": self.code, "signal": self.signal.map(|s| signal_name(s))})
+    }
+}
+
+fn signal_name(n: i32) -> &'static str {
+    match n { 1 => "SIGHUP", 2 => "SIGINT", 3 => "SIGQUIT", 6 => "SIGABRT", 9 => "SIGKILL", 13 => "SIGPIPE", 15 => "SIGTERM", _ => "SIGNAL" }
+}
+
+/// `terminal/output` 的响应
+pub fn terminal_output_result(output: &str, truncated: bool, exit: Option<Exit>) -> Value {
+    let mut v = json!({"output": output, "truncated": truncated});
+    if let Some(e) = exit { v["exitStatus"] = e.json(); }
+    v
+}
+
+/// 实际执行的 argv：ACP 约定 command 是可执行文件、args 是参数；但有的 Agent 把整条命令行塞进 command，
+/// 没有 args 且 command 里有空白时按 shell 命令行处理。stdout 和 stderr 合并（`2>&1`），和终端里看到的一致。
+/// 返回传给 `sh -c` 的 (脚本, $0 之后的参数)。
+pub fn shell_invocation(command: &str, args: &[String]) -> (String, Vec<String>) {
+    if args.is_empty() && command.trim().contains(char::is_whitespace) {
+        (format!("exec {} 2>&1", command.trim()), vec![])
+    } else {
+        // "$0" 是命令，"$@" 是参数，原样传递，不经过 shell 的二次解析
+        ("exec \"$0\" \"$@\" 2>&1".to_string(), std::iter::once(command.to_string()).chain(args.iter().cloned()).collect())
+    }
+}
+
 /// 绝对路径 → 相对项目根的路径；不在项目内返回 None
 pub fn rel_path(root: &std::path::Path, abs: &str) -> Option<String> {
     let rel = std::path::Path::new(abs).strip_prefix(root).ok()?;
@@ -449,7 +533,7 @@ mod tests {
         assert_eq!(m["params"]["protocolVersion"], 1);
         assert_eq!(m["params"]["clientCapabilities"]["fs"]["readTextFile"], true);
         assert_eq!(m["params"]["clientCapabilities"]["fs"]["writeTextFile"], true);
-        assert_eq!(m["params"]["clientCapabilities"]["terminal"], false);
+        assert_eq!(m["params"]["clientCapabilities"]["terminal"], true); // 终端由 Quill 起进程（acp_term）
         assert_eq!(m["jsonrpc"], "2.0");
     }
 
@@ -599,8 +683,8 @@ mod tests {
         let r = parse_line(r#"{"jsonrpc":"2.0","id":6,"method":"fs/write_text_file","params":{"sessionId":"s","path":"/p/a.rs","content":"x"}}"#);
         assert_eq!(r, Incoming::Request { id: json!(6), req: Request::WriteFile { path: "/p/a.rs".into(), content: "x".into() } });
         // 不认识的请求也要带 id 回来，调用方才能回「不支持」而不是让 Agent 干等
-        let r = parse_line(r#"{"jsonrpc":"2.0","id":9,"method":"terminal/create","params":{}}"#);
-        assert_eq!(r, Incoming::Request { id: json!(9), req: Request::Unknown("terminal/create".into()) });
+        let r = parse_line(r#"{"jsonrpc":"2.0","id":9,"method":"workspace/unknown_thing","params":{}}"#);
+        assert_eq!(r, Incoming::Request { id: json!(9), req: Request::Unknown("workspace/unknown_thing".into()) });
     }
 
     #[test]
@@ -787,5 +871,88 @@ mod tests {
         // 片段级 diff（磁盘比新文本长得多）/ 之后又被改过：对不上
         assert_eq!(reconcile_before(Some("hello"), "world", "line1\nworld\nline3\n"), None);
         assert_eq!(reconcile_before(Some("a"), "b", "c"), None);
+    }
+
+    #[test]
+    fn 握手声明终端能力() {
+        assert_eq!(v(&initialize(1))["params"]["clientCapabilities"]["terminal"], true);
+    }
+
+    #[test]
+    fn 解析终端请求() {
+        let r = parse_line(r#"{"jsonrpc":"2.0","id":3,"method":"terminal/create","params":{"sessionId":"s","command":"cargo","args":["test","--lib"],"env":[{"name":"A","value":"1"}],"cwd":"/p","outputByteLimit":2000}}"#);
+        assert_eq!(r, Incoming::Request { id: json!(3), req: Request::TermCreate { command: "cargo".into(), args: vec!["test".into(), "--lib".into()], env: vec![("A".into(), "1".into())], cwd: Some("/p".into()), limit: Some(2000) } });
+        let r = parse_line(r#"{"jsonrpc":"2.0","id":4,"method":"terminal/create","params":{"command":"ls"}}"#);
+        assert_eq!(r, Incoming::Request { id: json!(4), req: Request::TermCreate { command: "ls".into(), args: vec![], env: vec![], cwd: None, limit: None } });
+        for (m, want) in [("terminal/output", Request::TermOutput { id: "t1".into() }), ("terminal/wait_for_exit", Request::TermWait { id: "t1".into() }),
+                          ("terminal/kill", Request::TermKill { id: "t1".into() }), ("terminal/release", Request::TermRelease { id: "t1".into() })] {
+            let line = format!(r#"{{"jsonrpc":"2.0","id":8,"method":"{m}","params":{{"sessionId":"s","terminalId":"t1"}}}}"#);
+            assert_eq!(parse_line(&line), Incoming::Request { id: json!(8), req: want }, "{m}");
+        }
+    }
+
+    #[test]
+    fn 输出缓冲_超限从开头丢并标记() {
+        let mut b = OutputBuf::new(Some(10));
+        b.push(b"0123456789");
+        assert_eq!((b.text(), b.truncated()), ("0123456789", false));
+        b.push(b"abc");
+        assert_eq!((b.text(), b.truncated()), ("3456789abc", true));
+    }
+
+    #[test]
+    fn 输出缓冲_多字节字符跨读取边界不乱码() {
+        let bytes = "你好世界".as_bytes(); // 12 字节
+        let mut b = OutputBuf::new(None);
+        b.push(&bytes[..4]); // 切在第二个字的中间
+        assert_eq!(b.text(), "你");
+        b.push(&bytes[4..7]);
+        assert_eq!(b.text(), "你好");
+        b.push(&bytes[7..]);
+        assert_eq!(b.text(), "你好世界");
+        assert!(!b.text().contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn 输出缓冲_截断落在字符边界() {
+        let mut b = OutputBuf::new(Some(7));
+        b.push("中文字符".as_bytes()); // 12 字节，要丢 5 字节 → 退到字符边界
+        assert!(b.text().len() <= 7);
+        assert!(b.text().chars().all(|c| "中文字符".contains(c)));
+        assert!(b.truncated());
+    }
+
+    #[test]
+    fn 输出缓冲_非法字节宽容转换_不卡住() {
+        let mut b = OutputBuf::new(None);
+        b.push(&[b'a', 0xff, b'b']);
+        assert!(b.text().starts_with('a') && b.text().ends_with('b'));
+        b.push(b"c");
+        assert!(b.text().ends_with("bc"));
+    }
+
+    #[test]
+    fn 终端输出响应与退出状态() {
+        assert_eq!(terminal_output_result("hi\n", false, None), json!({"output": "hi\n", "truncated": false}));
+        let r = terminal_output_result("hi\n", true, Some(Exit { code: Some(0), signal: None }));
+        assert_eq!(r["truncated"], true);
+        assert_eq!(r["exitStatus"], json!({"exitCode": 0, "signal": null}));
+        let r = terminal_output_result("", false, Some(Exit { code: None, signal: Some(9) }));
+        assert_eq!(r["exitStatus"], json!({"exitCode": null, "signal": "SIGKILL"}));
+    }
+
+    #[test]
+    fn 命令行拼装() {
+        // 标准写法：可执行文件 + 参数，原样传递，不会被 shell 二次解析
+        let (script, argv) = shell_invocation("cargo", &["test".to_string(), "a b".to_string()]);
+        assert_eq!(script, "exec \"$0\" \"$@\" 2>&1");
+        assert_eq!(argv, vec!["cargo", "test", "a b"]);
+        // 整条命令行塞进 command：按 shell 处理
+        let (script, argv) = shell_invocation("ls -la | head", &[]);
+        assert_eq!(script, "exec ls -la | head 2>&1");
+        assert!(argv.is_empty());
+        // 单个词、没有参数：当成可执行文件
+        let (_, argv) = shell_invocation("pwd", &[]);
+        assert_eq!(argv, vec!["pwd"]);
     }
 }

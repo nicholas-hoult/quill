@@ -4,6 +4,7 @@
 use super::*;
 use crate::acp::{self, Choice, Incoming, Request, Update};
 use crate::acp_client::{self, Event};
+use crate::acp_term::Terminals;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -39,6 +40,10 @@ pub(super) struct AcpState {
     tools: HashMap<String, acp::ToolCall>,
     /// 等待用户确认的权限请求（可能同时有多个：Agent 会并行调用工具）
     pub(super) perms: acp::PermQueue<AcpPerm>,
+    /// Agent 的终端（`terminal/create`），以及正在等某个终端退出的 `terminal/wait_for_exit` 请求
+    pub(super) terms: Terminals,
+    term_waits: HashMap<String, Vec<Value>>,
+    events: async_channel::Sender<Event>,
 }
 
 impl AgentPanel {
@@ -54,11 +59,12 @@ impl AgentPanel {
     fn acp_start(&mut self, root: PathBuf, cx: &mut Context<Self>) -> Result<(), String> {
         let (tx, rx) = async_channel::unbounded();
         let cmd = acp_client::command_line(&self.settings.acp_cmd);
+        let tx2 = tx.clone();
         let handle = acp_client::spawn(&cmd, &root, tx)?;
         self.acp_epoch += 1;
         let epoch = self.acp_epoch;
         handle.send(acp::initialize(1));
-        self.acp = Some(AcpState { handle, root, epoch, next_rpc: 3, init_id: 1, new_id: 0, session: None, can_load: false, loading: None, prompt_id: None, ignored: HashSet::new(), queued: None, cur: None, tools: HashMap::new(), perms: Default::default() });
+        self.acp = Some(AcpState { handle, root, epoch, next_rpc: 3, init_id: 1, new_id: 0, session: None, can_load: false, loading: None, prompt_id: None, ignored: HashSet::new(), queued: None, cur: None, tools: HashMap::new(), perms: Default::default(), terms: Terminals::default(), term_waits: HashMap::new(), events: tx2 });
         cx.spawn(async move |this, cx| {
             while let Ok(ev) = rx.recv().await {
                 if this.update(cx, |p, cx| p.on_acp(epoch, ev, cx)).is_err() { break; }
@@ -154,6 +160,15 @@ impl AgentPanel {
             Event::Line(Incoming::Update(u)) => self.acp_update(u, cx),
             Event::Line(Incoming::Request { id, req }) => self.acp_request(id, req, cx),
             Event::Line(Incoming::Ignore) => {}
+            Event::TermOutput => { if self.stick { self.scroll.scroll_to_bottom(); } cx.notify(); }
+            Event::TermExit(id) => {
+                let Some(a) = self.acp.as_mut() else { return };
+                let exit = a.terms.exit(&id).flatten();
+                for rpc in a.term_waits.remove(&id).unwrap_or_default() {
+                    a.handle.send(acp::respond(&rpc, exit.map(|e| e.json()).unwrap_or(json!({}))));
+                }
+                cx.notify();
+            }
         }
     }
 
@@ -337,6 +352,35 @@ impl AgentPanel {
                     None => self.acp_reply(acp::respond_err(&id, -32602, &format!("路径不在项目内：{path}"))),
                 }
             }
+            Request::TermCreate { command, args, env, cwd, limit } => {
+                let Some(a) = self.acp.as_mut() else { return };
+                let dir = cwd.map(PathBuf::from).filter(|p| p.is_absolute() && p.is_dir()).unwrap_or_else(|| a.root.clone());
+                let reply = match a.terms.create(&command, &args, &env, &dir, limit, a.events.clone()) {
+                    Ok(tid) => acp::respond(&id, json!({"terminalId": tid})),
+                    Err(e) => acp::respond_err(&id, -32000, &e),
+                };
+                self.acp_reply(reply);
+            }
+            Request::TermOutput { id: tid } => {
+                let reply = match self.acp.as_ref().and_then(|a| a.terms.output(&tid)) {
+                    Some((text, truncated, exit)) => acp::respond(&id, acp::terminal_output_result(&text, truncated, exit)),
+                    None => acp::respond_err(&id, -32002, &format!("没有这个终端：{tid}")),
+                };
+                self.acp_reply(reply);
+            }
+            Request::TermWait { id: tid } => {
+                let Some(a) = self.acp.as_mut() else { return };
+                match a.terms.exit(&tid) {
+                    None => { let l = acp::respond_err(&id, -32002, &format!("没有这个终端：{tid}")); a.handle.send(l); }
+                    Some(Some(e)) => { let l = acp::respond(&id, e.json()); a.handle.send(l); }
+                    Some(None) => a.term_waits.entry(tid).or_default().push(id), // 退出时由 Event::TermExit 回应
+                }
+            }
+            Request::TermKill { id: tid } | Request::TermRelease { id: tid } => {
+                // release 也只是终止；输出保留在内存里，卡片完成后还要显示
+                if let Some(a) = self.acp.as_ref() { a.terms.kill(&tid); }
+                self.acp_reply(acp::respond(&id, json!({})));
+            }
             Request::Unknown(m) => self.acp_reply(acp::respond_err(&id, -32601, &format!("Quill 不支持 {m}"))),
         }
         cx.notify();
@@ -362,6 +406,7 @@ impl AgentPanel {
         }
         a.queued = None;
         a.cur = None;
+        a.terms.kill_all();
     }
 
     // ---------- 界面 ----------
@@ -380,7 +425,13 @@ impl AgentPanel {
         let queued = !perm && self.acp.as_ref().map(|a| a.perms.contains(here)).unwrap_or(false);
         let failed = c.result.as_deref().map(|r| r.starts_with("错误")).unwrap_or(false);
         let ic = match kind.as_str() { "execute" => "terminal", "search" => "search", "edit" | "delete" | "move" => "agent", "think" | "other" | "switch_mode" => "alert", _ => "file" };
-        let body: Vec<String> = c.result.as_deref().filter(|_| !failed || kind == "execute").map(|r| r.lines().map(str::to_string).collect()).unwrap_or_default();
+        // 有终端时显示终端的实时输出，否则显示工具返回的文字
+        let term = c.input["terminal"].as_str().and_then(|id| self.acp.as_ref().and_then(|a| a.terms.view(id)));
+        let running = term.as_ref().map(|(_, r)| *r).unwrap_or(false);
+        let body: Vec<String> = match &term {
+            Some((text, _)) => text.lines().map(str::to_string).collect(),
+            None => c.result.as_deref().filter(|_| !failed || kind == "execute").map(|r| r.lines().map(str::to_string).collect()).unwrap_or_default(),
+        };
         const SHOWN: usize = 8;
         let hidden = body.len().saturating_sub(SHOWN);
         let shown: Vec<String> = body[hidden..].to_vec();
@@ -393,6 +444,7 @@ impl AgentPanel {
                     .child(icon(ic, 13., if perm { t.accent } else { t.faint }))
                     .child(div().flex_1().min_w_0().truncate().font_family(MONO_FONT).text_size(px(12.)).text_color(t.text).child(title))
                     .child(if perm { div().flex_none().text_size(px(11.5)).text_color(t.accent).child("等待确认").into_any_element() }
+                        else if running { div().flex_none().text_size(px(11.5)).text_color(t.dim).child("运行中…").into_any_element() }
                         else if queued { div().flex_none().text_size(px(11.5)).text_color(t.faint).child("排队等待确认").into_any_element() }
                         else if failed { icon("x", 13., t.del).into_any_element() }
                         else if c.result.is_some() { icon("check", 13., t.add).into_any_element() }

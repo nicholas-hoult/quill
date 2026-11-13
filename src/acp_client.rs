@@ -17,6 +17,9 @@ pub enum Event {
     Line(Incoming),
     /// 进程结束了。附带 stderr 末尾，用来告诉用户为什么
     Exited(String),
+    /// Agent 的某个终端有新输出 / 退出了（`acp_term`）
+    TermOutput,
+    TermExit(String),
 }
 
 pub struct Handle {
