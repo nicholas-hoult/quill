@@ -18,6 +18,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+#[path = "agent_acp.rs"]
+mod acp_impl;
+
 pub enum AgentEvent {
     Apply { path: Option<String>, code: String },
     OpenSettings,
@@ -111,6 +114,9 @@ pub struct AgentPanel {
     /// 正在确认回退的那条用户消息；以及已经回退过的（只用来显示「已恢复」）
     restoring: Option<u64>,
     restored: HashSet<u64>,
+    /// Claude Code（ACP）后端的会话（#7）；每个对话一个，切换 / 新建对话时关掉
+    acp: Option<acp_impl::AcpState>,
+    acp_epoch: u64,
     _sub: Subscription,
 }
 
@@ -128,13 +134,13 @@ impl AgentPanel {
         let sub = cx.subscribe(&composer, |this, _, ev: &EditorEvent, cx| match ev {
             EditorEvent::Submit => this.send(cx),
             EditorEvent::Changed => this.update_mention(cx),
-            EditorEvent::Cancel => { if this.restoring.is_some() { this.cancel_restore(cx); } else if this.model_menu { this.close_model_menu(cx); } else if this.awaiting.is_some() { this.decide(Decision::Deny, cx); } else if this.cancel.is_some() { this.stop(cx); } }
+            EditorEvent::Cancel => { if this.restoring.is_some() { this.cancel_restore(cx); } else if this.model_menu { this.close_model_menu(cx); } else if this.awaiting.is_some() || this.acp_perm_pending() { this.decide(Decision::Deny, cx); } else if this.cancel.is_some() { this.stop(cx); } }
             _ => {}
         });
         let threads = load_threads();
         let active = 0;
         let next_id = threads.iter().flat_map(|t| t.messages.iter().map(|m| m.id)).max().unwrap_or(0) + 1;
-        Self { workspace, composer, threads, active, cancel: None, scroll: ScrollHandle::new(), stick: true, files: vec![], active_file: None, dropped: vec![], extra: vec![], mention: None, menu: false, settings, next_id, rounds: 0, expanded: HashSet::new(), hl_cache: Default::default(), rules_file: None, rules_root: None, awaiting: None, running: None, always_allow: false, model_menu: false, model_sel: 0, restoring: None, restored: HashSet::new(), _sub: sub }
+        Self { workspace, composer, threads, active, cancel: None, scroll: ScrollHandle::new(), stick: true, files: vec![], active_file: None, dropped: vec![], extra: vec![], mention: None, menu: false, settings, next_id, rounds: 0, expanded: HashSet::new(), hl_cache: Default::default(), rules_file: None, rules_root: None, awaiting: None, running: None, always_allow: false, model_menu: false, model_sel: 0, restoring: None, restored: HashSet::new(), acp: None, acp_epoch: 0, _sub: sub }
     }
 
     pub fn focus_composer(&self, window: &mut Window, cx: &App) { window.focus(&self.composer.read(cx).focus); }
@@ -187,7 +193,7 @@ impl AgentPanel {
         crate::checkpoint::plan(&turns)
     }
 
-    fn busy(&self) -> bool { self.cancel.is_some() || self.awaiting.is_some() }
+    fn busy(&self) -> bool { self.cancel.is_some() || self.awaiting.is_some() || self.acp_perm_pending() }
 
     fn begin_restore(&mut self, user_id: u64, cx: &mut Context<Self>) {
         if self.busy() || self.restore_plan(user_id).is_empty() { return; }
@@ -391,6 +397,11 @@ impl AgentPanel {
         self.thread().messages.push(user);
         self.rounds = 0;
         self.stick = true;
+        if self.settings.provider == "claude-code" {
+            let prompt = self.threads[self.active].messages.last().map(|m| m.content.clone()).unwrap_or_default();
+            self.acp_send(prompt, cx);
+            return;
+        }
         self.start_round(cx);
     }
 
@@ -406,7 +417,7 @@ impl AgentPanel {
             .map(|(i, m)| HistMsg {
                 role: if m.role == Role::User { "user" } else { "assistant" },
                 text: if m.role == Role::User && Some(i) != last_user { strip_context(&m.content).to_string() } else { m.content.clone() },
-                calls: m.calls.iter().filter_map(|c| Some(HistCall { id: c.id.clone(), name: c.name.clone(), input: c.input.clone(), result: c.result.clone()? })).collect(),
+                calls: m.calls.iter().filter(|c| !c.name.starts_with("acp:")).filter_map(|c| Some(HistCall { id: c.id.clone(), name: c.name.clone(), input: c.input.clone(), result: c.result.clone()? })).collect(),
             })
             .collect();
         let messages = api_messages(&hist);
@@ -504,6 +515,7 @@ impl AgentPanel {
 
     /// 用户对确认卡片的选择
     fn decide(&mut self, d: Decision, cx: &mut Context<Self>) {
+        if self.acp_perm_pending() { self.acp_decide(d, cx); return; }
         let Some((msg_id, i)) = self.awaiting.take() else { return };
         match d {
             Decision::Deny => {
@@ -549,7 +561,8 @@ impl AgentPanel {
 
     /// 切换 / 新建 / 删除对话前，先结束还在等确认或运行中的命令，避免确认卡片留在看不见的对话里
     fn abort_pending(&mut self, cx: &mut Context<Self>) {
-        if self.awaiting.is_some() || self.running.is_some() { self.stop(cx); }
+        if self.awaiting.is_some() || self.running.is_some() || self.acp.is_some() { self.stop(cx); }
+        self.acp_reset();
     }
 
     /// 应用最近一条回复里还没应用的代码块（⌘⇧↵）
@@ -567,6 +580,7 @@ impl AgentPanel {
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
+        self.acp_stop();
         if let Some((mid, i)) = self.awaiting.take() { self.set_result(mid, i, "用户中止了这次对话，命令没有运行。".into()); }
         if let Some(c) = self.cancel.take() {
             c.store(true, Ordering::Relaxed);
@@ -660,8 +674,9 @@ impl AgentPanel {
 
     /// 输入框右下角的模型 chip：当前模型的简短名称；演示模式显示「演示模式」，点击去设置
     fn model_chip(&self, t: &crate::theme::Theme, cx: &mut Context<Self>) -> Stateful<Div> {
-        let mock = self.settings.provider == "mock";
-        let name = if mock { "演示模式".to_string() } else { crate::models::label(&self.settings.model) };
+        let cc = self.settings.provider == "claude-code";
+        let mock = self.settings.provider == "mock" || cc;
+        let name = if cc { "Claude Code".to_string() } else if mock { "演示模式".to_string() } else { crate::models::label(&self.settings.model) };
         let (hover, dim, faint, text) = (t.hover, t.dim, t.faint, t.text);
         div().id("model-chip").flex().items_center().gap(px(4.)).h(px(26.)).px(px(8.)).mr(px(4.)).rounded(px(8.)).cursor_pointer().text_size(px(12.)).text_color(dim)
             .hover(move |s| s.bg(hover).text_color(text))
@@ -698,6 +713,7 @@ impl AgentPanel {
 
     /// 一次工具调用：读类是一行紧凑的摘要；run_command 是带确认按钮和输出的终端卡片
     fn render_call(&self, msg_id: u64, i: usize, c: &ToolCall, cx: &mut Context<Self>) -> Div {
+        if c.name.starts_with("acp:") { return self.render_acp_call(msg_id, i, c, cx); }
         let t = cx.theme().clone();
         let (verb, obj) = tools::parts(&c.name, &c.input);
         let failed = c.result.as_deref().map(|r| r.starts_with("错误")).unwrap_or(false);
@@ -840,7 +856,7 @@ impl Render for AgentPanel {
             .on_action(cx.listener(|this, _: &crate::actions::MoveDown, _, cx| { if this.model_menu { this.move_model_sel(1, cx); } else if let Some(m) = &mut this.mention { m.sel = (m.sel + 1) % m.items.len(); cx.notify(); } }))
             .on_action(cx.listener(|this, _: &crate::actions::AcceptReview, _, cx| {
                 // ⌘↵：有命令在等确认就允许运行；否则交给后面的处理者（接受审阅）
-                if this.awaiting.is_some() { this.decide(Decision::Once, cx); } else { cx.propagate(); }
+                if this.awaiting.is_some() || this.acp_perm_pending() { this.decide(Decision::Once, cx); } else { cx.propagate(); }
             }))
             .on_action(cx.listener(|this, _: &crate::actions::Enter, _, cx| if this.restoring.is_some() { this.confirm_restore(cx) } else if this.model_menu { this.choose_model(this.model_sel, cx) } else { this.pick_mention(cx) }))
             .on_action(cx.listener(|this, _: &crate::actions::Tab, _, cx| if this.model_menu { this.choose_model(this.model_sel, cx) } else { this.pick_mention(cx) }))

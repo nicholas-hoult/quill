@@ -1398,7 +1398,7 @@ impl Workspace {
         let ed = self.active_editor();
         let (pos, lang) = ed.as_ref().map(|e| { let e = e.read(cx); (Some(e.cursor_line_col()), syntax::lang_label(e.lang)) }).unwrap_or((None, ""));
         let near = ed.as_ref().and_then(|e| e.read(cx).diagnostic_near_cursor().map(|d| (d.severity, d.message.lines().next().unwrap_or("").to_string())));
-        let provider = if self.settings.provider == "mock" { "演示模式".to_string() } else { self.settings.model.clone() };
+        let provider = match self.settings.provider.as_str() { "mock" => "演示模式".to_string(), "claude-code" => "Claude Code".to_string(), _ => self.settings.model.clone() };
         div().h(px(26.)).flex_none().flex().items_center().gap(px(14.)).px(px(12.)).bg(t.panel).border_t_1().border_color(t.border).text_size(px(12.)).text_color(t.dim)
             .when_some(self.branch.clone(), |d, b| d.child(div().flex().items_center().gap(px(5.)).child(icon("branch", 13., t.dim)).child(b)))
             .when(!self.changes.is_empty(), |d| d.child(div().id("st-chg").cursor_pointer().hover(|s| s.text_color(t.text)).on_click(cx.listener(|this, _, _, cx| { this.sidebar = true; this.side_view = SideView::Git; cx.notify(); })).child(format!("{} 处改动", self.changes.len()))))

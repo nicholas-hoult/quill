@@ -16,6 +16,7 @@ pub struct SettingsView {
     key: Entity<Editor>,
     model: Entity<Editor>,
     base: Entity<Editor>,
+    acp: Entity<Editor>,
     _subs: Vec<Subscription>,
 }
 
@@ -27,8 +28,9 @@ impl SettingsView {
         let key = mk(cx, "sk-…", &s.api_key);
         let model = mk(cx, "模型名", &s.model);
         let base = mk(cx, "留空使用官方地址", &s.base_url);
+        let acp = mk(cx, crate::acp_client::DEFAULT_COMMAND, &s.acp_cmd);
         let mut subs = vec![];
-        for e in [&key, &model, &base] {
+        for e in [&key, &model, &base, &acp] {
             subs.push(cx.subscribe(e, |this, _, ev: &EditorEvent, cx| match ev {
                 EditorEvent::Cancel => cx.emit(SettingsEvent::Close),
                 EditorEvent::Submit => this.save(cx),
@@ -36,8 +38,8 @@ impl SettingsView {
             }));
         }
         let focus = cx.focus_handle();
-        if s.provider != "mock" { window.focus(&key.read(cx).focus); } else { window.focus(&focus); }
-        Self { focus, s, key, model, base, _subs: subs }
+        if s.provider == "anthropic" || s.provider == "openai" { window.focus(&key.read(cx).focus); } else { window.focus(&focus); }
+        Self { focus, s, key, model, base, acp, _subs: subs }
     }
 
     fn save(&mut self, cx: &mut Context<Self>) {
@@ -45,7 +47,8 @@ impl SettingsView {
         s.api_key = self.key.read(cx).text();
         s.model = self.model.read(cx).text();
         s.base_url = self.base.read(cx).text();
-        if s.provider != "mock" { crate::models::remember(&mut s.models, &s.model); }
+        s.acp_cmd = self.acp.read(cx).text().trim().to_string();
+        if s.provider == "anthropic" || s.provider == "openai" { crate::models::remember(&mut s.models, &s.model); }
         cx.emit(SettingsEvent::Save(s));
     }
 }
@@ -65,6 +68,7 @@ impl Render for SettingsView {
         let t = cx.theme().clone();
         let field = |label: &str, e: &Entity<Editor>| div().flex().items_center().gap(px(10.)).child(div().w(px(80.)).text_color(t.dim).child(label.to_string())).child(div().flex_1().h(px(32.)).px(px(10.)).flex().items_center().rounded(px(8.)).bg(t.bg).border_1().border_color(t.border).child(div().flex_1().child(e.clone())));
         let mock = self.s.provider == "mock";
+        let cc = self.s.provider == "claude-code";
         div().id("settings-scrim").track_focus(&self.focus).on_key_down(cx.listener(|_, ev: &KeyDownEvent, _, cx| { if ev.keystroke.key == "escape" { cx.emit(SettingsEvent::Close); } })).absolute().inset_0().flex().justify_center().items_center().bg(t.scrim).occlude()
             .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::Close)))
             .child(
@@ -73,9 +77,11 @@ impl Render for SettingsView {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(div().text_size(px(16.)).font_weight(FontWeight::BOLD).child("设置"))
                     .child(div().flex().items_center().gap(px(10.)).child(div().w(px(80.)).text_color(t.dim).child("主题")).child(div().flex_1().child(seg("theme", &[("system", "跟随系统"), ("dark", "深色"), ("light", "浅色")], &self.s.theme.clone(), cx, |this, v| this.s.theme = v.to_string()))))
-                    .child(div().flex().items_center().gap(px(10.)).child(div().w(px(80.)).text_color(t.dim).child("模型服务")).child(div().flex_1().child(seg("prov", &[("mock", "演示"), ("anthropic", "Anthropic"), ("openai", "OpenAI 兼容")], &self.s.provider.clone(), cx, |this, v| this.s.provider = v.to_string()))))
+                    .child(div().flex().items_center().gap(px(10.)).child(div().w(px(80.)).text_color(t.dim).child("模型服务")).child(div().flex_1().child(seg("prov", &[("mock", "演示"), ("anthropic", "Anthropic"), ("openai", "OpenAI 兼容"), ("claude-code", "Claude Code")], &self.s.provider.clone(), cx, |this, v| this.s.provider = v.to_string()))))
                     .when(mock, |d| d.child(div().pl(px(90.)).text_size(px(12.)).text_color(t.faint).child("演示模式不联网，只回放固定回复，用来体验交互。")))
-                    .when(!mock, |d| d.child(field("API Key", &self.key)).child(field("模型", &self.model)).child(field("Base URL", &self.base))
+                    .when(cc, |d| d.child(field("启动命令", &self.acp))
+                        .child(div().pl(px(90.)).text_size(px(12.)).text_color(t.faint).child("用本机 Claude Code 当 Agent（ACP 协议），沿用它已有的登录，不需要在这里填 Key。留空使用默认命令；首次运行会下载适配器。")))
+                    .when(!mock && !cc, |d| d.child(field("API Key", &self.key)).child(field("模型", &self.model)).child(field("Base URL", &self.base))
                         .child(div().pl(px(90.)).text_size(px(12.)).text_color(t.faint).child("Key 只保存在本机配置文件里。")))
                     .child(div().flex().justify_end().gap(px(8.)).mt(px(6.))
                         .child(btn("set-cancel", "取消", false, cx).on_click(cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::Close))))

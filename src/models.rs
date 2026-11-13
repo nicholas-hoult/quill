@@ -41,7 +41,8 @@ pub fn label(id: &str) -> String {
 
 /// 选择器里的选项。mock 没有可选项；当前模型一定在列表里（不在预设 / 已用过里就置顶）。
 pub fn choices(provider: &str, current: &str, saved: &[String]) -> Vec<ModelChoice> {
-    if provider == "mock" { return vec![]; }
+    // 演示模式没有模型；Claude Code 后端的模型由它自己管（#7）
+    if provider == "mock" || provider == "claude-code" { return vec![]; }
     let mk = |id: &str, note: &str| ModelChoice { id: id.to_string(), label: label(id), note: note.to_string() };
     let current = current.trim();
     let mut out: Vec<ModelChoice> = vec![];
@@ -131,5 +132,10 @@ mod tests {
         assert_eq!(v.len(), MAX_SAVED);
         assert_eq!(v[0], "m19");
         assert!(!v.contains(&"a".to_string()));
+    }
+
+    #[test]
+    fn claude_code_后端没有可选模型() {
+        assert!(choices("claude-code", "claude-sonnet-5-5", &["x".to_string()]).is_empty());
     }
 }

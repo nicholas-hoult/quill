@@ -1,3 +1,5 @@
+mod acp;
+mod acp_client;
 mod actions;
 mod agent;
 mod analysis;

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
 pub struct Settings {
-    /// "mock" | "anthropic" | "openai"
+    /// "mock" | "anthropic" | "openai" | "claude-code"
     pub provider: String,
     pub api_key: String,
     pub base_url: String,
@@ -29,6 +29,9 @@ pub struct Settings {
     /// 用过的模型（最近的在前），模型选择器里列出（#4）
     #[serde(default)]
     pub models: Vec<String>,
+    /// Claude Code（ACP）后端的启动命令，留空用默认（#7）
+    #[serde(default)]
+    pub acp_cmd: String,
 }
 
 fn d_side() -> f32 { 264.0 }
@@ -38,7 +41,7 @@ fn d_true() -> bool { true }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { provider: "mock".into(), api_key: String::new(), base_url: String::new(), model: "claude-sonnet-5-5".into(), theme: "system".into(), side_w: d_side(), agent_w: d_agent(), term_h: d_term(), sidebar: true, agent_open: true, models: vec![] }
+        Self { provider: "mock".into(), api_key: String::new(), base_url: String::new(), model: "claude-sonnet-5-5".into(), theme: "system".into(), side_w: d_side(), agent_w: d_agent(), term_h: d_term(), sidebar: true, agent_open: true, models: vec![], acp_cmd: String::new() }
     }
 }
 

@@ -15,7 +15,7 @@ cargo build --release    # 发布构建（首次很慢）
 
 ## 结构
 
-* 纯逻辑（可单测，改动必须带测试）：`buffer`（rope + 撤销）、`diff`（逐块审阅）、`syntax`（tree-sitter 高亮）、`fuzzy`、`blocks`（围栏解析）、`context`（@ 引用 + 提示词）、`md`、`tree`、`git`（含暂存 / 提交）、`outline`（符号大纲）、`agent_proto`（工具调用协议 + 演示脚本）、`tools`（Agent 工具：read_file / list_dir / search，路径限制在项目内）、`ai`（Anthropic / OpenAI 兼容 / mock，阻塞式 SSE 放后台线程）
+* 纯逻辑（可单测，改动必须带测试）：`buffer`（rope + 撤销）、`diff`（逐块审阅）、`syntax`（tree-sitter 高亮）、`fuzzy`、`blocks`（围栏解析）、`context`（@ 引用 + 提示词）、`md`、`tree`、`git`（含暂存 / 提交）、`outline`（符号大纲）、`acp`（ACP 协议）、`agent_proto`（工具调用协议 + 演示脚本）、`tools`（Agent 工具：read_file / list_dir / search，路径限制在项目内）、`ai`（Anthropic / OpenAI 兼容 / mock，阻塞式 SSE 放后台线程）
 * 界面：`editor` + `editor_element`（自绘编辑器；同一套代码也当单行输入框和聊天输入框，见 `EditorMode`）、`workspace`（标题栏 / 侧栏 / 标签 / 状态栏 / 面板开合动画 / 拖拽分栏 / 浮层）、`agent`（对话面板）、`palette`、`settings_view`、`inline`（⌘K）、`terminal`（alacritty_terminal 内核）、`theme`（深浅两套）、`ui`（小组件）、`assets`（内嵌 SVG 图标）
 * AI 改动的落地：`Editor::apply_with_review` / `replace_range_streaming` 把新文本写进缓冲区并进入审阅，`refresh_review` 按 `diff::hunks` 生成显示行（含被删除行），`accept_hunk` / `reject_hunk` 逐块处理
 
@@ -50,6 +50,12 @@ cargo build --release    # 发布构建（首次很慢）
 无 Key 验证：在对话里发含 `[tool-demo]` 的消息，mock 会依次 列目录 → 读文件 → 提交编辑。
 终端 / 诊断工具（#3）：`run_command`（`tools::exec`，`sh -c`、cwd=项目根、stdout+stderr 合并、60s 超时、取消时杀整个进程组、输出头尾各留约 10KB）每次都要用户确认——`run_tools` 是状态机：遇到 run_command 记入 `awaiting` 并 return，确认卡片上 `⌘↵` 允许 / `Esc` 拒绝 / 「本会话始终允许」（只存内存），之后 `decide` → `spawn_command`（后台线程）→ `command_done` 回到 `run_tools` 继续。`diagnostics` 读 `Workspace::all_diags`（LSP 推送的最新诊断）。OpenAI 兼容接口没有工具调用，这些工具不可用。轮数上限 `MAX_ROUNDS`=12。
 验证：消息含 `[cmd-demo]`（命令成功）/ `[cmd-fail]`（命令失败）走「运行命令 → 查看诊断 → 总结」；`QUILL_DEBUG_SYSTEM=1` 发送时在 stderr 打印最终系统提示。脚本里 `key:cmd-enter` 等于点「允许运行」（脚本的 click 只走编辑器，点不到面板按钮）。
+
+## Claude Code 后端（#7，ACP）
+
+设置里「模型服务」选 Claude Code：Quill 当 ACP Client，起本机 Claude Code 适配器当 Agent（默认 `npx -y @agentclientprotocol/claude-agent-acp`，设置里可改；沿用本机 Claude Code 登录，不填 Key）。分三层：`acp.rs`（纯逻辑：JSON-RPC 编解码、`session/update` 解析、工具调用合并、权限选项、`fs/read_text_file` 切片、投影成面板卡片；有单测）→ `acp_client.rs`（子进程：用 `$SHELL -l -c exec <命令>` 起，保证 PATH；读 / 写 / stderr 三个线程；释放时杀整个进程组）→ `agent_acp.rs`（`agent.rs` 的子模块，`#[path]` 引入，能用面板私有字段：握手状态机、消息 / 工具卡片 / 计划 / 权限卡片）。
+要点：每个对话一个 ACP 会话，切换 / 新建 / 删除对话会关掉进程（二期用 `session/load` 恢复）；文字紧跟在工具调用后面时另起一条助手消息，保持先后顺序；`fs/write_text_file` 走 `emit_apply`（逐块审阅 + 检查点）并立即回成功；`terminal/*` 不声明，Agent 用自带 Bash；工具名统一 `acp:<kind>`，面板历史转 API 请求时会过滤掉；被用户停止的 prompt 记进 `ignored`，它迟到的 cancelled 响应不能当成新一轮的结束；进程异常退出会把 stderr 末尾显示在错误卡片里。
+验证：`QUILL_ACP="python3 private/probes/mock_acp.py"` 用模拟 Agent（消息含 `[acp-tool]` 走 读文件 → 计划 → 权限 → 写文件；`[acp-cancel]` 等取消；`[acp-die]` 崩溃）；测试用的 HOME 里要放 `settings.json`，`provider` 写 `claude-code`。注意 Rust 2024 里 `gen` 是保留字。
 
 ## 打包
 
