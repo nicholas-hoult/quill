@@ -23,6 +23,16 @@ pub fn new_session(id: u64, cwd: &str) -> String {
     json!({"jsonrpc":"2.0","id":id,"method":"session/new","params":{"cwd":cwd,"mcpServers":[]}}).to_string()
 }
 
+/// 恢复之前的会话（Agent 声明了 loadSession 才能用）。Agent 会把历史重放成 session/update，Client 要忽略它们
+pub fn load_session(id: u64, session_id: &str, cwd: &str) -> String {
+    json!({"jsonrpc":"2.0","id":id,"method":"session/load","params":{"sessionId":session_id,"cwd":cwd,"mcpServers":[]}}).to_string()
+}
+
+/// `initialize` 响应里的 agentCapabilities.loadSession
+pub fn supports_load(init_result: &Value) -> bool {
+    init_result["agentCapabilities"]["loadSession"].as_bool() == Some(true)
+}
+
 pub fn prompt(id: u64, session_id: &str, text: &str) -> String {
     json!({"jsonrpc":"2.0","id":id,"method":"session/prompt","params":{
         "sessionId":session_id,"prompt":[{"type":"text","text":text}]
@@ -453,6 +463,20 @@ mod tests {
         assert_eq!(m["params"]["prompt"][0]["type"], "text");
         assert_eq!(m["params"]["prompt"][0]["text"], "你好\n第二行");
         assert_eq!(v(&new_session(2, "/proj"))["params"]["cwd"], "/proj");
+    }
+
+    #[test]
+    fn 恢复会话请求与能力判断() {
+        let m = v(&load_session(5, "sess-1", "/proj"));
+        assert_eq!(m["method"], "session/load");
+        assert_eq!(m["params"]["sessionId"], "sess-1");
+        assert_eq!(m["params"]["cwd"], "/proj");
+        assert!(m["params"]["mcpServers"].is_array()); // 协议要求必须有
+        assert!(!v(&load_session(5, "s", "/p")).to_string().contains('\n'));
+        assert!(supports_load(&json!({"agentCapabilities": {"loadSession": true}})));
+        assert!(!supports_load(&json!({"agentCapabilities": {"loadSession": false}})));
+        assert!(!supports_load(&json!({"agentCapabilities": {}})));
+        assert!(!supports_load(&json!({})));
     }
 
     #[test]

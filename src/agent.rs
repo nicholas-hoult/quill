@@ -66,10 +66,13 @@ pub struct Message {
 pub struct Thread {
     pub title: String,
     pub messages: Vec<Message>,
+    /// Claude Code（ACP）后端的会话 ID：下次发消息时用 `session/load` 恢复，Agent 就记得之前的上下文（#7）
+    #[serde(default)]
+    pub acp_session: Option<String>,
 }
 
 impl Thread {
-    fn new() -> Self { Self { title: "新对话".into(), messages: vec![] } }
+    fn new() -> Self { Self { title: "新对话".into(), messages: vec![], acp_session: None } }
 }
 
 fn threads_path() -> Option<std::path::PathBuf> {

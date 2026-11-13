@@ -30,6 +30,9 @@ pub(super) struct AcpState {
     ignored: HashSet<u64>,
     /// 等会话就绪 / 上一轮结束后再发的 prompt
     pub(super) queued: Option<String>,
+    /// Agent 是否声明了 loadSession；以及正在恢复的会话 ID（恢复期间 Agent 重放的历史要忽略）
+    can_load: bool,
+    loading: Option<String>,
     /// 当前正在往里写内容的助手消息
     cur: Option<u64>,
     /// toolCallId → 合并后的完整工具调用
@@ -55,7 +58,7 @@ impl AgentPanel {
         self.acp_epoch += 1;
         let epoch = self.acp_epoch;
         handle.send(acp::initialize(1));
-        self.acp = Some(AcpState { handle, root, epoch, next_rpc: 3, init_id: 1, new_id: 0, session: None, prompt_id: None, ignored: HashSet::new(), queued: None, cur: None, tools: HashMap::new(), perms: Default::default() });
+        self.acp = Some(AcpState { handle, root, epoch, next_rpc: 3, init_id: 1, new_id: 0, session: None, can_load: false, loading: None, prompt_id: None, ignored: HashSet::new(), queued: None, cur: None, tools: HashMap::new(), perms: Default::default() });
         cx.spawn(async move |this, cx| {
             while let Ok(ev) = rx.recv().await {
                 if this.update(cx, |p, cx| p.on_acp(epoch, ev, cx)).is_err() { break; }
@@ -155,23 +158,49 @@ impl AgentPanel {
     }
 
     fn acp_response(&mut self, id: u64, result: Result<Value, String>, cx: &mut Context<Self>) {
+        let stored = self.threads[self.active].acp_session.clone();
         let Some(a) = self.acp.as_mut() else { return };
         if a.ignored.remove(&id) { if a.prompt_id == Some(id) { a.prompt_id = None; } self.acp_flush(); return; }
         if id == a.init_id {
             match result {
-                Ok(_) => {
+                Ok(v) => {
+                    a.can_load = acp::supports_load(&v);
                     let nid = a.next_rpc;
                     a.next_rpc += 1;
                     a.new_id = nid;
                     let cwd = a.root.to_string_lossy().to_string();
-                    a.handle.send(acp::new_session(nid, &cwd));
+                    // 这个对话以前有过会话：恢复它，Agent 就记得之前的上下文
+                    match stored.filter(|_| a.can_load) {
+                        Some(sid) => { a.handle.send(acp::load_session(nid, &sid, &cwd)); a.loading = Some(sid); }
+                        None => a.handle.send(acp::new_session(nid, &cwd)),
+                    }
                 }
                 Err(e) => self.acp_fail(format!("握手失败：{e}"), cx),
             }
         } else if id == a.new_id {
+            if let Some(sid) = a.loading.take() {
+                match result {
+                    Ok(_) => { a.session = Some(sid); self.acp_flush(); }
+                    Err(_) => {
+                        // 恢复失败（会话已被清理 / 换了项目）：退回新建会话，并忘掉旧的 ID
+                        let nid = a.next_rpc;
+                        a.next_rpc += 1;
+                        a.new_id = nid;
+                        let cwd = a.root.to_string_lossy().to_string();
+                        a.handle.send(acp::new_session(nid, &cwd));
+                        self.threads[self.active].acp_session = None;
+                    }
+                }
+                return;
+            }
             match result {
                 Ok(v) => match v["sessionId"].as_str() {
-                    Some(s) => { a.session = Some(s.to_string()); self.acp_flush(); }
+                    Some(s) => {
+                        a.session = Some(s.to_string());
+                        self.threads[self.active].acp_session = Some(s.to_string());
+                        self.save();
+                        self.acp_flush();
+                    }
                     None => self.acp_fail("Agent 没有返回会话 ID".into(), cx),
                 },
                 Err(e) => self.acp_fail(format!("创建会话失败：{e}"), cx),
@@ -186,6 +215,8 @@ impl AgentPanel {
     }
 
     fn acp_update(&mut self, u: Update, cx: &mut Context<Self>) {
+        // 恢复会话时 Agent 会把历史重放一遍：界面上已经有了，忽略
+        if self.acp.as_ref().map(|a| a.loading.is_some()).unwrap_or(false) { return; }
         match u {
             Update::Text(t) => {
                 let id = self.acp_target(true);
@@ -204,7 +235,14 @@ impl AgentPanel {
                 let (name, input, result) = acp::project_plan(&es);
                 self.acp_set_call("plan".into(), name, input, result);
             }
-            Update::Thought(_) | Update::Other => return,
+            Update::Thought(t) => {
+                // 思考内容：每条助手消息一块，折叠显示；连续的思考片段累加
+                let mid = self.acp_target(false);
+                let id = format!("thought:{mid}");
+                let prev = self.threads[self.active].messages.iter().flat_map(|m| m.calls.iter()).find(|c| c.id == id).and_then(|c| c.input["text"].as_str().map(str::to_string)).unwrap_or_default();
+                self.acp_set_call(id, "acp:thought".into(), json!({"text": format!("{prev}{t}")}), Some(String::new()));
+            }
+            Update::Other => return,
         }
         if self.stick { self.scroll.scroll_to_bottom(); }
         cx.notify();
@@ -333,6 +371,7 @@ impl AgentPanel {
         let t = cx.theme().clone();
         let kind = c.name.trim_start_matches("acp:").to_string();
         if kind == "plan" { return self.render_plan(c, &t); }
+        if kind == "thought" { return self.render_thought(msg_id, i, c, cx); }
         let title = c.input["title"].as_str().unwrap_or("").to_string();
         let title = if title.is_empty() { kind.clone() } else { title };
         let here = |p: &AcpPerm| p.msg_id == msg_id && p.call == i;
@@ -386,6 +425,24 @@ impl AgentPanel {
                     .child(btn(("acp-deny", uid), "拒绝  Esc", false, cx).h(px(26.)).px(px(12.)).on_click(cx.listener(|this, _, _, cx| this.decide(Decision::Deny, cx))))
                     .child(btn(("acp-allow", uid), "允许  ⌘↵", true, cx).h(px(26.)).px(px(12.)).on_click(cx.listener(|this, _, _, cx| this.decide(Decision::Once, cx)))),
             ))
+    }
+
+    /// 思考内容：默认折叠成一行，点开看全文
+    fn render_thought(&self, msg_id: u64, i: usize, c: &ToolCall, cx: &mut Context<Self>) -> Div {
+        let t = cx.theme().clone();
+        let text = c.input["text"].as_str().unwrap_or("").trim().to_string();
+        let key = (msg_id, 20_000 + i);
+        let open = self.expanded.contains(&key);
+        let first = text.lines().next().unwrap_or("").to_string();
+        div().flex().flex_col().gap(px(4.))
+            .child(
+                div().id(("thought", (msg_id * 100 + i as u64) as usize)).flex().items_center().gap(px(6.)).h(px(24.)).cursor_pointer().text_size(px(12.)).text_color(t.faint).hover(|s| s.text_color(t.dim))
+                    .on_click(cx.listener(move |this, _, _, cx| { if !this.expanded.remove(&key) { this.expanded.insert(key); } cx.notify(); }))
+                    .child(icon(if open { "chevron_down" } else { "chevron" }, 12., t.faint))
+                    .child("思考")
+                    .when(!open, |d| d.child(div().flex_1().min_w_0().truncate().child(first))),
+            )
+            .when(open, |d| d.child(div().pl(px(18.)).text_size(px(12.5)).line_height(px(19.)).text_color(t.dim).child(text)))
     }
 
     fn render_plan(&self, c: &ToolCall, t: &crate::theme::Theme) -> Div {
