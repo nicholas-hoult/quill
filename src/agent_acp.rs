@@ -73,6 +73,20 @@ impl AgentPanel {
         Ok(())
     }
 
+    /// 用户开始打字时提前起 Agent、握手、建会话（#8）。预热期间出任何错都不往对话里写：用户还没发消息，
+    /// 真正发送时会重新起一次，那时的错误才该让他看到。
+    pub(super) fn acp_prewarm(&mut self, cx: &mut Context<Self>) {
+        let empty = self.composer.read(cx).is_empty();
+        let root = self.workspace.update(cx, |w, _| w.root_path()).ok().flatten();
+        if !acp::should_prewarm(&self.settings.provider, self.acp.is_some(), root.is_some(), self.cancel.is_some(), empty) { return; }
+        if let Some(root) = root { let _ = self.acp_start(root, cx); }
+    }
+
+    /// 预热期间（没有在等回复）的失败：悄悄丢掉进程，下次发送会重来；在等回复时才走正常的报错
+    fn acp_fail_or_drop(&mut self, err: String, cx: &mut Context<Self>) {
+        if self.cancel.is_none() { self.acp = None; } else { self.acp_fail(err, cx); }
+    }
+
     /// 发送一条消息给 Claude Code。会话没起来就先起（异步握手），消息排队等就绪
     pub(super) fn acp_send(&mut self, prompt: String, cx: &mut Context<Self>) {
         let root = self.workspace.update(cx, |w, _| w.root_path()).ok().flatten();
@@ -190,7 +204,7 @@ impl AgentPanel {
                         None => a.handle.send(acp::new_session(nid, &cwd)),
                     }
                 }
-                Err(e) => self.acp_fail(format!("握手失败：{e}"), cx),
+                Err(e) => self.acp_fail_or_drop(format!("握手失败：{e}"), cx),
             }
         } else if id == a.new_id {
             if let Some(sid) = a.loading.take() {
@@ -216,9 +230,9 @@ impl AgentPanel {
                         self.save();
                         self.acp_flush();
                     }
-                    None => self.acp_fail("Agent 没有返回会话 ID".into(), cx),
+                    None => self.acp_fail_or_drop("Agent 没有返回会话 ID".into(), cx),
                 },
-                Err(e) => self.acp_fail(format!("创建会话失败：{e}"), cx),
+                Err(e) => self.acp_fail_or_drop(format!("创建会话失败：{e}"), cx),
             }
         } else if a.prompt_id == Some(id) {
             a.prompt_id = None;

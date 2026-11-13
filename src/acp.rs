@@ -331,6 +331,12 @@ impl<T> PermQueue<T> {
     pub fn contains(&self, f: impl Fn(&T) -> bool) -> bool { self.items.iter().any(|(_, t)| f(t)) }
 }
 
+/// 是否该提前把 Agent 拉起来（#8）：启动进程 + 握手 + 建会话要好几秒，等用户按下发送再起会让他干等。
+/// 以「输入框开始有字」作为发送意图——只点一下输入框、切换对话都不起进程（它们很频繁，每次起一个 node 太浪费）。
+pub fn should_prewarm(provider: &str, has_agent: bool, has_root: bool, busy: bool, composer_empty: bool) -> bool {
+    provider == "claude-code" && !has_agent && has_root && !busy && !composer_empty
+}
+
 /// 一次回合结束的原因，转成给用户看的话；正常结束返回 None
 pub fn stop_note(reason: &str) -> Option<&'static str> {
     match reason {
@@ -954,5 +960,24 @@ mod tests {
         // 单个词、没有参数：当成可执行文件
         let (_, argv) = shell_invocation("pwd", &[]);
         assert_eq!(argv, vec!["pwd"]);
+    }
+
+    // ---- 预热（#8）：Agent 启动 + 握手 + 建会话要好几秒，用户开始打字时就先拉起来，发送时已经就绪 ----
+
+    #[test]
+    fn 预热_只在有发送意图时触发() {
+        // 用 Claude Code、有项目、没有进程、不忙、输入框有字：预热
+        assert!(should_prewarm("claude-code", false, true, false, false));
+        // 输入框还是空的：没有发送意图（点一下输入框、切换对话都不该起进程）
+        assert!(!should_prewarm("claude-code", false, true, false, true));
+        // 已经有进程（预热过 / 正在用）：不重复起
+        assert!(!should_prewarm("claude-code", true, true, false, false));
+        // 没打开项目：Agent 没有工作目录可用
+        assert!(!should_prewarm("claude-code", false, false, false, false));
+        // 正在回复中：不碰
+        assert!(!should_prewarm("claude-code", false, true, true, false));
+        // 用 API Key 的后端：根本没有这个进程
+        assert!(!should_prewarm("anthropic", false, true, false, false));
+        assert!(!should_prewarm("", false, true, false, false));
     }
 }

@@ -145,7 +145,7 @@ impl AgentPanel {
         let composer = cx.new(|cx| Editor::new(EditorMode::composer("向 Quill 提问，或描述要做的修改…"), cx));
         let sub = cx.subscribe(&composer, |this, _, ev: &EditorEvent, cx| match ev {
             EditorEvent::Submit => this.send(cx),
-            EditorEvent::Changed => this.update_mention(cx),
+            EditorEvent::Changed => { this.update_mention(cx); this.acp_prewarm(cx); }
             EditorEvent::Cancel => { if this.restoring.is_some() { this.cancel_restore(cx); } else if this.model_menu { this.close_model_menu(cx); } else if this.awaiting.is_some() || this.acp_perm_pending() { this.decide(Decision::Deny, cx); } else if this.cancel.is_some() { this.stop(cx); } }
             _ => {}
         });
