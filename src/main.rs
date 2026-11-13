@@ -25,6 +25,7 @@ mod mentions;
 mod models;
 mod multicursor;
 mod outline;
+mod msglist;
 mod palette;
 mod rules;
 mod settings_view;

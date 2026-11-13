@@ -240,9 +240,21 @@ impl Workspace {
         this
     }
 
-    pub fn apply_theme(&mut self, window: &Window, cx: &mut Context<Self>) {
+    /// 告诉对话面板当前打开的文件。面板是缓存视图（见 `agent_view`），只在自己 notify 时才重新渲染，
+    /// 所以外部改它的状态必须同时 notify；值没变就不通知，免得白白重建整个对话
+    fn set_agent_file(&self, rel: Option<String>, cx: &mut Context<Self>) {
+        self.agent.update(cx, |a, cx| { if a.active_file != rel { a.active_file = rel; cx.notify(); } });
+    }
+
+    /// 对话面板的挂载元素：打字、光标移动这类与对话无关的刷新不再让它重新布局和绘制（长对话下每次按键省几十毫秒）
+    fn agent_view(&self) -> AnyView {
+        AnyView::from(self.agent.clone()).cached(StyleRefinement::default().size_full())
+    }
+
+    pub fn apply_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let dark = match self.settings.theme.as_str() { "dark" => true, "light" => false, _ => system_is_dark(window) };
         cx.set_global(if dark { Theme::dark() } else { Theme::light() });
+        window.refresh(); // 缓存视图（对话面板）要强制重绘才会换色
         cx.notify();
     }
 
@@ -710,7 +722,7 @@ impl Workspace {
         self.focus_right = right;
         let i = if right { self.right_tab } else { self.left_tab };
         self.active = Some(i);
-        if let Some(t) = self.tabs.get(i) { let rel = self.rel(&t.path); self.agent.update(cx, |a, _| a.active_file = Some(rel)); }
+        if let Some(t) = self.tabs.get(i) { let rel = self.rel(&t.path); self.set_agent_file(Some(rel), cx); }
         self.close_popups(cx);
         cx.notify();
     }
@@ -763,7 +775,7 @@ impl Workspace {
         if let Some(l) = line { ed.update(cx, |e, cx| e.scroll_to_line(l.saturating_sub(1), cx)); }
         window.focus(&ed.read(cx).focus);
         let rel = self.rel(abs);
-        self.agent.update(cx, |a, _| { a.active_file = Some(rel); });
+        self.set_agent_file(Some(rel), cx);
         cx.notify();
         if perf { crate::editor_element::AFTER_OPEN.store(4, std::sync::atomic::Ordering::Relaxed); stages.push(("其余", t_open.elapsed().as_micros())); eprintln!("[perf] 打开文件（同步部分）{:?}", stages); }
     }
@@ -895,9 +907,9 @@ impl Workspace {
         if let Some(ed) = self.active_editor() {
             window.focus(&ed.read(cx).focus);
             let rel = self.rel(&self.tabs[self.active.unwrap()].path);
-            self.agent.update(cx, |a, _| a.active_file = Some(rel));
+            self.set_agent_file(Some(rel), cx);
         } else {
-            self.agent.update(cx, |a, _| a.active_file = None);
+            self.set_agent_file(None, cx);
             window.focus(&self.focus);
         }
         cx.notify();
@@ -1084,7 +1096,7 @@ impl Workspace {
                 this.settings = s.clone();
                 let _ = s.save();
                 let s2 = s.clone();
-                this.agent.update(cx, |a, _| a.settings = s2);
+                this.agent.update(cx, |a, cx| { a.settings = s2; cx.notify(); });
                 this.apply_theme(window, cx);
                 this.toast("设置已保存", false, cx);
             }
@@ -1652,7 +1664,7 @@ impl Render for Workspace {
                     .child(center)
                     .when(self.agent_t > 0.99, |d| d.child(self.handle("h-agent", Resize::Agent, cx)))
                     .child(div().flex_none().w(px(self.agent_w * self.agent_t)).overflow_hidden().bg(t.panel).opacity(self.agent_t.min(1.0))
-                        .child(div().w(px(self.agent_w)).h_full().child(self.agent.clone()))),
+                        .child(div().w(px(self.agent_w)).h_full().child(self.agent_view()))),
             )
             .child(self.status_bar(cx))
             .children(self.context_menu(cx))

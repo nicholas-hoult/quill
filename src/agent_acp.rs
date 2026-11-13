@@ -160,7 +160,7 @@ impl AgentPanel {
             Event::Line(Incoming::Update(u)) => self.acp_update(u, cx),
             Event::Line(Incoming::Request { id, req }) => self.acp_request(id, req, cx),
             Event::Line(Incoming::Ignore) => {}
-            Event::TermOutput => { if self.stick { self.scroll.scroll_to_bottom(); } cx.notify(); }
+            Event::TermOutput => { if self.stick { self.scroll_end(); } cx.notify(); }
             Event::TermExit(id) => {
                 let Some(a) = self.acp.as_mut() else { return };
                 let exit = a.terms.exit(&id).flatten();
@@ -259,7 +259,7 @@ impl AgentPanel {
             }
             Update::Other => return,
         }
-        if self.stick { self.scroll.scroll_to_bottom(); }
+        if self.stick { self.scroll_end(); }
         cx.notify();
     }
 
@@ -320,7 +320,7 @@ impl AgentPanel {
                     // 同一个工具调用又来一个请求：旧的作废，要回「取消」，否则 Agent 会一直等它
                     let old = self.acp.as_mut().and_then(|a| a.perms.push(&tool_id, AcpPerm { rpc_id: id, tool_id: tool_id.clone(), options, msg_id, call }));
                     if let Some(old) = old { self.acp_reply(acp::respond(&old.rpc_id, acp::permission_result(None))); }
-                    if self.stick { self.scroll.scroll_to_bottom(); }
+                    if self.stick { self.scroll_end(); }
                 }
             }
             Request::ReadFile { path, line, limit } => {

@@ -92,7 +92,9 @@ pub struct AgentPanel {
     threads: Vec<Thread>,
     active: usize,
     cancel: Option<Arc<AtomicBool>>,
-    scroll: ScrollHandle,
+    /// 消息列表（虚拟化：只构建 / 排版可见的消息）。`msgs_key` 是上次同步给它的数据状态，见 msglist.rs
+    msgs: ListState,
+    msgs_key: Option<crate::msglist::Key>,
     stick: bool,
     pub files: Vec<String>,
     /// 项目符号索引（#6），后台线程按文件建；`@文件#符号` 的候选和源码行都来自它
@@ -150,7 +152,7 @@ impl AgentPanel {
         let threads = load_threads();
         let active = 0;
         let next_id = threads.iter().flat_map(|t| t.messages.iter().map(|m| m.id)).max().unwrap_or(0) + 1;
-        Self { workspace, composer, threads, active, cancel: None, scroll: ScrollHandle::new(), stick: true, files: vec![], symbols: vec![], sym_cache: Default::default(), active_file: None, dropped: vec![], extra: vec![], mention: None, menu: false, settings, next_id, rounds: 0, expanded: HashSet::new(), hl_cache: Default::default(), rules_file: None, rules_root: None, awaiting: None, running: None, always_allow: false, model_menu: false, model_sel: 0, restoring: None, restored: HashSet::new(), acp: None, acp_epoch: 0, _sub: sub }
+        Self { workspace, composer, threads, active, cancel: None, msgs: ListState::new(0, ListAlignment::Top, px(500.)), msgs_key: None, stick: true, files: vec![], symbols: vec![], sym_cache: Default::default(), active_file: None, dropped: vec![], extra: vec![], mention: None, menu: false, settings, next_id, rounds: 0, expanded: HashSet::new(), hl_cache: Default::default(), rules_file: None, rules_root: None, awaiting: None, running: None, always_allow: false, model_menu: false, model_sel: 0, restoring: None, restored: HashSet::new(), acp: None, acp_epoch: 0, _sub: sub }
     }
 
     /// 项目文件列表更新了：记下来，并在后台线程里（增量）重建符号索引
@@ -559,7 +561,7 @@ impl AgentPanel {
             AgentStreamEvent::Done(stop) => { m.status = Status::Done; self.cancel = None; run_tools = stop == "tool_use" && m.calls.iter().any(|c| c.result.is_none()); self.save(); }
             AgentStreamEvent::Error(e) => { m.status = Status::Error(e); self.cancel = None; self.save(); }
         }
-        if self.stick { self.scroll.scroll_to_bottom(); }
+        if self.stick { self.scroll_end(); }
         cx.notify();
         if run_tools { self.run_tools(id, cx); }
     }
@@ -598,7 +600,7 @@ impl AgentPanel {
                     else if root.is_none() { "错误：没有打开项目".to_string() }
                     else if tools::needs_permission(&name) && !self.always_allow {
                         self.awaiting = Some((msg_id, i));
-                        if self.stick { self.scroll.scroll_to_bottom(); }
+                        if self.stick { self.scroll_end(); }
                         cx.notify();
                         return;
                     } else { self.spawn_command(msg_id, i, cx); return; }
@@ -650,7 +652,7 @@ impl AgentPanel {
         cx.spawn(async move |this, cx| {
             if let Ok(r) = rx.recv().await { let _ = this.update(cx, |p, cx| p.command_done(msg_id, i, r, flag, cx)); }
         }).detach();
-        if self.stick { self.scroll.scroll_to_bottom(); }
+        if self.stick { self.scroll_end(); }
         cx.notify();
     }
 
@@ -692,6 +694,26 @@ impl AgentPanel {
         }
         self.save();
         cx.notify();
+    }
+
+    /// 把消息数据的变化告诉列表（只在变了才动它）；贴底状态下重置后回到底部
+    fn sync_msgs(&mut self, _window: &Window) {
+        use crate::msglist::{plan, Key, Sync};
+        let th = &self.threads[self.active];
+        let key = Key { thread: self.active, len: th.messages.len(), first: th.messages.first().map_or(0, |m| m.id), last: th.messages.last().map_or(0, |m| m.id) };
+        match plan(self.msgs_key, key) {
+            Sync::Keep => {}
+            Sync::Append(n) => { let at = self.msgs.item_count(); self.msgs.splice(at..at, n); }
+            Sync::Reset => self.msgs.reset(key.len),
+        }
+        self.msgs_key = Some(key);
+        // 贴底时每次渲染都回到底部：流式输出让最后一条变高、权限卡片展开等都不经过「消息数变化」，不能只靠事件触发
+        if self.stick { self.scroll_end(); }
+    }
+
+    /// 滚到最后一条消息的末尾（下一次布局时按最新量到的高度生效）
+    fn scroll_end(&self) {
+        self.msgs.scroll_to(ListOffset { item_ix: self.msgs.item_count(), offset_in_item: px(0.) });
     }
 
     fn render_text(&self, text: &str, cx: &App) -> Div {
@@ -950,10 +972,10 @@ impl Render for AgentPanel {
         self.sync_rules(cx);
         let t = cx.theme().clone();
         let streaming = self.cancel.is_some() || self.awaiting.is_some();
-        let thread = self.threads[self.active].clone();
+        let (title, msg_count) = { let th = &self.threads[self.active]; (th.title.clone(), th.messages.len()) };
+        self.sync_msgs(window);
         let atts = { let text = self.composer.read(cx).text(); self.attachments(&text) };
         let can_send = !self.composer.read(cx).is_empty() && !streaming;
-        let _ = window;
         div()
             .size_full()
             .flex()
@@ -973,15 +995,15 @@ impl Render for AgentPanel {
                     .child(
                         div().id("thread-btn").flex().items_center().gap(px(5.)).px(px(8.)).h(px(28.)).rounded(px(8.)).cursor_pointer().font_weight(FontWeight::SEMIBOLD).max_w(px(250.))
                             .hover(|s| s.bg(t.hover)).on_click(cx.listener(|this, _, _, cx| { this.menu = !this.menu; cx.notify(); }))
-                            .child(div().truncate().child(thread.title.clone())).child(icon("chevron_down", 13., t.faint)),
+                            .child(div().truncate().child(title)).child(icon("chevron_down", 13., t.faint)),
                     )
                     .child(div().flex_1())
                     .child(icon_button("new-thread", "plus", false, cx).on_click(cx.listener(|this, _, _, cx| this.new_thread(cx)))),
             )
             .child(
-                div().id("agent-msgs").flex_1().min_h_0().overflow_y_scroll().track_scroll(&self.scroll).px(px(16.)).pt(px(18.)).pb(px(8.))
+                div().id("agent-msgs").flex_1().min_h_0().px(px(16.)).pt(px(18.)).pb(px(8.))
                     .on_scroll_wheel(cx.listener(|this, _, _, _| { this.stick = false; }))
-                    .when(thread.messages.is_empty(), |d| d.child(
+                    .when(msg_count == 0, |d| d.child(
                         div().pt(px(30.)).flex().flex_col().gap(px(8.))
                             .child(div().text_size(px(20.)).font_weight(FontWeight::BOLD).child("想改点什么？"))
                             .child(div().text_color(t.dim).mb(px(10.)).child("直接描述需求。用 @ 引用文件，回复里的代码块可以一键应用，并逐块审阅。"))
@@ -992,7 +1014,15 @@ impl Render for AgentPanel {
                                     .child(*s)
                             }))
                     ))
-                    .children(thread.messages.iter().enumerate().map(|(mi, m)| { let cont = mi > 0 && thread.messages[mi - 1].role == Role::Assistant && m.role == Role::Assistant; self.render_message(m, cont, cx) })),
+                    .when(msg_count > 0, |d| d.child(
+                        list(self.msgs.clone(), cx.processor(|this, ix: usize, _window, cx| {
+                            let th = &this.threads[this.active];
+                            let Some(m) = th.messages.get(ix) else { return div().into_any_element() };
+                            let cont = ix > 0 && th.messages[ix - 1].role == Role::Assistant && m.role == Role::Assistant;
+                            // 外面包一层：列表量高度时算的是这个包装元素，消息自己的上下外边距（含「连续消息」的负边距）才会被算进去
+                            div().w_full().child(this.render_message(m, cont, cx)).into_any_element()
+                        })).size_full()
+                    )),
             )
             .child(
                 div().flex_none().mx(px(12.)).mb(px(12.)).mt(px(6.)).relative().rounded(px(14.)).bg(t.elev).border_1().border_color(t.border_strong)

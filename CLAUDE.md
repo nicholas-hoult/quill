@@ -15,7 +15,7 @@ cargo build --release    # 发布构建（首次很慢）
 
 ## 结构
 
-* 纯逻辑（可单测，改动必须带测试）：`buffer`（rope + 撤销）、`diff`（逐块审阅）、`syntax`（tree-sitter 高亮）、`fuzzy`、`blocks`（围栏解析）、`context`（@ 引用 + 提示词）、`md`、`tree`、`git`（含暂存 / 提交）、`outline`（符号大纲）、`acp`（ACP 协议）、`mentions`（@ 引用）、`symindex`、`web`、`agent_proto`（工具调用协议 + 演示脚本）、`tools`（Agent 工具：read_file / list_dir / search，路径限制在项目内）、`ai`（Anthropic / OpenAI 兼容 / mock，阻塞式 SSE 放后台线程）
+* 纯逻辑（可单测，改动必须带测试）：`buffer`（rope + 撤销）、`diff`（逐块审阅）、`syntax`（tree-sitter 高亮）、`fuzzy`、`blocks`（围栏解析）、`context`（@ 引用 + 提示词）、`md`、`tree`、`git`（含暂存 / 提交）、`outline`（符号大纲）、`acp`（ACP 协议）、`msglist`（对话列表虚拟化的同步策略）、`mentions`（@ 引用）、`symindex`、`web`、`agent_proto`（工具调用协议 + 演示脚本）、`tools`（Agent 工具：read_file / list_dir / search，路径限制在项目内）、`ai`（Anthropic / OpenAI 兼容 / mock，阻塞式 SSE 放后台线程）
 * 界面：`editor` + `editor_element`（自绘编辑器；同一套代码也当单行输入框和聊天输入框，见 `EditorMode`）、`workspace`（标题栏 / 侧栏 / 标签 / 状态栏 / 面板开合动画 / 拖拽分栏 / 浮层）、`agent`（对话面板）、`palette`、`settings_view`、`inline`（⌘K）、`terminal`（alacritty_terminal 内核）、`theme`（深浅两套）、`ui`（小组件）、`assets`（内嵌 SVG 图标）
 * AI 改动的落地：`Editor::apply_with_review` / `replace_range_streaming` 把新文本写进缓冲区并进入审阅，`refresh_review` 按 `diff::hunks` 生成显示行（含被删除行），`accept_hunk` / `reject_hunk` 逐块处理
 
@@ -31,6 +31,13 @@ cargo build --release    # 发布构建（首次很慢）
 打开文件速度：`Workspace::open_file` 同步部分（读文件 + rope + 创建编辑器）约 0.3–1.5ms；首帧 prepaint（CoreText 排版）约 2–3ms、paint 约 3–6ms。字形首次栅格化是大头，所以启动时 `warm_element` 用近透明文字预热图集——要点：字形缓存按 **X、Y 各 4 档亚像素位置** 分版本，预热行高必须固定为编辑器的 21px（默认行高会让 Y 档位对不上，预热白做）；不能裁剪。再补 Y 的 4 档没有额外收益，已撤掉。`QUILL_PERF=1` 的打开帧同时打印墙钟和线程 CPU 时间（机器被别的进程占满时看 CPU 时间）。
 实测首次打开（release，新进程）：安静时约 6.5ms，机器忙（负载 5–10）时 8–15ms 抖动；冷启动（窗口 + GPU 初始化）不在此列。
 实测（release，8000 行 Rust）：翻页最慢帧 ~11ms（主要是 CoreText 排版 45 行新文字），连续打字无慢帧；打开文件后常驻内存约 118MB。
+
+**对话面板的渲染（#8）**：面板是缓存视图（`Workspace::agent_view` 用 `AnyView::cached`，自己没 `notify` 就复用上一帧的布局和绘制），消息列表用 GPUI `list` 虚拟化（`AgentPanel.msgs: ListState`，只构建 / 排版可见消息）。约束：
+* **在 `AgentPanel` 外面改它的状态必须同时 `cx.notify()`**（用 `Workspace::set_agent_file` 这类 helper，值没变就别通知）；`agent.update(cx, |a, _| a.x = ..)` 不通知，界面就不更新
+* 换主题必须 `window.refresh()`（缓存视图读的是全局主题，全局变化不会让它变脏）
+* 消息数据变了要经 `msglist::plan` 告诉 `ListState`（追加用 `splice`，换对话 / 删除用 `reset`），否则高度错位；贴底状态（`stick`）下每次渲染都 `scroll_end`
+* 输入框是面板的子视图，它闪烁 / 打字会让面板变脏（脏标记沿祖先链上传），所以面板 `render` 本身必须便宜——不要在里面克隆整个对话或为全部消息建元素
+* 度量脚本：`private/probes/gen_long_thread.py <临时HOME>` 造 120 条消息的对话，再用 `/usr/bin/time -l` 比打字时的进程 CPU（空对话 vs 长对话）。实测打字 200–400 字符：长对话输入框 10.2s→1.4s（空对话 1.0s），编辑器 16–32s→2.8s，内存 194MB→96MB
 
 ## 模型切换（#4）
 
