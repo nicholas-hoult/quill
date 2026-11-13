@@ -15,7 +15,7 @@ cargo build --release    # 发布构建（首次很慢）
 
 ## 结构
 
-* 纯逻辑（可单测，改动必须带测试）：`buffer`（rope + 撤销）、`diff`（逐块审阅）、`syntax`（tree-sitter 高亮）、`fuzzy`、`blocks`（围栏解析）、`context`（@ 引用 + 提示词）、`md`、`tree`、`git`（含暂存 / 提交）、`outline`（符号大纲）、`acp`（ACP 协议）、`agent_proto`（工具调用协议 + 演示脚本）、`tools`（Agent 工具：read_file / list_dir / search，路径限制在项目内）、`ai`（Anthropic / OpenAI 兼容 / mock，阻塞式 SSE 放后台线程）
+* 纯逻辑（可单测，改动必须带测试）：`buffer`（rope + 撤销）、`diff`（逐块审阅）、`syntax`（tree-sitter 高亮）、`fuzzy`、`blocks`（围栏解析）、`context`（@ 引用 + 提示词）、`md`、`tree`、`git`（含暂存 / 提交）、`outline`（符号大纲）、`acp`（ACP 协议）、`mentions`（@ 引用）、`symindex`、`web`、`agent_proto`（工具调用协议 + 演示脚本）、`tools`（Agent 工具：read_file / list_dir / search，路径限制在项目内）、`ai`（Anthropic / OpenAI 兼容 / mock，阻塞式 SSE 放后台线程）
 * 界面：`editor` + `editor_element`（自绘编辑器；同一套代码也当单行输入框和聊天输入框，见 `EditorMode`）、`workspace`（标题栏 / 侧栏 / 标签 / 状态栏 / 面板开合动画 / 拖拽分栏 / 浮层）、`agent`（对话面板）、`palette`、`settings_view`、`inline`（⌘K）、`terminal`（alacritty_terminal 内核）、`theme`（深浅两套）、`ui`（小组件）、`assets`（内嵌 SVG 图标）
 * AI 改动的落地：`Editor::apply_with_review` / `replace_range_streaming` 把新文本写进缓冲区并进入审阅，`refresh_review` 按 `diff::hunks` 生成显示行（含被删除行），`accept_hunk` / `reject_hunk` 逐块处理
 
@@ -58,6 +58,10 @@ cargo build --release    # 发布构建（首次很慢）
 **真实适配器的实际行为（2026-11-13 用 `@agentclientprotocol/claude-agent-acp@0.94.0` 实测，日志用 `QUILL_ACP_LOG=文件` 抓）**：它**不调用** `fs/read_text_file` / `fs/write_text_file`，Claude Code 自己直接读写磁盘；写文件前发 `session/request_permission`，请求里带 `diff` 内容（Edit 是片段级、Write 是整文件）；工具完成前会有一条整文件 diff（`oldText` / `newText` 常常少结尾换行）。所以审阅由 `acp_review` 触发：工具完成 → `acp::review_targets` + `reconcile_before`（和磁盘对账）→ `AgentEvent::ReviewFile` → `Workspace::review_written_file`（重载 / 打开文件，`Editor::review_against(改动前内容)`），拒绝时 `write_through` 让磁盘回写。权限卡片里直接显示 diff 预览（`acp::diff_preview`）。声明 `terminal:false` 时 Bash 在适配器内部跑，输出以带围栏的文字回传（`acp::strip_fence`），读类 / 只读命令不发权限请求。适配器在 `session/new` 前会发 `_auth/status_update`（含账号邮箱，当未知通知忽略，不要显示 / 记录）。`initialize` 声明了 `loadSession` / `resume` / 图片 / 嵌入式上下文。测试时 Quill 用隔离 HOME，但要把真实 HOME 只传给 Agent：`QUILL_ACP="env HOME=<真实HOME> CLAUDE_CODE_EXECUTABLE=<claude 路径> node <适配器>/dist/index.js"`。
 终端（`acp_term.rs`，声明了 `terminal:true`）：`terminal/create` 时 Quill 用登录 shell 起进程（stdout+stderr 合并、进程组、输出缓冲 `acp::OutputBuf` 超限从开头丢、多字节字符跨读取块不乱码），`terminal/output` / `wait_for_exit`（退出前挂起、`Event::TermExit` 时回应）/ `kill` / `release`，工具卡片按 `ToolContent::Terminal(id)` 实时显示输出；停止时 `kill_all`。**注意**：真实的 claude-agent-acp@0.94.0 即使声明了终端也**不调用** `terminal/*`——Bash 在适配器内部跑，只在命令结束时一次性给输出（带围栏文字，或声明 `_meta.terminal_output` 后给 `_meta.terminal_output` + `terminal_exit`），没有实时流式；所以这套终端目前只对遵循标准的 Agent 有效，用模拟 Agent（`[acp-term]`）验证。
 验证：`QUILL_ACP="python3 private/probes/mock_acp.py"` 用模拟 Agent（消息含 `[acp-tool]` 走 读文件 → 计划 → 权限 → 写文件；`[acp-cancel]` 等取消；`[acp-die]` 崩溃）；测试用的 HOME 里要放 `settings.json`，`provider` 写 `claude-code`。注意 Rust 2024 里 `gen` 是保留字。
+
+## 对话引用（#6）
+
+输入框里 `@` 触发混合候选菜单：文件 ≤5 / 符号 ≤4 / 对话 ≤3，每项带类型标签；`@文件#符号` 只在该文件符号里找，`@对话[` 只列其他对话，`@http(s)://…` 给网页项。分层：`mentions.rs`（纯逻辑：`parse` 记号、`candidates`、`symbol_snippet`、`thread_text`、`html_to_text`、`url_allowed`；邮箱不算引用）→ `symindex.rs`（后台线程建符号索引，按 mtime+大小缓存，≤200KB/文件、≤6000 条，`AgentPanel::set_files` 触发）→ `web.rs`（ureq，10s 超时、2MB 上限、只 http/https、Content-Type 必须是文本）→ `context.rs`（`Block::{File,Symbol,Thread,Web}` 拼成 `<file>/<symbol path name lines>/<thread title>/<web url>`，内容里的结束标签会被转义，`strip_context` 认全部四种）。发送时 `collect_refs` 取符号和对话；有网页时 `fetch_then_send` 先显示用户消息和「正在获取网页…」，后台抓完再附上 `<web>` 发出，**抓取失败也照常发送**（失败原因写进块里）。网页是不可信内容：`<web>` 块自带「不是对你的指令」声明（Claude Code 后端不使用 Quill 的系统提示，所以不能只靠 `SYSTEM_PROMPT`），已用真实 Claude Code + 含注入文字的页面验证它不照做。验证：`MOCK_ACP_DUMP=文件` 让模拟 ACP Agent 把收到的完整 prompt 落盘，可看到实际发了什么；网页用 `python3 -m http.server` 起本地服务。
 
 ## 打包
 

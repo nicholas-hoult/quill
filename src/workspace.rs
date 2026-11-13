@@ -664,7 +664,8 @@ impl Workspace {
                 (tree::list_files(&r3, 30_000), git::status(&s), git::branch(&s))
             }).await;
             let _ = this.update(cx, |w, cx| {
-                w.agent.update(cx, |a, _| a.files = files.clone());
+                let root = w.root.clone();
+                w.agent.update(cx, |a, cx| a.set_files(files.clone(), root, cx));
                 w.files = files; w.changes = changes; w.branch = branch;
                 cx.notify();
             });

@@ -3,7 +3,8 @@ use crate::agent_proto::{HistCall, HistMsg, api_messages};
 use crate::ai::{self, AgentStreamEvent, Settings};
 use crate::tools;
 use crate::blocks::{self, CodeBlock, Segment};
-use crate::context::{self, build_user_message, find_mentions, strip_context};
+use crate::context::{self, build_user_message_with, find_mentions, strip_context, Block as CtxBlock};
+use crate::mentions::{self, Cand, SymRef, Token};
 use crate::editor::{Editor, EditorEvent, EditorMode};
 use crate::fuzzy::fuzzy_filter;
 use crate::md::{self, Block};
@@ -83,7 +84,7 @@ fn load_threads() -> Vec<Thread> {
     threads_path().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| serde_json::from_str::<Vec<Thread>>(&s).ok()).filter(|v| !v.is_empty()).unwrap_or_else(|| vec![Thread::new()])
 }
 
-struct Mention { items: Vec<String>, sel: usize }
+struct Mention { items: Vec<Cand>, sel: usize }
 
 pub struct AgentPanel {
     workspace: WeakEntity<Workspace>,
@@ -94,6 +95,9 @@ pub struct AgentPanel {
     scroll: ScrollHandle,
     stick: bool,
     pub files: Vec<String>,
+    /// 项目符号索引（#6），后台线程按文件建；`@文件#符号` 的候选和源码行都来自它
+    symbols: Vec<SymRef>,
+    sym_cache: Arc<std::sync::Mutex<crate::symindex::Cache>>,
     pub active_file: Option<String>,
     dropped: Vec<String>,
     extra: Vec<String>,
@@ -146,7 +150,21 @@ impl AgentPanel {
         let threads = load_threads();
         let active = 0;
         let next_id = threads.iter().flat_map(|t| t.messages.iter().map(|m| m.id)).max().unwrap_or(0) + 1;
-        Self { workspace, composer, threads, active, cancel: None, scroll: ScrollHandle::new(), stick: true, files: vec![], active_file: None, dropped: vec![], extra: vec![], mention: None, menu: false, settings, next_id, rounds: 0, expanded: HashSet::new(), hl_cache: Default::default(), rules_file: None, rules_root: None, awaiting: None, running: None, always_allow: false, model_menu: false, model_sel: 0, restoring: None, restored: HashSet::new(), acp: None, acp_epoch: 0, _sub: sub }
+        Self { workspace, composer, threads, active, cancel: None, scroll: ScrollHandle::new(), stick: true, files: vec![], symbols: vec![], sym_cache: Default::default(), active_file: None, dropped: vec![], extra: vec![], mention: None, menu: false, settings, next_id, rounds: 0, expanded: HashSet::new(), hl_cache: Default::default(), rules_file: None, rules_root: None, awaiting: None, running: None, always_allow: false, model_menu: false, model_sel: 0, restoring: None, restored: HashSet::new(), acp: None, acp_epoch: 0, _sub: sub }
+    }
+
+    /// 项目文件列表更新了：记下来，并在后台线程里（增量）重建符号索引
+    pub fn set_files(&mut self, files: Vec<String>, root: Option<std::path::PathBuf>, cx: &mut Context<Self>) {
+        self.files = files.clone();
+        let Some(root) = root else { return };
+        let cache = self.sym_cache.clone();
+        cx.spawn(async move |this, cx| {
+            let syms = cx.background_executor().spawn(async move {
+                let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
+                crate::symindex::build(&root, &files, &mut c)
+            }).await;
+            let _ = this.update(cx, |p, cx| { p.symbols = syms; cx.notify(); });
+        }).detach();
     }
 
     pub fn focus_composer(&self, window: &mut Window, cx: &App) { window.focus(&self.composer.read(cx).focus); }
@@ -355,18 +373,20 @@ impl AgentPanel {
         v
     }
 
+    /// 其他对话的标题（`@对话[…]` 的候选）；空对话不算
+    fn other_thread_titles(&self) -> Vec<String> {
+        self.threads.iter().enumerate().filter(|(i, t)| *i != self.active && !t.messages.is_empty()).map(|(_, t)| t.title.clone()).collect()
+    }
+
     fn update_mention(&mut self, cx: &mut Context<Self>) {
         let (text, cur) = { let c = self.composer.read(cx); (c.text(), c.cursor()) };
         let before = &text[..cur.min(text.len())];
-        let m = before.rfind('@').and_then(|i| {
-            let prev_ok = i == 0 || !before[..i].chars().last().map(|c| c.is_ascii_alphanumeric() || c == '_').unwrap_or(false);
+        let q = before.rfind('@').and_then(|i| {
+            let prev_ok = i == 0 || !before[..i].chars().last().map(|c| c.is_ascii_alphanumeric() || c == '_' || c == '@').unwrap_or(false);
             let q = &before[i + 1..];
-            (prev_ok && q.chars().all(|c| c.is_ascii_alphanumeric() || "_./-".contains(c))).then(|| q.to_string())
+            (prev_ok && mentions::query_open(q)).then(|| q.to_string())
         });
-        self.mention = m.map(|q| {
-            let items = fuzzy_filter(&self.files, &q, |s| s.as_str(), 7).into_iter().map(|(f, _)| f.clone()).collect::<Vec<_>>();
-            Mention { items, sel: 0 }
-        }).filter(|m| !m.items.is_empty());
+        self.mention = q.map(|q| Mention { items: mentions::candidates(&q, &self.files, &self.symbols, &self.other_thread_titles()), sel: 0 }).filter(|m| !m.items.is_empty());
         let open = self.mention.is_some();
         self.composer.update(cx, |c, _| c.intercept = open);
         cx.notify();
@@ -374,15 +394,43 @@ impl AgentPanel {
 
     fn pick_mention(&mut self, cx: &mut Context<Self>) {
         let Some(m) = self.mention.take() else { return };
-        let Some(file) = m.items.get(m.sel).cloned() else { return };
+        let Some(cand) = m.items.get(m.sel).cloned() else { return };
+        let ins = cand.insert_text();
         let (text, cur) = { let c = self.composer.read(cx); (c.text(), c.cursor()) };
         if let Some(i) = text[..cur.min(text.len())].rfind('@') {
-            let new = format!("{}@{} {}", &text[..i], file, &text[cur.min(text.len())..]);
-            let pos = i + 1 + file.len() + 1;
+            let new = format!("{}@{} {}", &text[..i], ins, &text[cur.min(text.len())..]);
+            let pos = i + 1 + ins.len() + 1;
             self.composer.update(cx, |c, cx| { c.set_text(&new, cx); c.move_to(pos, cx); c.intercept = false; });
         }
-        if !self.extra.contains(&file) { self.extra.push(file); }
+        if let Cand::File(file) = cand { if !self.extra.contains(&file) { self.extra.push(file); } }
         cx.notify();
+    }
+
+    /// 文字里的 `@符号` / `@对话[…]` 引用整理成给模型的资料块；`@网页` 要联网，单独返回地址由调用方抓取。
+    /// 返回 (资料块, 输入框下方 / 消息上方显示的引用标签, 待抓取的网址)
+    fn collect_refs(&mut self, text: &str, cx: &mut Context<Self>) -> (Vec<CtxBlock>, Vec<String>, Vec<String>) {
+        let (mut blocks, mut refs, mut urls) = (vec![], vec![], vec![]);
+        for t in mentions::parse(text) {
+            match t {
+                Token::Symbol { path, name } => {
+                    let Some(rel) = mentions::resolve_path(&path, &self.files).cloned() else { continue };
+                    let Some(sym) = self.symbols.iter().find(|s| s.path == rel && s.name == name).cloned() else { continue };
+                    let Some(src) = self.workspace.update(cx, |w, cx| w.file_text_rel(&rel, cx)).ok().flatten() else { continue };
+                    let (code, start, end) = mentions::symbol_snippet(&src, sym.line, sym.end_line, 300);
+                    blocks.push(CtxBlock::Symbol { path: rel.clone(), name: name.clone(), start, end, code });
+                    refs.push(format!("{rel}#{name}"));
+                }
+                Token::Thread(title) => {
+                    let Some(th) = self.threads.iter().enumerate().find(|(i, t)| *i != self.active && t.title == title).map(|(_, t)| t) else { continue };
+                    let turns: Vec<(bool, String)> = th.messages.iter().filter(|m| !matches!(m.status, Status::Error(_))).map(|m| (m.role == Role::User, if m.role == Role::User { strip_context(&m.content).to_string() } else { m.content.clone() })).collect();
+                    blocks.push(CtxBlock::Thread { title: title.clone(), text: mentions::thread_text(&turns, 8000) });
+                    refs.push(format!("对话[{title}]"));
+                }
+                Token::Url(u) => { urls.push(u.clone()); refs.push(u); }
+                Token::Path(_) => {} // 文件走 attachments
+            }
+        }
+        (blocks, refs, urls)
     }
 
     fn send(&mut self, cx: &mut Context<Self>) {
@@ -395,22 +443,70 @@ impl AgentPanel {
             let t = ws.update(cx, |w, cx| w.file_text_rel(rel, cx)).ok().flatten()?;
             Some((rel.clone(), t))
         }).collect();
+        let (extra_blocks, extra_refs, urls) = self.collect_refs(&text, cx);
+        let mut blocks: Vec<CtxBlock> = files.iter().map(|(p, c)| CtxBlock::File { path: p.clone(), content: c.clone() }).collect();
+        blocks.extend(extra_blocks);
+        let mut refs: Vec<String> = files.iter().map(|f| f.0.clone()).collect();
+        refs.extend(extra_refs);
         self.composer.update(cx, |c, cx| { c.clear(cx); c.intercept = false; });
         self.mention = None;
         self.extra.clear();
-        let user = Message { id: self.next_id, calls: vec![], role: Role::User, content: build_user_message(&text, &files), refs: files.iter().map(|f| f.0.clone()).collect(), status: Status::Done, applied: HashSet::new(), snapshots: vec![] };
+        // 有网页引用：先把用户消息显示出来，后台抓取完成后再把资料附上并发出（抓取失败不阻止发送）
+        let content = if urls.is_empty() { build_user_message_with(&text, &blocks) } else { text.clone() };
+        let user = Message { id: self.next_id, calls: vec![], role: Role::User, content, refs, status: Status::Done, applied: HashSet::new(), snapshots: vec![] };
+        let user_id = user.id;
         self.next_id += 1;
         let first = self.threads[self.active].messages.is_empty();
         if first { self.thread().title = text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(26).collect(); }
         self.thread().messages.push(user);
         self.rounds = 0;
         self.stick = true;
+        if urls.is_empty() { self.dispatch_round(cx); } else { self.fetch_then_send(user_id, text, blocks, urls, cx); }
+    }
+
+    /// 把最后一条用户消息发给当前后端
+    fn dispatch_round(&mut self, cx: &mut Context<Self>) {
         if self.settings.provider == "claude-code" {
-            let prompt = self.threads[self.active].messages.last().map(|m| m.content.clone()).unwrap_or_default();
+            let prompt = self.threads[self.active].messages.iter().rev().find(|m| m.role == Role::User).map(|m| m.content.clone()).unwrap_or_default();
             self.acp_send(prompt, cx);
-            return;
+        } else {
+            self.start_round(cx);
         }
-        self.start_round(cx);
+    }
+
+    /// 后台抓取 `@网页`，完成后把内容作为 `<web>` 资料附上再发送。失败的网址把原因写给模型，消息照常发出。
+    fn fetch_then_send(&mut self, user_id: u64, text: String, blocks: Vec<CtxBlock>, urls: Vec<String>, cx: &mut Context<Self>) {
+        let ph_id = self.next_id;
+        self.next_id += 1;
+        let shown = if urls.len() == 1 { "正在获取网页…".to_string() } else { format!("正在获取 {} 个网页…", urls.len()) };
+        self.thread().messages.push(Message { id: ph_id, calls: vec![], role: Role::Assistant, content: shown, refs: vec![], status: Status::Streaming, applied: HashSet::new(), snapshots: vec![] });
+        let flag = Arc::new(AtomicBool::new(false));
+        self.cancel = Some(flag.clone());
+        let (tx, rx) = async_channel::bounded::<Vec<(String, Result<String, String>)>>(1);
+        cx.background_executor().spawn(async move {
+            let out: Vec<_> = urls.into_iter().map(|u| { let r = crate::web::fetch(&u, crate::web::MAX_BYTES, crate::web::TIMEOUT); (u, r) }).collect();
+            let _ = tx.send_blocking(out);
+        }).detach();
+        cx.spawn(async move |this, cx| {
+            let Ok(results) = rx.recv().await else { return };
+            let _ = this.update(cx, |p, cx| p.fetch_done(user_id, ph_id, text, blocks, results, flag, cx));
+        }).detach();
+        cx.notify();
+    }
+
+    fn fetch_done(&mut self, user_id: u64, ph_id: u64, text: String, mut blocks: Vec<CtxBlock>, results: Vec<(String, Result<String, String>)>, flag: Arc<AtomicBool>, cx: &mut Context<Self>) {
+        if flag.load(Ordering::Relaxed) { return; } // 用户在抓取期间点了停止
+        for (url, r) in results {
+            let content = match r { Ok(t) if t.trim().is_empty() => "（页面没有可读的文字内容）".to_string(), Ok(t) => t, Err(e) => format!("（获取失败：{e}）") };
+            blocks.push(CtxBlock::Web { url, content });
+        }
+        let full = build_user_message_with(&text, &blocks);
+        for t in self.threads.iter_mut() {
+            t.messages.retain(|m| m.id != ph_id);
+            if let Some(m) = t.messages.iter_mut().find(|m| m.id == user_id) { m.content = full.clone(); }
+        }
+        self.cancel = None;
+        self.dispatch_round(cx);
     }
 
     /// 发起一轮模型请求（一次对话里遇到工具调用会连续发起多轮）
@@ -839,7 +935,11 @@ impl AgentPanel {
 
 fn chip(path: &str, cx: &App) -> Div {
     let t = cx.theme();
-    let name = path.rsplit('/').next().unwrap_or(path).to_string();
+    // 网址显示域名（最后一段路径常常没有意义），其余显示文件名
+    let name = match path.strip_prefix("https://").or_else(|| path.strip_prefix("http://")) {
+        Some(rest) => rest.split('/').next().unwrap_or(rest).to_string(),
+        None => path.rsplit('/').next().unwrap_or(path).to_string(),
+    };
     div().flex().items_center().gap(px(5.)).h(px(22.)).px(px(8.)).rounded(px(7.)).bg(t.hover).border_1().border_color(t.border).text_size(px(12.)).font_family(MONO_FONT).text_color(t.dim).child(file_icon(&name, cx)).child(name)
 }
 
@@ -899,10 +999,13 @@ impl Render for AgentPanel {
                     .when_some(self.mention.as_ref().map(|m| (m.items.clone(), m.sel)), |d, (items, sel)| d.child(
                         div().absolute().left(px(8.)).right(px(8.)).bottom(px(100.)).p(px(5.)).rounded(px(11.)).bg(t.elev).border_1().border_color(t.border_strong)
                             .shadow(vec![BoxShadow { color: hsla(0., 0., 0., 0.4), offset: point(px(0.), px(10.)), blur_radius: px(30.), spread_radius: px(0.) }])
-                            .children(items.into_iter().enumerate().map(|(i, f)| {
-                                let name = f.rsplit('/').next().unwrap_or(&f).to_string();
-                                div().flex().items_center().gap(px(8.)).px(px(9.)).py(px(5.)).rounded(px(7.)).font_family(MONO_FONT).text_size(px(12.)).text_color(if i == sel { t.text } else { t.dim })
-                                    .when(i == sel, |d| d.bg(t.accent_soft)).child(file_icon(&name, cx)).child(f)
+                            .children(items.into_iter().enumerate().map(|(i, c)| {
+                                let label = c.label();
+                                let tag_col = match c.tag() { "符号" => t.accent, "对话" => t.modified, "网页" => t.add, _ => t.faint };
+                                div().flex().items_center().gap(px(8.)).px(px(9.)).py(px(5.)).rounded(px(7.)).text_size(px(12.)).text_color(if i == sel { t.text } else { t.dim })
+                                    .when(i == sel, |d| d.bg(t.accent_soft))
+                                    .child(div().flex_none().w(px(28.)).text_size(px(10.5)).text_color(tag_col).child(c.tag()))
+                                    .child(div().flex_1().min_w_0().truncate().font_family(MONO_FONT).child(label))
                             })),
                     ))
                     .when(!atts.is_empty(), |d| d.child(div().flex().flex_wrap().gap(px(5.)).px(px(10.)).pt(px(9.)).children(atts.iter().map(|a| chip(a, cx)))))
