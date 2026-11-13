@@ -463,26 +463,21 @@ impl Element for EditorElement {
                 }
             }
 
-            // ---- 光标（带平滑移动）----
+            // ---- 光标：不做位置滑动（VS Code / IDEA / Zed 默认都没有，打字时会拖尾），坐标吸附到物理像素 ----
+            let scale = window.scale_factor();
+            let (cw, ch, cdy) = crate::caret::geometry(mode.line_height, mode.font_size, scale);
+            let caret_box = |x: Pixels, y: Pixels| Bounds::new(point(px(crate::caret::snap(x.f(), scale)), px(crate::caret::snap(y.f() + cdy, scale))), size(px(cw), px(ch)));
             let mut cursor_box = None;
             if let Some((x, y)) = ed.layout_position(&rows, text_left, scroll_x, cursor, lh) {
-                let target = point(x, y);
-                let cur = ed.cursor_anim.unwrap_or(target);
-                let (dx, dy) = ((target.x - cur.x).f(), (target.y - cur.y).f());
-                let next = if dx.abs() < 0.4 && dy.abs() < 0.4 || dy.abs() > 200.0 { target } else { point(cur.x + px(dx * 0.55), cur.y + px(dy * 0.55)) };
-                if next != target { window.request_animation_frame(); }
-                ed.cursor_anim = Some(next);
-                let (cw, ch, cdy) = crate::caret::geometry(mode.line_height);
-                // 向左挪半个像素：细光标压在字符边界上，而不是侵入下一个字符
-                cursor_box = Some(Bounds::new(point(next.x - px(0.5), next.y + px(cdy)), size(px(cw), px(ch))));
+                ed.cursor_anim = Some(point(x, y));
+                cursor_box = Some(caret_box(x, y));
             }
             // 闪烁（VS Code smooth）：只有淡出阶段连续请求下一帧，亮住 / 暗住时画面不变
             let ph = crate::caret::phase(ed.blink_at.elapsed());
             let caret_a = if focused { crate::caret::alpha(ph) } else { 0.0 };
             if focused && crate::caret::fading(ph) { window.request_animation_frame(); }
             let extra_cursors: Vec<Bounds<Pixels>> = if focused && caret_a > 0.01 {
-                let (cw, ch, cdy) = crate::caret::geometry(mode.line_height);
-                ed.extra.iter().filter_map(|r| ed.layout_position(&rows, text_left, scroll_x, r.end, lh).map(|(x, y)| Bounds::new(point(x - px(0.5), y + px(cdy)), size(px(cw), px(ch))))).collect()
+                ed.extra.iter().filter_map(|r| ed.layout_position(&rows, text_left, scroll_x, r.end, lh).map(|(x, y)| caret_box(x, y))).collect()
             } else { vec![] };
             let show_cursor = focused && ed.sel.is_empty() || (focused && ed.marked.is_some());
             let cursor_out = if show_cursor && caret_a > 0.01 { cursor_box } else { None };

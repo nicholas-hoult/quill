@@ -38,7 +38,7 @@ cargo build --release    # 发布构建（首次很慢）
 
 ## 光标
 
-对标 VS Code `cursorBlinking: smooth` / IDEA：`caret.rs`（纯逻辑，有单测）。中性色（取 `theme.text`，不是强调色）、2px 笔直竖线、高度一整行（上下各让 0.5px）、没有圆角和光晕。闪烁周期 1s：亮住 200ms → 淡出 400ms → 暗住 400ms → 立刻亮起；打字 / 移动 / 刚获得焦点时 `Editor.blink_at` 重置，光标先满亮。时间驱动：编辑器的后台任务只在「画面需要变化」的时刻唤醒（`until_next_change`），淡出期间由绘制自己 `request_animation_frame`，亮住 / 暗住时画面静止、不重绘。
+对标 VS Code `cursorBlinking: smooth` / IDEA：`caret.rs`（纯逻辑，有单测）。中性色（取 `theme.text`，不是强调色）、约 1.5 逻辑像素宽的笔直竖线、高度按字号（≈1.3 倍）在行内居中——不撑满行高（行高 21 / 字号 13 时撑满像根杆子）、坐标和尺寸都吸附到物理像素（否则边缘被抗锯齿成发虚的灰边）、**不做位置滑动动画**（打字会拖尾）、没有圆角和光晕。闪烁周期 1s：亮住 200ms → 淡出 400ms → 暗住 400ms → 立刻亮起；打字 / 移动 / 刚获得焦点时 `Editor.blink_at` 重置，光标先满亮。时间驱动：编辑器的后台任务只在「画面需要变化」的时刻唤醒（`until_next_change`），淡出期间由绘制自己 `request_animation_frame`，亮住 / 暗住时画面静止、不重绘。
 
 ## 折叠与分屏
 

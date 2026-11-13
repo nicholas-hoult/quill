@@ -43,9 +43,19 @@ pub fn until_next_change(phase: Duration) -> Duration {
     Duration::from_millis(next - t)
 }
 
-/// 光标尺寸 (宽, 高, 距行顶偏移)：2px 宽，高度取一整行（上下各让半个像素，避免压到相邻行的背景）。
-pub fn geometry(line_height: f32) -> (f32, f32, f32) {
-    ((2.0), (line_height - 1.0).max(4.0), 0.5)
+/// 吸附到设备像素：竖线的边落在半个物理像素上会被抗锯齿成两条灰边，看起来发虚发糊
+pub fn snap(v: f32, scale: f32) -> f32 {
+    (v * scale).round() / scale
+}
+
+/// 光标尺寸 (宽, 高, 距行顶偏移)，单位逻辑像素，都吸附到物理像素。
+/// 高度跟字号走（约 1.3 倍，接近字体的上升 + 下降），在行内垂直居中，而不是撑满行高——
+/// 行高 21、字号 13 时撑满会比字高出一大截，像根杆子；宽度约 1.5 逻辑像素，Retina 上是 3 个物理像素。
+pub fn geometry(line_height: f32, font_size: f32, scale: f32) -> (f32, f32, f32) {
+    let h = snap((font_size * 1.3).min(line_height - 1.0).max(4.0), scale);
+    let w = snap(1.5, scale).max(1.0 / scale);
+    let dy = snap((line_height - h) / 2.0, scale);
+    (w, h, dy)
 }
 
 #[cfg(test)]
@@ -111,14 +121,31 @@ mod tests {
     }
 
     #[test]
-    fn 光标几何_两像素宽_整行高() {
-        let (w, h, dy) = geometry(21.0);
-        assert_eq!(w, 2.0);
-        assert_eq!(h, 20.0);
-        assert_eq!(dy, 0.5);
-        let (_, h2, _) = geometry(22.0);
-        assert_eq!(h2, 21.0);
-        // 极小行高不会出现 0 或负数
-        assert!(geometry(1.0).1 >= 4.0);
+    fn 光标几何_高度跟字号走_居中_吸附物理像素() {
+        // 13px 字、21px 行高：不撑满行高
+        let (w, h, dy) = geometry(21.0, 13.0, 2.0);
+        assert_eq!(w, 1.5); // Retina 上 3 个物理像素
+        assert_eq!(h, 17.0); // 16.9 吸附到半像素网格 → 17
+        assert!(h < 21.0 - 2.0, "不应撑满整行");
+        assert_eq!(dy, 2.0);
+        // 上下留白相等（居中）
+        assert!(((21.0 - h) / 2.0 - dy).abs() <= 0.25);
+        // 所有数值都落在物理像素网格上
+        for &sc in &[1.0f32, 2.0, 3.0] {
+            let (w, h, dy) = geometry(21.0, 13.5, sc);
+            for v in [w, h, dy] { assert!((v * sc - (v * sc).round()).abs() < 1e-4, "scale {sc}: {v}"); }
+        }
+        // 1x 屏宽度至少 1 物理像素；极小行高不会出现 0 或负数
+        assert!(geometry(21.0, 13.0, 1.0).0 >= 1.0);
+        assert!(geometry(1.0, 13.0, 2.0).1 >= 4.0);
+        // 行高很紧时不会超出行
+        assert!(geometry(14.0, 13.0, 2.0).1 <= 13.0);
+    }
+
+    #[test]
+    fn 吸附() {
+        assert_eq!(snap(10.26, 2.0), 10.5);
+        assert_eq!(snap(10.24, 2.0), 10.0);
+        assert_eq!(snap(10.4, 1.0), 10.0);
     }
 }
