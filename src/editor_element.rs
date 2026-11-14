@@ -474,8 +474,8 @@ impl Element for EditorElement {
             }
             // 闪烁（VS Code smooth）：只有淡出阶段连续请求下一帧，亮住 / 暗住时画面不变
             let ph = crate::caret::phase(ed.blink_at.elapsed());
-            let caret_a = if focused { crate::caret::alpha(ph) } else { 0.0 };
-            if focused && crate::caret::fading(ph) { window.request_animation_frame(); }
+            let caret_a = if focused { crate::caret::alpha_for(ph, ed.smooth_caret) } else { 0.0 };
+            if focused && crate::caret::wants_frames(ph, ed.smooth_caret) { window.request_animation_frame(); }
             let extra_cursors: Vec<Bounds<Pixels>> = if focused && caret_a > 0.01 {
                 ed.extra.iter().filter_map(|r| ed.layout_position(&rows, text_left, scroll_x, r.end, lh).map(|(x, y)| caret_box(x, y))).collect()
             } else { vec![] };

@@ -201,6 +201,7 @@ impl Workspace {
             AgentEvent::ReviewFile { path, before } => this.review_written_file(path.clone(), before.clone(), window, cx),
             AgentEvent::OpenSettings => this.open_settings(window, cx),
             AgentEvent::Restore(plan) => this.restore_files(plan.clone(), window, cx),
+            AgentEvent::Toast { text, error } => this.toast(text.clone(), *error, cx),
             AgentEvent::ModeChanged { mode } => {
                 this.settings.acp_mode = mode.clone();
                 let _ = this.settings.save();

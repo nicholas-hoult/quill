@@ -29,6 +29,14 @@ pub fn alpha(phase: Duration) -> f32 {
     else { 0.0 }
 }
 
+/// 周期内某个相位的不透明度：`smooth` 为假时是硬闪（亮到 `FADE_END` 再灭），没有中间态
+pub fn alpha_for(phase: Duration, smooth: bool) -> f32 {
+    if smooth { alpha(phase) } else if (phase.as_millis() as u64) < FADE_END { 1.0 } else { 0.0 }
+}
+
+/// 这一帧要不要继续请求下一帧：只有平滑模式且正在淡出
+pub fn wants_frames(phase: Duration, smooth: bool) -> bool { smooth && fading(phase) }
+
 /// 是否正处在淡出阶段（这段时间需要连续请求下一帧；其余阶段画面不变，不必重绘）
 pub fn fading(phase: Duration) -> bool {
     let t = phase.as_millis() as u64;
@@ -63,6 +71,27 @@ mod tests {
     use super::*;
 
     fn ms(n: u64) -> Duration { Duration::from_millis(n) }
+
+    // 平滑渐隐期间每一帧都会请求下一帧，而 gpui 会把请求帧的视图的祖先一起标脏重渲：
+    // 对话里有一条很长的流式消息时，光标每动一帧都要重建整条消息（实测把一个核心吃满）。
+    // 所以流式回复期间要能关掉渐隐，改成硬闪：只在切换那一刻重绘。
+
+    #[test]
+    fn 硬闪只有亮和灭两档() {
+        for t in [0, 100, 199, 200, 400, 599] { assert_eq!(alpha_for(ms(t), false), 1.0, "{t}ms"); }
+        for t in [600, 700, 999] { assert_eq!(alpha_for(ms(t), false), 0.0, "{t}ms"); }
+        // 平滑模式和原来一样
+        assert_eq!(alpha_for(ms(100), true), alpha(ms(100)));
+        assert!(alpha_for(ms(400), true) > 0.0 && alpha_for(ms(400), true) < 1.0);
+    }
+
+    #[test]
+    fn 硬闪不请求连续帧_平滑只在淡出时请求() {
+        for t in [0, 250, 400, 599, 600, 900] { assert!(!wants_frames(ms(t), false), "{t}ms"); }
+        assert!(wants_frames(ms(400), true));
+        assert!(!wants_frames(ms(100), true));
+        assert!(!wants_frames(ms(700), true));
+    }
 
     #[test]
     fn 周期开头先满亮_打字后不会半透明() {

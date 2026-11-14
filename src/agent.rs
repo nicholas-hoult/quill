@@ -32,6 +32,8 @@ pub enum AgentEvent {
     ModelChanged { model: String, models: Vec<String> },
     /// 在对话面板里切换了 Claude Code 的会话模式（只发常用的、值得记住的）：工作区据此保存设置（#9）
     ModeChanged { mode: String },
+    /// 面板想给用户一条提示（如贴的图片太大）：工作区显示 toast
+    Toast { text: String, error: bool },
     /// 检查点回退：按计划还原 / 删除这些文件（路径相对项目根）
     Restore(Vec<(String, crate::checkpoint::Action)>),
 }
@@ -126,6 +128,12 @@ pub struct AgentPanel {
     model_menu: bool,
     /// Claude Code 会话模式的选择浮层（#9）
     mode_menu: bool,
+    /// 输入框里贴好、还没发送的图片；点发送时移到 `outgoing_images`，由 `acp_send` 带上（#12）
+    images: Vec<Arc<Image>>,
+    outgoing_images: Vec<Arc<Image>>,
+    /// 流式片段的重绘节流（见 `msglist::stream_wait`）：上次重绘的时间、是否已安排了一次延迟重绘
+    last_stream_paint: Option<std::time::Instant>,
+    stream_flush: bool,
     model_sel: usize,
     /// 正在确认回退的那条用户消息；以及已经回退过的（只用来显示「已恢复」）
     restoring: Option<u64>,
@@ -156,7 +164,7 @@ impl AgentPanel {
         let threads = load_threads();
         let active = 0;
         let next_id = threads.iter().flat_map(|t| t.messages.iter().map(|m| m.id)).max().unwrap_or(0) + 1;
-        Self { workspace, composer, threads, active, cancel: None, msgs: ListState::new(0, ListAlignment::Top, px(500.)), msgs_key: None, stick: true, files: vec![], symbols: vec![], sym_cache: Default::default(), active_file: None, dropped: vec![], extra: vec![], mention: None, menu: false, settings, next_id, rounds: 0, expanded: HashSet::new(), hl_cache: Default::default(), rules_file: None, rules_root: None, awaiting: None, running: None, always_allow: false, model_menu: false, mode_menu: false, model_sel: 0, restoring: None, restored: HashSet::new(), acp: None, acp_epoch: 0, _sub: sub }
+        Self { workspace, composer, threads, active, cancel: None, msgs: ListState::new(0, ListAlignment::Top, px(500.)), msgs_key: None, stick: true, files: vec![], symbols: vec![], sym_cache: Default::default(), active_file: None, dropped: vec![], extra: vec![], mention: None, menu: false, settings, next_id, rounds: 0, expanded: HashSet::new(), hl_cache: Default::default(), rules_file: None, rules_root: None, awaiting: None, running: None, always_allow: false, model_menu: false, mode_menu: false, images: vec![], outgoing_images: vec![], last_stream_paint: None, stream_flush: false, model_sel: 0, restoring: None, restored: HashSet::new(), acp: None, acp_epoch: 0, _sub: sub }
     }
 
     /// 项目文件列表更新了：记下来，并在后台线程里（增量）重建符号索引
@@ -385,6 +393,17 @@ impl AgentPanel {
         self.threads.iter().enumerate().filter(|(i, t)| *i != self.active && !t.messages.is_empty()).map(|(_, t)| t.title.clone()).collect()
     }
 
+    /// ⌘V 时剪贴板里没有文字：有图片就贴进输入框（只有 Claude Code 后端能看图，#12）
+    fn paste_image(&mut self, cx: &mut Context<Self>) {
+        if self.settings.provider != "claude-code" { return; }
+        let Some(item) = cx.read_from_clipboard() else { return };
+        let Some(img) = item.into_entries().find_map(|e| match e { ClipboardEntry::Image(i) => Some(i), _ => None }) else { return };
+        match crate::acp::accept_image(self.images.len(), img.format, img.bytes.len()) {
+            Ok(_) => { self.images.push(Arc::new(img)); cx.notify(); }
+            Err(why) => cx.emit(AgentEvent::Toast { text: why, error: true }),
+        }
+    }
+
     fn update_mention(&mut self, cx: &mut Context<Self>) {
         let (text, cur) = { let c = self.composer.read(cx); (c.text(), c.cursor()) };
         // 行首的 `/`：Claude Code 的斜杠命令（#10）；否则看光标前有没有 `@` 引用
@@ -464,6 +483,8 @@ impl AgentPanel {
         // 斜杠命令（#10）：原样发出，不附当前文件 / 引用，否则它们会被当成命令的参数
         let slash = self.settings.provider == "claude-code" && crate::acp::is_slash_command(&text, self.acp.as_ref().map(|a| a.commands.as_slice()).unwrap_or(&[]));
         let atts = if slash { vec![] } else { self.attachments(&text) };
+        // 贴的图片随这条消息发出（斜杠命令不带图）；消息上方的引用标签里显示「图片 N」
+        let images = if slash { vec![] } else { std::mem::take(&mut self.images) };
         let ws = self.workspace.clone();
         let files: Vec<(String, String)> = atts.iter().filter_map(|rel| {
             let t = ws.update(cx, |w, cx| w.file_text_rel(rel, cx)).ok().flatten()?;
@@ -474,6 +495,8 @@ impl AgentPanel {
         blocks.extend(extra_blocks);
         let mut refs: Vec<String> = files.iter().map(|f| f.0.clone()).collect();
         refs.extend(extra_refs);
+        refs.extend(images.iter().enumerate().map(|(i, im)| format!("图片 {} · {}KB", i + 1, im.bytes.len().div_ceil(1024))));
+        self.outgoing_images = images;
         self.composer.update(cx, |c, cx| { c.clear(cx); c.intercept = false; });
         self.mention = None;
         self.extra.clear();
@@ -734,7 +757,6 @@ impl AgentPanel {
             Sync::Reset => self.msgs.reset(key.len),
         }
         self.msgs_key = Some(key);
-        // 贴底时每次渲染都回到底部：流式输出让最后一条变高、权限卡片展开等都不经过「消息数变化」，不能只靠事件触发
         if self.stick { self.scroll_end(); }
     }
 
@@ -1043,6 +1065,8 @@ impl Render for AgentPanel {
         self.sync_rules(cx);
         let t = cx.theme().clone();
         let streaming = self.cancel.is_some() || self.awaiting.is_some();
+        // 流式回复期间输入框光标改硬闪：渐隐的每一帧都会让整条（很长的）流式消息重建一遍
+        if self.composer.read(cx).smooth_caret == streaming { self.composer.update(cx, |c, _| c.smooth_caret = !streaming); }
         let (title, msg_count) = { let th = &self.threads[self.active]; (th.title.clone(), th.messages.len()) };
         self.sync_msgs(window);
         let atts = { let text = self.composer.read(cx).text(); self.attachments(&text) };
@@ -1061,6 +1085,7 @@ impl Render for AgentPanel {
             }))
             .on_action(cx.listener(|this, _: &crate::actions::Enter, _, cx| if this.restoring.is_some() { this.confirm_restore(cx) } else if this.model_menu { this.choose_model(this.model_sel, cx) } else { this.pick_mention(cx) }))
             .on_action(cx.listener(|this, _: &crate::actions::Outdent, _, cx| this.acp_cycle_mode(cx)))
+            .on_action(cx.listener(|this, _: &crate::actions::Paste, _, cx| this.paste_image(cx)))
             .on_action(cx.listener(|this, _: &crate::actions::Tab, _, cx| if this.model_menu { this.choose_model(this.model_sel, cx) } else { this.pick_mention(cx) }))
             .child(
                 div().h(px(44.)).flex_none().px(px(12.)).flex().items_center().gap(px(6.)).border_b_1().border_color(t.border)
@@ -1112,7 +1137,16 @@ impl Render for AgentPanel {
                                     .when_some(detail, |d, s| d.child(div().flex_1().min_w_0().truncate().text_size(px(11.5)).text_color(t.faint).child(s)))
                             })),
                     ))
-                    .when(!atts.is_empty(), |d| d.child(div().flex().flex_wrap().gap(px(5.)).px(px(10.)).pt(px(9.)).children(atts.iter().map(|a| chip(a, cx)))))
+                    .when(!atts.is_empty() || !self.images.is_empty(), |d| d.child(div().flex().flex_wrap().gap(px(5.)).px(px(10.)).pt(px(9.))
+                        .children(self.images.iter().enumerate().map(|(i, im)| {
+                            let (hover, border, bg) = (t.hover, t.border, t.hover);
+                            div().id(("img-chip", i)).flex().items_center().gap(px(6.)).h(px(30.)).pl(px(3.)).pr(px(7.)).rounded(px(7.)).bg(bg).border_1().border_color(border).text_size(px(12.)).text_color(t.dim)
+                                .child(img(im.clone()).size(px(24.)).rounded(px(4.)).object_fit(ObjectFit::Cover))
+                                .child(format!("图片 {}", i + 1))
+                                .child(div().id(("img-x", i)).ml(px(2.)).px(px(3.)).rounded(px(4.)).cursor_pointer().hover(move |s| s.bg(hover)).child("✕")
+                                    .on_click(cx.listener(move |this, _, _, cx| { if i < this.images.len() { this.images.remove(i); cx.notify(); } })))
+                        }))
+                        .children(atts.iter().map(|a| chip(a, cx)))))
                     .child(div().px(px(12.)).py(px(8.)).child(self.composer.clone()))
                     .child(
                         div().flex().items_center().gap(px(6.)).px(px(8.)).pb(px(8.)).pl(px(12.)).text_size(px(12.)).text_color(t.faint)

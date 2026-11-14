@@ -158,10 +158,48 @@ pub fn mode_to_apply(pref: &str, m: &Modes) -> Option<String> {
     Some(pref.to_string())
 }
 
-pub fn prompt(id: u64, session_id: &str, text: &str) -> String {
-    json!({"jsonrpc":"2.0","id":id,"method":"session/prompt","params":{
-        "sessionId":session_id,"prompt":[{"type":"text","text":text}]
-    }}).to_string()
+pub fn prompt(id: u64, session_id: &str, text: &str) -> String { prompt_with_images(id, session_id, text, &[]) }
+
+/// 单张图片的大小上限（Claude 的限制是每张 5MB）和一条消息最多几张
+pub const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+pub const MAX_IMAGES: usize = 4;
+
+/// Claude 能看的图片格式对应的 MIME；其余（svg / bmp / tiff…）不收
+pub fn image_mime(f: gpui::ImageFormat) -> Option<&'static str> {
+    use gpui::ImageFormat as F;
+    match f { F::Png => Some("image/png"), F::Jpeg => Some("image/jpeg"), F::Webp => Some("image/webp"), F::Gif => Some("image/gif"), _ => None }
+}
+
+/// 贴进来的图片收不收：`have` 是已经贴了几张。收返回 MIME，不收返回给用户看的原因
+pub fn accept_image(have: usize, f: gpui::ImageFormat, len: usize) -> Result<&'static str, String> {
+    let mime = image_mime(f).ok_or("不支持这种图片格式（支持 PNG / JPEG / WebP / GIF）")?;
+    if len == 0 { return Err("图片是空的".into()); }
+    if len > MAX_IMAGE_BYTES { return Err("图片超过 5MB，请先缩小或截取一部分".into()); }
+    if have >= MAX_IMAGES { return Err(format!("一条消息最多 {MAX_IMAGES} 张图片")); }
+    Ok(mime)
+}
+
+/// 标准 base64（RFC 4648，带 `=` 填充）
+pub fn base64_encode(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// 发 prompt：文字在前，图片（`image` 内容块，base64）在后。Agent 要先声明 `promptCapabilities.image`（Claude Code 适配器声明了）
+pub fn prompt_with_images(id: u64, session_id: &str, text: &str, images: &[std::sync::Arc<gpui::Image>]) -> String {
+    let mut blocks = vec![json!({"type":"text","text":text})];
+    for img in images {
+        if let Some(mime) = image_mime(img.format) { blocks.push(json!({"type":"image","mimeType":mime,"data":base64_encode(&img.bytes)})); }
+    }
+    json!({"jsonrpc":"2.0","id":id,"method":"session/prompt","params":{"sessionId":session_id,"prompt":blocks}}).to_string()
 }
 
 /// 取消是通知（没有 id、没有响应）
@@ -1339,5 +1377,66 @@ mod tests {
         assert_eq!(short_description("第一行\n第二行", 20), "第一行 第二行");
         assert_eq!(short_description("abcdefghij", 5), "abcd…");
         assert_eq!(short_description("  前后空白  ", 20), "前后空白");
+    }
+
+    // ---------- 图片（贴图）----------
+    // 为什么单独测：图片以 base64 放进 prompt。编码错了模型收到的是一张坏图（界面上看不出来）；
+    // 大小 / 格式 / 数量判错了，要么把超限的图发出去被 Agent 整条拒绝，要么把能发的图挡掉。
+
+    #[test]
+    fn base64_标准向量() {
+        // RFC 4648 §10
+        for (i, o) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg=="), ("fooba", "Zm9vYmE="), ("foobar", "Zm9vYmFy")] {
+            assert_eq!(base64_encode(i.as_bytes()), o, "{i}");
+        }
+        // 非 ASCII 字节
+        assert_eq!(base64_encode(&[0xff, 0xfe, 0xfd]), "//79");
+        assert_eq!(base64_encode(&[0x00]), "AA==");
+        // 较长输入：每 3 字节 4 字符
+        assert_eq!(base64_encode(&vec![0u8; 3000]).len(), 4000);
+    }
+
+    #[test]
+    fn 只收_claude_能看的图片格式() {
+        use gpui::ImageFormat as F;
+        assert_eq!(image_mime(F::Png), Some("image/png"));
+        assert_eq!(image_mime(F::Jpeg), Some("image/jpeg"));
+        assert_eq!(image_mime(F::Webp), Some("image/webp"));
+        assert_eq!(image_mime(F::Gif), Some("image/gif"));
+        assert_eq!(image_mime(F::Svg), None);
+        assert_eq!(image_mime(F::Bmp), None);
+        assert_eq!(image_mime(F::Tiff), None);
+    }
+
+    #[test]
+    fn 贴图的大小和数量限制() {
+        use gpui::ImageFormat as F;
+        assert_eq!(accept_image(0, F::Png, 1000), Ok("image/png"));
+        // 刚好到上限可以，超 1 字节不行
+        assert_eq!(accept_image(0, F::Png, MAX_IMAGE_BYTES), Ok("image/png"));
+        assert!(accept_image(0, F::Png, MAX_IMAGE_BYTES + 1).unwrap_err().contains("5MB"));
+        assert!(accept_image(0, F::Svg, 10).unwrap_err().contains("格式"));
+        assert_eq!(accept_image(MAX_IMAGES - 1, F::Png, 10), Ok("image/png"));
+        assert!(accept_image(MAX_IMAGES, F::Png, 10).unwrap_err().contains(&MAX_IMAGES.to_string()));
+        // 空图片
+        assert!(accept_image(0, F::Png, 0).is_err());
+    }
+
+    #[test]
+    fn 带图片的_prompt_文字在前图片在后() {
+        use gpui::{Image, ImageFormat as F};
+        let img = std::sync::Arc::new(Image::from_bytes(F::Png, vec![1, 2, 3]));
+        let m = v(&prompt_with_images(4, "sess-1", "看这张图", &[img]));
+        assert_eq!(m["method"], "session/prompt");
+        assert_eq!(m["params"]["sessionId"], "sess-1");
+        let c = m["params"]["prompt"].as_array().unwrap();
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0], json!({"type":"text","text":"看这张图"}));
+        assert_eq!(c[1], json!({"type":"image","mimeType":"image/png","data":"AQID"}));
+        // 没有图片时和原来的 prompt 完全一样
+        assert_eq!(prompt_with_images(4, "s", "你好", &[]), prompt(4, "s", "你好"));
+        // 不支持的格式的图不会发出去（防御：accept_image 已经挡过一次）
+        let svg = std::sync::Arc::new(Image::from_bytes(F::Svg, vec![1]));
+        assert_eq!(v(&prompt_with_images(4, "s", "x", &[svg]))["params"]["prompt"].as_array().unwrap().len(), 1);
     }
 }

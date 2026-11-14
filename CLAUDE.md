@@ -72,6 +72,10 @@ cargo build --release    # 发布构建（首次很慢）
 
 **Markdown 表格（#11）**：`md::parse_blocks` 识别 GFM 表格（`Block::Table`，表头 + 列数相同的分隔行才算，流式输出时写到一半仍是段落），`ui::md_table` 渲染，聊天 `render_text` 和悬停卡片 `ui::md_text` 共用；列宽 = `col_weights`（内容长度的相对权重，flex-grow 取权重、basis 为 0），每列最小宽度 = `col_min_chars`（最长不可拆词，防止 `~330` 被拆成两行）。
 
+**贴图（#12）**：⌘V 时剪贴板没有文字（编辑器对 `enter_submits` 的输入框把 Paste 交给面板）有图片就贴进 `AgentPanel.images`（`acp::accept_image`：PNG / JPEG / WebP / GIF、≤5MB、≤4 张，超限弹 toast），输入框上方带缩略图的 chip，发送时作为 `image` 内容块跟在文字块后发出（`acp::prompt_with_images`，base64 自己写、没加依赖）；消息上方引用标签显示「图片 N · 大小」，图片不写 threads.json。仅 Claude Code 后端；斜杠命令不带图。验证贴图：`osascript -e 'set the clipboard to (read (POSIX file "x.png") as «class PNGf»)'` 再让 `QUILL_SCRIPT` 发 `key:cmd-v`（会覆盖当前剪贴板）。`@文件` 没改成 resource 块（模型视角等价，见 issue #12）。
+
+**流式长回答的卡顿（#8）**：根因有两个，都用 `sample` + 渲染计数量出来的。① 输入框光标渐隐期间每帧 `request_animation_frame`，gpui 会把请求帧的视图的**祖先一起标脏重渲**，于是整条长消息每帧重建——流式回复期间面板把 `composer.smooth_caret` 关掉改硬闪（`caret::alpha_for` / `wants_frames`）。② 流式片段密（66 个 / 秒），每个都重排整条消息、单帧约 1.5µs / 字符——片段触发的重绘合并（`msglist::stream_interval`：间隔 = 字符数 × 5µs，夹在 40ms..400ms；`stream_wait` + `notify_stream`，最后一个片段一定补刷）。压测：`MOCK_LONG_SECS` 的「长回答」+ 每秒采样进程 CPU，优化前一路涨到 112%，优化后稳定 40–48%。判断「是谁在触发重绘」别靠猜：在 `render` 里临时加每秒计数，对照改某个开关前后的渲染次数。
+
 **绕过 npx（#8）**：默认命令 `npx -y …@0.94.0` 每次启动都要先跑一遍 npm，实测握手 11.7s，直接运行缓存里的入口 3.4s（同负载）。`acp_client::default_command` 先在 `~/.npm/_npx/*/node_modules` 里找版本正好是 `ADAPTER_VERSION` 且入口在的适配器（`cached_adapter`，版本不同不顶替），找到就直接跑（单引号包路径），找不到回退 npx（它会下载并缓存，之后走直接路径）。设置里填了自定义命令则一律用用户的。建会话那几秒是 Claude Code 自己加载用户配置（hooks / 插件 / MCP），Quill 管不了，靠预热藏起来。
 验证：`QUILL_ACP="python3 private/probes/mock_acp.py"` 用模拟 Agent（消息含 `[acp-tool]` 走 读文件 → 计划 → 权限 → 写文件；`[acp-cancel]` 等取消；`[acp-die]` 崩溃）；测试用的 HOME 里要放 `settings.json`，`provider` 写 `claude-code`。注意 Rust 2024 里 `gen` 是保留字。
 

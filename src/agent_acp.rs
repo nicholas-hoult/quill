@@ -31,6 +31,8 @@ pub(super) struct AcpState {
     ignored: HashSet<u64>,
     /// 等会话就绪 / 上一轮结束后再发的 prompt
     pub(super) queued: Option<String>,
+    /// 随 `queued` 一起发出的图片（#12）
+    queued_images: Vec<Arc<gpui::Image>>,
     /// Agent 是否声明了 loadSession；以及正在恢复的会话 ID（恢复期间 Agent 重放的历史要忽略）
     can_load: bool,
     loading: Option<String>,
@@ -69,7 +71,7 @@ impl AgentPanel {
         self.acp_epoch += 1;
         let epoch = self.acp_epoch;
         handle.send(acp::initialize(1));
-        self.acp = Some(AcpState { handle, root, epoch, next_rpc: 3, init_id: 1, new_id: 0, session: None, can_load: false, loading: None, prompt_id: None, ignored: HashSet::new(), queued: None, cur: None, tools: HashMap::new(), perms: Default::default(), terms: Terminals::default(), term_waits: HashMap::new(), modes: None, commands: vec![], mode_req: None, events: tx2 });
+        self.acp = Some(AcpState { handle, root, epoch, next_rpc: 3, init_id: 1, new_id: 0, session: None, can_load: false, loading: None, prompt_id: None, ignored: HashSet::new(), queued: None, queued_images: vec![], cur: None, tools: HashMap::new(), perms: Default::default(), terms: Terminals::default(), term_waits: HashMap::new(), modes: None, commands: vec![], mode_req: None, events: tx2 });
         cx.spawn(async move |this, cx| {
             while let Ok(ev) = rx.recv().await {
                 if this.update(cx, |p, cx| p.on_acp(epoch, ev, cx)).is_err() { break; }
@@ -113,7 +115,8 @@ impl AgentPanel {
             if let Err(e) = self.acp_start(root, cx) { self.acp_fail(e, cx); return; }
         }
         self.cancel = Some(Arc::new(AtomicBool::new(false)));
-        if let Some(a) = self.acp.as_mut() { a.cur = None; a.queued = Some(prompt); }
+        let images = std::mem::take(&mut self.outgoing_images);
+        if let Some(a) = self.acp.as_mut() { a.cur = None; a.queued = Some(prompt); a.queued_images = images; }
         self.acp_target(false); // 先放一条空的助手消息，界面显示「思考中…」
         self.acp_flush();
         cx.notify();
@@ -126,7 +129,8 @@ impl AgentPanel {
             let id = a.next_rpc;
             a.next_rpc += 1;
             a.prompt_id = Some(id);
-            a.handle.send(acp::prompt(id, &sid, &q));
+            let images = std::mem::take(&mut a.queued_images);
+            a.handle.send(acp::prompt_with_images(id, &sid, &q, &images));
         }
     }
 
@@ -159,7 +163,7 @@ impl AgentPanel {
             self.thread().messages.push(Message { id, calls: vec![], role: Role::Assistant, content: String::new(), refs: vec![], status: Status::Error(text), applied: HashSet::new(), snapshots: vec![] });
         }
         self.cancel = None;
-        if let Some(a) = self.acp.as_mut() { a.perms.drain(); a.queued = None; a.prompt_id = None; a.cur = None; }
+        if let Some(a) = self.acp.as_mut() { a.perms.drain(); a.queued = None; a.queued_images.clear(); a.prompt_id = None; a.cur = None; }
         self.save();
         cx.notify();
     }
@@ -268,6 +272,7 @@ impl AgentPanel {
     fn acp_update(&mut self, u: Update, cx: &mut Context<Self>) {
         // 恢复会话时 Agent 会把历史重放一遍：界面上已经有了，忽略
         if self.acp.as_ref().map(|a| a.loading.is_some()).unwrap_or(false) && !matches!(u, Update::Commands(_) | Update::Mode(_)) { return; }
+        let chunk = matches!(u, Update::Text(_) | Update::Thought(_));
         match u {
             Update::Text(t) => {
                 let id = self.acp_target(true);
@@ -301,7 +306,22 @@ impl AgentPanel {
             Update::Other => return,
         }
         if self.stick { self.scroll_end(); }
-        cx.notify();
+        // 文字 / 思考片段很密：合并重绘（长回答每个片段都重排整条消息会吃满一个核心）；其余更新立即重绘
+        if chunk { self.notify_stream(cx); } else { self.last_stream_paint = Some(std::time::Instant::now()); cx.notify(); }
+    }
+
+    /// 流式片段触发的重绘：距上次重绘不足 `STREAM_MIN_INTERVAL` 就推迟到满间隔（只安排一次，最后一个片段一定会补刷）
+    fn notify_stream(&mut self, cx: &mut Context<Self>) {
+        let now = std::time::Instant::now();
+        let len = self.threads[self.active].messages.last().map(|m| m.content.chars().count()).unwrap_or(0);
+        let wait = crate::msglist::stream_wait(self.last_stream_paint, now, crate::msglist::stream_interval(len));
+        if wait.is_zero() { self.last_stream_paint = Some(now); cx.notify(); return; }
+        if self.stream_flush { return; }
+        self.stream_flush = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            let _ = this.update(cx, |p, cx| { p.stream_flush = false; p.last_stream_paint = Some(std::time::Instant::now()); cx.notify(); });
+        }).detach();
     }
 
     fn acp_set_tool(&mut self, tc: acp::ToolCall) -> Option<(u64, usize)> {
@@ -446,6 +466,7 @@ impl AgentPanel {
             a.ignored.insert(pid);
         }
         a.queued = None;
+        a.queued_images.clear();
         a.cur = None;
         a.terms.kill_all();
     }

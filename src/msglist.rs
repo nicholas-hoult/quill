@@ -36,9 +36,72 @@ pub fn plan(old: Option<Key>, new: Key) -> Sync {
     Sync::Reset
 }
 
+/// 流式片段触发重绘的最小间隔：每个片段都重排整条长消息会把一个核心吃满（实测 20KB 的回答每帧 ~15ms，
+/// 66 片段 / 秒时 CPU 110%），合并到 40ms 一次（25 帧 / 秒）肉眼无差别
+pub const STREAM_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// 流式重绘间隔的上限（再长的消息文字也至少每 400ms 动一次）
+pub const STREAM_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// 流式重绘的最小间隔随消息长度放大：单帧要把整条消息重新布局（实测约 1.5µs / 字符，20KB ≈ 30ms），
+/// 固定 40ms 间隔对长消息等于背靠背渲染、仍把一个核心吃满。按「最多占 30% CPU」取 5µs / 字符，夹在 40ms..400ms
+pub fn stream_interval(chars: usize) -> std::time::Duration {
+    std::time::Duration::from_micros((chars as u64).saturating_mul(5)).clamp(STREAM_MIN_INTERVAL, STREAM_MAX_INTERVAL)
+}
+
+/// 流式片段到了，现在该不该重绘：返回还要等多久。`Duration::ZERO` = 立刻重绘；
+/// 否则调用方安排一次延迟重绘（已经安排过就不再安排：最后一个片段一定会被补刷）
+pub fn stream_wait(last_paint: Option<std::time::Instant>, now: std::time::Instant, min: std::time::Duration) -> std::time::Duration {
+    match last_paint {
+        None => std::time::Duration::ZERO,
+        Some(t) => min.saturating_sub(now.saturating_duration_since(t)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    // 为什么单独测：节流判错了，要么长回答照样卡（该等没等），要么最后一个片段不显示 / 流式时界面一顿一顿（等过头）
+
+    #[test]
+    fn 间隔随消息长度放大_短消息保持下限() {
+        // 实测单帧约 1.5µs / 字符（20KB 的消息 ~30ms），按「重绘最多占 30% CPU」标定：间隔 ≈ 5µs / 字符
+        assert_eq!(stream_interval(0), STREAM_MIN_INTERVAL);
+        assert_eq!(stream_interval(2_000), STREAM_MIN_INTERVAL); // 10ms < 下限
+        assert_eq!(stream_interval(8_000), STREAM_MIN_INTERVAL); // 刚好 40ms
+        assert_eq!(stream_interval(20_000), Duration::from_millis(100));
+        assert_eq!(stream_interval(60_000), Duration::from_millis(300));
+        // 封顶：再长也不会让文字几秒才动一下
+        assert_eq!(stream_interval(10_000_000), STREAM_MAX_INTERVAL);
+    }
+
+    #[test]
+    fn 第一个片段立刻重绘() {
+        assert_eq!(stream_wait(None, Instant::now(), STREAM_MIN_INTERVAL), Duration::ZERO);
+    }
+
+    #[test]
+    fn 刚重绘过就要等到满间隔() {
+        let t0 = Instant::now();
+        assert_eq!(stream_wait(Some(t0), t0 + Duration::from_millis(10), STREAM_MIN_INTERVAL), Duration::from_millis(30));
+        assert_eq!(stream_wait(Some(t0), t0, STREAM_MIN_INTERVAL), STREAM_MIN_INTERVAL);
+    }
+
+    #[test]
+    fn 过了间隔就立刻重绘() {
+        let t0 = Instant::now();
+        assert_eq!(stream_wait(Some(t0), t0 + STREAM_MIN_INTERVAL, STREAM_MIN_INTERVAL), Duration::ZERO);
+        assert_eq!(stream_wait(Some(t0), t0 + Duration::from_secs(3), STREAM_MIN_INTERVAL), Duration::ZERO);
+    }
+
+    #[test]
+    fn 时钟倒退不会算出负数或溢出() {
+        let t0 = Instant::now();
+        assert_eq!(stream_wait(Some(t0 + Duration::from_millis(5)), t0, STREAM_MIN_INTERVAL), STREAM_MIN_INTERVAL);
+    }
+
     fn k(thread: usize, len: usize, first: u64, last: u64) -> Key { Key { thread, len, first, last } }
 
     #[test]

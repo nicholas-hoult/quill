@@ -119,6 +119,8 @@ pub struct Editor {
     pub read_only: bool,
     /// 外部（如 @ 提及弹窗）接管 上/下/回车/Tab 时置位，编辑器把这些键交还给父级
     pub intercept: bool,
+    /// 光标平滑渐隐（默认）；为假时硬闪。渐隐每帧都请求下一帧、连带祖先重渲，对话里有很长的流式消息时会吃满一个核心（见 caret.rs）
+    pub smooth_caret: bool,
     pub diagnostics: Vec<Diagnostic>,
     /// 已折叠的区域：(标题行, 结束行)
     pub folds: Vec<(usize, usize)>,
@@ -199,6 +201,7 @@ impl Editor {
             cursor_anim: None,
             read_only: false,
             intercept: false,
+            smooth_caret: true,
             diagnostics: vec![],
             folds: vec![],
             fold_cache: (u64::MAX, vec![]),
@@ -1003,6 +1006,8 @@ impl Editor {
         if let Some(t) = cx.read_from_clipboard().and_then(|i| i.text()) {
             let t = if self.mode.single_line { t.replace(['\n', '\r'], " ") } else { t.replace("\r\n", "\n") };
             self.insert(&t, cx);
+        } else if self.mode.enter_submits {
+            cx.propagate(); // 剪贴板里没有文字（可能是图片）：对话输入框交给上层面板处理（贴图，#12）
         }
     }
 
