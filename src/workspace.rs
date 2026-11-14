@@ -177,6 +177,13 @@ fn load_recents() -> Vec<String> {
     recents_path().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 
+/// 启动时该打开哪个项目：显式指定（QUILL_OPEN）优先，否则取「最近打开」里第一个仍存在的目录。
+/// 目的：让启动后立刻有项目根目录，Claude Code 才能马上开始预热（#8）。
+fn startup_root(explicit: Option<String>, recents: &[String], is_dir: impl Fn(&str) -> bool) -> Option<PathBuf> {
+    if let Some(p) = explicit.filter(|p| !p.is_empty()) { return Some(PathBuf::from(p)); }
+    recents.iter().find(|r| is_dir(r)).map(PathBuf::from)
+}
+
 pub fn system_is_dark(window: &Window) -> bool { matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark) }
 
 impl Workspace {
@@ -641,6 +648,13 @@ impl Workspace {
     }
 
     // ---------- 项目 ----------
+
+    /// 启动时调用：打开 QUILL_OPEN 指定的项目，否则打开上次的项目；都没有就停在欢迎页。
+    pub fn open_startup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(p) = startup_root(std::env::var("QUILL_OPEN").ok(), &self.recents, |r| std::path::Path::new(r).is_dir()) {
+            self.open_root(p, window, cx);
+        }
+    }
 
     pub fn open_root(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.tabs.clear();
@@ -1676,5 +1690,33 @@ impl Render for Workspace {
                 div().px(px(16.)).py(px(9.)).rounded(px(11.)).bg(t.elev).border_1().border_color(if ts.error { t.del } else { t.border_strong }).text_color(if ts.error { t.del } else { t.text })
                     .shadow(vec![BoxShadow { color: hsla(0., 0., 0., 0.4), offset: point(px(0.), px(8.)), blur_radius: px(24.), spread_radius: px(0.) }]).child(ts.text.clone())
             })))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::startup_root; // 不用 super::*：会引入 gpui 的 test 宏
+    use std::path::PathBuf;
+
+    // 为什么单独测：启动自动打开上次项目是为了尽早预热 Claude Code；
+    // 选错了（目录已删仍去打开、或压过显式指定的项目）界面上就是打开一个不存在的项目 / 开发脚本跑错目录。
+
+    #[test]
+    fn 显式指定优先() {
+        let r = vec!["/a".to_string()];
+        assert_eq!(startup_root(Some("/x".into()), &r, |_| true), Some(PathBuf::from("/x")));
+    }
+
+    #[test]
+    fn 取最近第一个存在的目录() {
+        let r = vec!["/gone".to_string(), "/b".to_string(), "/c".to_string()];
+        assert_eq!(startup_root(None, &r, |p| p != "/gone"), Some(PathBuf::from("/b")));
+    }
+
+    #[test]
+    fn 都不存在或为空则停在欢迎页() {
+        assert_eq!(startup_root(None, &[], |_| true), None);
+        assert_eq!(startup_root(None, &["/gone".to_string()], |_| false), None);
+        assert_eq!(startup_root(Some(String::new()), &[], |_| true), None);
     }
 }

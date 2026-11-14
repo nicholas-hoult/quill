@@ -40,7 +40,6 @@ mod web;
 mod workspace;
 
 use gpui::{prelude::*, *};
-use std::path::PathBuf;
 use std::time::Duration;
 use workspace::Workspace;
 
@@ -84,7 +83,7 @@ fn main() {
                     warm_up_text(window);
                     let ws = cx.new(|cx| Workspace::new(window, cx));
                     window.focus(&ws.read(cx).focus_handle(cx));
-                    if let Ok(p) = std::env::var("QUILL_OPEN") { ws.update(cx, |w, cx| w.open_root(PathBuf::from(p), window, cx)); }
+                    ws.update(cx, |w, cx| w.open_startup(window, cx));
                     ws
                 },
             )
