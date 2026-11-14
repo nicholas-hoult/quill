@@ -879,6 +879,7 @@ impl Editor {
     }
 
     pub fn outdent(&mut self, _: &Outdent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.mode.enter_submits { cx.propagate(); return; } // 对话输入框 / 单行输入框：交给上层（对话面板用 Shift+Tab 切换模式）
         let (l0, l1) = (self.buffer.line_of(self.sel.start), self.buffer.line_of(self.sel.end));
         self.indent_lines(l0, l1, false, cx);
     }

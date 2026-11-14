@@ -43,6 +43,9 @@ pub(super) struct AcpState {
     /// Agent 的终端（`terminal/create`），以及正在等某个终端退出的 `terminal/wait_for_exit` 请求
     pub(super) terms: Terminals,
     term_waits: HashMap<String, Vec<Value>>,
+    /// 会话模式（#9）：Agent 在建会话 / 恢复会话的结果里声明；以及最近一次切换请求（id + 切换前的状态，失败时回滚）
+    pub(super) modes: Option<acp::Modes>,
+    mode_req: Option<(u64, acp::Modes)>,
     events: async_channel::Sender<Event>,
 }
 
@@ -64,7 +67,7 @@ impl AgentPanel {
         self.acp_epoch += 1;
         let epoch = self.acp_epoch;
         handle.send(acp::initialize(1));
-        self.acp = Some(AcpState { handle, root, epoch, next_rpc: 3, init_id: 1, new_id: 0, session: None, can_load: false, loading: None, prompt_id: None, ignored: HashSet::new(), queued: None, cur: None, tools: HashMap::new(), perms: Default::default(), terms: Terminals::default(), term_waits: HashMap::new(), events: tx2 });
+        self.acp = Some(AcpState { handle, root, epoch, next_rpc: 3, init_id: 1, new_id: 0, session: None, can_load: false, loading: None, prompt_id: None, ignored: HashSet::new(), queued: None, cur: None, tools: HashMap::new(), perms: Default::default(), terms: Terminals::default(), term_waits: HashMap::new(), modes: None, mode_req: None, events: tx2 });
         cx.spawn(async move |this, cx| {
             while let Ok(ev) = rx.recv().await {
                 if this.update(cx, |p, cx| p.on_acp(epoch, ev, cx)).is_err() { break; }
@@ -200,6 +203,7 @@ impl AgentPanel {
 
     fn acp_response(&mut self, id: u64, result: Result<Value, String>, cx: &mut Context<Self>) {
         let stored = self.threads[self.active].acp_session.clone();
+        let pref_mode = self.settings.acp_mode.clone();
         let Some(a) = self.acp.as_mut() else { return };
         if a.ignored.remove(&id) { if a.prompt_id == Some(id) { a.prompt_id = None; } self.acp_flush(); return; }
         if id == a.init_id {
@@ -221,7 +225,7 @@ impl AgentPanel {
         } else if id == a.new_id {
             if let Some(sid) = a.loading.take() {
                 match result {
-                    Ok(_) => { a.session = Some(sid); self.acp_flush(); }
+                    Ok(v) => { a.session = Some(sid); apply_session_modes(a, &v, &pref_mode); self.acp_flush(); }
                     Err(_) => {
                         // 恢复失败（会话已被清理 / 换了项目）：退回新建会话，并忘掉旧的 ID
                         let nid = a.next_rpc;
@@ -238,6 +242,7 @@ impl AgentPanel {
                 Ok(v) => match v["sessionId"].as_str() {
                     Some(s) => {
                         a.session = Some(s.to_string());
+                        apply_session_modes(a, &v, &pref_mode);
                         self.threads[self.active].acp_session = Some(s.to_string());
                         self.save();
                         self.acp_flush();
@@ -246,6 +251,9 @@ impl AgentPanel {
                 },
                 Err(e) => self.acp_fail_or_drop(format!("创建会话失败：{e}"), cx),
             }
+        } else if a.mode_req.as_ref().map(|r| r.0) == Some(id) {
+            // 切换模式失败：界面退回切换前的状态
+            if let (Err(_), Some((_, prev))) = (&result, a.mode_req.take()) { a.modes = Some(prev); cx.notify(); } else { a.mode_req = None; }
         } else if a.prompt_id == Some(id) {
             a.prompt_id = None;
             match result {
@@ -283,6 +291,7 @@ impl AgentPanel {
                 let prev = self.threads[self.active].messages.iter().flat_map(|m| m.calls.iter()).find(|c| c.id == id).and_then(|c| c.input["text"].as_str().map(str::to_string)).unwrap_or_default();
                 self.acp_set_call(id, "acp:thought".into(), json!({"text": format!("{prev}{t}")}), Some(String::new()));
             }
+            Update::Mode(id) => { if let Some(m) = self.acp.as_mut().and_then(|a| a.modes.as_mut()) { m.current = id; } }
             Update::Other => return,
         }
         if self.stick { self.scroll_end(); }
@@ -533,5 +542,46 @@ impl AgentPanel {
                     .child(div().flex_none().w(px(12.)).text_color(col).child(mark))
                     .child(div().flex_1().min_w_0().child(text))
             }))
+    }
+}
+
+/// 会话建好 / 恢复好后：记下 Agent 声明的模式；用户记住的模式和当前不同就补发一次切换（#9）
+fn apply_session_modes(a: &mut AcpState, result: &Value, pref: &str) {
+    a.modes = acp::parse_modes(result);
+    let Some(m) = a.modes.as_mut() else { return };
+    let (Some(id), Some(sid)) = (acp::mode_to_apply(pref, m), a.session.clone()) else { return };
+    let rid = a.next_rpc;
+    a.next_rpc += 1;
+    a.handle.send(acp::set_mode(rid, &sid, &id));
+    a.mode_req = Some((rid, m.clone()));
+    m.current = id;
+}
+
+impl AgentPanel {
+    /// 切换会话模式：界面立即更新，响应报错再退回；常用模式记进设置（#9）
+    pub(super) fn acp_choose_mode(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.mode_menu = false;
+        if let Some(a) = self.acp.as_mut() {
+            if let (Some(sid), Some(m)) = (a.session.clone(), a.modes.as_mut()) {
+                if m.current != id && m.available.iter().any(|x| x.id == id) {
+                    let rid = a.next_rpc;
+                    a.next_rpc += 1;
+                    a.handle.send(acp::set_mode(rid, &sid, id));
+                    a.mode_req = Some((rid, m.clone()));
+                    m.current = id.to_string();
+                    if acp::persistable_mode(id) {
+                        self.settings.acp_mode = id.to_string();
+                        cx.emit(AgentEvent::ModeChanged { mode: id.to_string() });
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Shift+Tab：切到下一个模式（不含「跳过所有确认」）
+    pub(super) fn acp_cycle_mode(&mut self, cx: &mut Context<Self>) {
+        let Some(next) = self.acp.as_ref().and_then(|a| a.modes.as_ref()).and_then(acp::cycle_next) else { return };
+        self.acp_choose_mode(&next, cx);
     }
 }

@@ -201,6 +201,10 @@ impl Workspace {
             AgentEvent::ReviewFile { path, before } => this.review_written_file(path.clone(), before.clone(), window, cx),
             AgentEvent::OpenSettings => this.open_settings(window, cx),
             AgentEvent::Restore(plan) => this.restore_files(plan.clone(), window, cx),
+            AgentEvent::ModeChanged { mode } => {
+                this.settings.acp_mode = mode.clone();
+                let _ = this.settings.save();
+            }
             AgentEvent::ModelChanged { model, models } => {
                 this.settings.model = model.clone();
                 this.settings.models = models.clone();
@@ -1011,7 +1015,7 @@ impl Workspace {
             CommandItem { title: "切换侧栏", keys: "⌘B" }, CommandItem { title: "切换 AI 对话", keys: "⇧⌘A" }, CommandItem { title: "聚焦对话输入框", keys: "⌘L" },
             CommandItem { title: "在项目中搜索", keys: "⇧⌘F" }, CommandItem { title: "查看 Git 改动", keys: "" }, CommandItem { title: "就地改写（Inline Assist）", keys: "⌘K" },
             CommandItem { title: "在文件中查找", keys: "⌘F" }, CommandItem { title: "新建对话", keys: "" }, CommandItem { title: "打开设置", keys: "⌘," },
-            CommandItem { title: "切换深色 / 浅色", keys: "" }, CommandItem { title: "关闭当前标签页", keys: "⌘W" }, CommandItem { title: "应用最近的代码块", keys: "⇧⌘↵" }, CommandItem { title: "切换终端", keys: "⌘J" }, CommandItem { title: "跳转到符号", keys: "⇧⌘O" }, CommandItem { title: "跳转到行", keys: "⌃G" }, CommandItem { title: "查看符号大纲", keys: "" }, CommandItem { title: "查找并替换", keys: "⌥⌘F" }, CommandItem { title: "切换自动换行", keys: "⌥Z" }, CommandItem { title: "转到定义", keys: "F12" }, CommandItem { title: "显示悬停信息", keys: "⌘I" }, CommandItem { title: "触发补全", keys: "⌃Space" }, CommandItem { title: "查看问题", keys: "" }, CommandItem { title: "折叠全部", keys: "" }, CommandItem { title: "展开全部", keys: "" }, CommandItem { title: "折叠当前块", keys: "⌥⌘[" }, CommandItem { title: "向右拆分 / 取消拆分", keys: "⌘\\" }, CommandItem { title: "选中下一处相同内容", keys: "⌘D" }, CommandItem { title: "选中全部相同内容", keys: "⇧⌘L" }, CommandItem { title: "恢复 Agent 最近一次改动之前的状态", keys: "" },
+            CommandItem { title: "切换深色 / 浅色", keys: "" }, CommandItem { title: "关闭当前标签页", keys: "⌘W" }, CommandItem { title: "应用最近的代码块", keys: "⇧⌘↵" }, CommandItem { title: "切换终端", keys: "⌘J" }, CommandItem { title: "跳转到符号", keys: "⇧⌘O" }, CommandItem { title: "跳转到行", keys: "⌃G" }, CommandItem { title: "查看符号大纲", keys: "" }, CommandItem { title: "查找并替换", keys: "⌥⌘F" }, CommandItem { title: "切换自动换行", keys: "⌥Z" }, CommandItem { title: "转到定义", keys: "F12" }, CommandItem { title: "显示悬停信息", keys: "⌘I" }, CommandItem { title: "触发补全", keys: "⌃Space" }, CommandItem { title: "查看问题", keys: "" }, CommandItem { title: "折叠全部", keys: "" }, CommandItem { title: "展开全部", keys: "" }, CommandItem { title: "折叠当前块", keys: "⌥⌘[" }, CommandItem { title: "向右拆分 / 取消拆分", keys: "⌘\\" }, CommandItem { title: "选中下一处相同内容", keys: "⌘D" }, CommandItem { title: "选中全部相同内容", keys: "⇧⌘L" }, CommandItem { title: "恢复 Agent 最近一次改动之前的状态", keys: "" }, CommandItem { title: "选择权限模式（Claude Code）", keys: "⇧Tab" },
         ]
     }
 
@@ -1072,6 +1076,7 @@ impl Workspace {
             29 => { if let Some(e) = self.active_editor() { e.update(cx, |e, cx| e.select_next(&SelectNext, window, cx)); } }
             30 => { if let Some(e) = self.active_editor() { e.update(cx, |e, cx| e.select_all_occurrences(&SelectAllOccurrences, window, cx)); } }
             31 => { self.focus_agent(window, cx); self.agent.update(cx, |a, cx| a.restore_latest(cx)); }
+            32 => { self.focus_agent(window, cx); self.agent.update(cx, |a, cx| a.toggle_mode_menu(cx)); }
             _ => {}
         }
     }

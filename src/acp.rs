@@ -33,6 +33,64 @@ pub fn supports_load(init_result: &Value) -> bool {
     init_result["agentCapabilities"]["loadSession"].as_bool() == Some(true)
 }
 
+/// 切换会话模式（`session/set_mode`）；响应是空对象
+pub fn set_mode(id: u64, session_id: &str, mode_id: &str) -> String {
+    json!({"jsonrpc":"2.0","id":id,"method":"session/set_mode","params":{"sessionId":session_id,"modeId":mode_id}}).to_string()
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Mode { pub id: String, pub name: String, pub description: String }
+
+/// 会话模式（#9）：由 Agent 在 `session/new` / `session/load` 的结果里声明，Quill 不写死列表
+#[derive(Debug, Clone, PartialEq)]
+pub struct Modes { pub current: String, pub available: Vec<Mode> }
+
+/// 从 `session/new` / `session/load` 的结果里取模式；没有或列表为空就是 None（界面不显示选择器）
+pub fn parse_modes(result: &Value) -> Option<Modes> {
+    let m = result.get("modes")?;
+    let available: Vec<Mode> = m.get("availableModes")?.as_array()?.iter().filter_map(|x| Some(Mode {
+        id: s(x, "id")?,
+        name: s(x, "name").unwrap_or_default(),
+        description: s(x, "description").unwrap_or_default(),
+    })).collect();
+    if available.is_empty() { return None; }
+    Some(Modes { current: s(m, "currentModeId").unwrap_or_default(), available })
+}
+
+/// 模式的显示名：已知 id 用中文，未知的用 Agent 给的名字
+pub fn mode_label(id: &str, name: &str) -> String {
+    match id {
+        "default" => "手动确认", "acceptEdits" => "自动接受编辑", "plan" => "计划", "auto" => "自动", "bypassPermissions" => "跳过所有确认",
+        _ => return name.to_string(),
+    }.to_string()
+}
+
+/// 模式的说明：已知 id 用中文，未知的用 Agent 给的原文
+pub fn mode_hint(id: &str, description: &str) -> String {
+    match id {
+        "default" => "每次修改前都询问", "acceptEdits" => "自动接受所有文件编辑", "plan" => "先出计划，不改文件",
+        "auto" => "由 Claude 判断哪些操作需要确认", "bypassPermissions" => "全部放行，不再询问",
+        _ => return description.to_string(),
+    }.to_string()
+}
+
+/// Shift+Tab 的下一个模式：按 Agent 给的顺序循环，**跳过「跳过所有确认」**（误触代价太大，只能从菜单选）
+pub fn cycle_next(m: &Modes) -> Option<String> {
+    let ring: Vec<&Mode> = m.available.iter().filter(|x| x.id != "bypassPermissions").collect();
+    if ring.len() < 2 { return None; }
+    let next = match ring.iter().position(|x| x.id == m.current) { Some(i) => ring[(i + 1) % ring.len()], None => ring[0] };
+    Some(next.id.clone())
+}
+
+/// 哪些模式值得跨会话记住：计划是「这件事先别动手」、跳过所有确认太危险，都只在当前会话有效
+pub fn persistable_mode(id: &str) -> bool { matches!(id, "default" | "acceptEdits" | "auto") }
+
+/// 会话建好后要不要补发 `session/set_mode`：记住的模式存在、可记、Agent 支持、且和当前不同
+pub fn mode_to_apply(pref: &str, m: &Modes) -> Option<String> {
+    if !persistable_mode(pref) || pref == m.current || !m.available.iter().any(|x| x.id == pref) { return None; }
+    Some(pref.to_string())
+}
+
 pub fn prompt(id: u64, session_id: &str, text: &str) -> String {
     json!({"jsonrpc":"2.0","id":id,"method":"session/prompt","params":{
         "sessionId":session_id,"prompt":[{"type":"text","text":text}]
@@ -126,6 +184,8 @@ pub enum Update {
     ToolCall(ToolCall),
     ToolUpdate(ToolPatch),
     Plan(Vec<PlanEntry>),
+    /// Agent 自己切换了会话模式（如退出计划模式）：新的 modeId（#9）
+    Mode(String),
     Other,
 }
 
@@ -217,6 +277,7 @@ fn update_of(u: &Value) -> Update {
                 text: s(e, "content").unwrap_or_default(),
                 status: status_of(e.get("status").and_then(|x| x.as_str()).unwrap_or("pending")),
             }).collect()).unwrap_or_default()),
+        Some("current_mode_update") => s(u, "currentModeId").map(Update::Mode).unwrap_or(Update::Other),
         _ => Update::Other,
     }
 }
@@ -992,5 +1053,113 @@ mod tests {
         // 用 API Key 的后端：根本没有这个进程
         assert!(!should_prewarm("anthropic", false, true, false, true));
         assert!(!should_prewarm("", false, true, false, true));
+    }
+
+    // ---------- 会话模式（#9）----------
+    // 为什么单独测：模式决定「每次改文件弹不弹确认」。解析错了 chip 不显示 / 显示错；
+    // 循环顺序错了 Shift+Tab 会误切到「跳过所有确认」；记住规则错了计划模式会跨会话粘住，用户会困惑「怎么不改文件了」。
+
+    fn real_modes() -> Value {
+        v(r#"{"sessionId":"s","modes":{"currentModeId":"default","availableModes":[
+            {"id":"default","name":"Manual","description":"Always ask before making changes"},
+            {"id":"acceptEdits","name":"Accept edits","description":"Automatically accept all file edits"},
+            {"id":"plan","name":"Plan","description":"Create a plan before making changes"},
+            {"id":"auto","name":"Auto","description":"Claude handles permission decisions"},
+            {"id":"bypassPermissions","name":"Bypass permissions","description":"Accepts all permissions"}]}}"#)
+    }
+
+    #[test]
+    fn 从建会话结果解析模式() {
+        let m = parse_modes(&real_modes()).unwrap();
+        assert_eq!(m.current, "default");
+        assert_eq!(m.available.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), ["default", "acceptEdits", "plan", "auto", "bypassPermissions"]);
+        assert_eq!(m.available[1].name, "Accept edits");
+        assert_eq!(m.available[1].description, "Automatically accept all file edits");
+    }
+
+    #[test]
+    fn 没有模式或模式为空就是没有() {
+        assert_eq!(parse_modes(&v(r#"{"sessionId":"s"}"#)), None);
+        assert_eq!(parse_modes(&v(r#"{"modes":{"currentModeId":"x","availableModes":[]}}"#)), None);
+        // 缺字段的条目跳过，不 panic
+        let m = parse_modes(&v(r#"{"modes":{"currentModeId":"a","availableModes":[{"name":"无 id"},{"id":"a","name":"A"}]}}"#)).unwrap();
+        assert_eq!(m.available.len(), 1);
+    }
+
+    #[test]
+    fn 切换模式请求() {
+        let m = v(&set_mode(7, "sess-1", "plan"));
+        assert_eq!(m["method"], "session/set_mode");
+        assert_eq!(m["id"], 7);
+        assert_eq!(m["params"]["sessionId"], "sess-1");
+        assert_eq!(m["params"]["modeId"], "plan");
+    }
+
+    #[test]
+    fn agent_自己切换模式的通知() {
+        let t = parse_line(r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"current_mode_update","currentModeId":"acceptEdits"}}}"#);
+        assert_eq!(t, Incoming::Update(Update::Mode("acceptEdits".into())));
+        // 缺 currentModeId：忽略
+        let t = parse_line(r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"current_mode_update"}}}"#);
+        assert_eq!(t, Incoming::Update(Update::Other));
+    }
+
+    #[test]
+    fn 已知模式有中文名未知的用适配器给的名字() {
+        assert_eq!(mode_label("default", "Manual"), "手动确认");
+        assert_eq!(mode_label("acceptEdits", "Accept edits"), "自动接受编辑");
+        assert_eq!(mode_label("plan", "Plan"), "计划");
+        assert_eq!(mode_label("auto", "Auto"), "自动");
+        assert_eq!(mode_label("bypassPermissions", "Bypass permissions"), "跳过所有确认");
+        assert_eq!(mode_label("dontAsk", "Don't ask"), "Don't ask");
+    }
+
+    #[test]
+    fn 已知模式有中文说明未知的用原文() {
+        assert_eq!(mode_hint("default", "Always ask before making changes"), "每次修改前都询问");
+        assert_eq!(mode_hint("bypassPermissions", "x"), "全部放行，不再询问");
+        assert_eq!(mode_hint("dontAsk", "Never ask"), "Never ask");
+    }
+
+    #[test]
+    fn shift_tab_循环不会到跳过所有确认() {
+        let mut m = parse_modes(&real_modes()).unwrap();
+        let mut seen = vec![m.current.clone()];
+        for _ in 0..4 {
+            let n = cycle_next(&m).unwrap();
+            m.current = n.clone();
+            seen.push(n);
+        }
+        assert_eq!(seen, ["default", "acceptEdits", "plan", "auto", "default"]);
+        // 当前就在「跳过所有确认」：下一个回到第一个，而不是卡住
+        m.current = "bypassPermissions".into();
+        assert_eq!(cycle_next(&m).as_deref(), Some("default"));
+        // 只有一种模式：没得切
+        let one = Modes { current: "default".into(), available: vec![m.available[0].clone()] };
+        assert_eq!(cycle_next(&one), None);
+    }
+
+    #[test]
+    fn 只记住常用模式() {
+        assert!(persistable_mode("default"));
+        assert!(persistable_mode("acceptEdits"));
+        assert!(persistable_mode("auto"));
+        assert!(!persistable_mode("plan"));
+        assert!(!persistable_mode("bypassPermissions"));
+        assert!(!persistable_mode(""));
+    }
+
+    #[test]
+    fn 会话建好后按需补发记住的模式() {
+        let m = parse_modes(&real_modes()).unwrap();
+        assert_eq!(mode_to_apply("acceptEdits", &m).as_deref(), Some("acceptEdits"));
+        // 已经是了：不发
+        assert_eq!(mode_to_apply("default", &m), None);
+        // 没记过：不发
+        assert_eq!(mode_to_apply("", &m), None);
+        // 适配器不支持这个模式（版本变了）：不发，不能让 Agent 报错
+        assert_eq!(mode_to_apply("gone", &m), None);
+        // 不该记的模式即使被写进了设置文件也不补发
+        assert_eq!(mode_to_apply("bypassPermissions", &m), None);
     }
 }

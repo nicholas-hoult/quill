@@ -32,6 +32,9 @@ pub struct Settings {
     /// Claude Code（ACP）后端的启动命令，留空用默认（#7）
     #[serde(default)]
     pub acp_cmd: String,
+    /// Claude Code 记住的会话模式（只记常用的几种，见 `acp::persistable_mode`，#9）；空 = 沿用 Agent 的默认
+    #[serde(default)]
+    pub acp_mode: String,
 }
 
 fn d_side() -> f32 { 264.0 }
@@ -41,7 +44,7 @@ fn d_true() -> bool { true }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { provider: "mock".into(), api_key: String::new(), base_url: String::new(), model: "claude-sonnet-5-5".into(), theme: "system".into(), side_w: d_side(), agent_w: d_agent(), term_h: d_term(), sidebar: true, agent_open: true, models: vec![], acp_cmd: String::new() }
+        Self { provider: "mock".into(), api_key: String::new(), base_url: String::new(), model: "claude-sonnet-5-5".into(), theme: "system".into(), side_w: d_side(), agent_w: d_agent(), term_h: d_term(), sidebar: true, agent_open: true, models: vec![], acp_cmd: String::new(), acp_mode: String::new() }
     }
 }
 

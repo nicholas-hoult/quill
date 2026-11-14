@@ -30,6 +30,8 @@ pub enum AgentEvent {
     OpenSettings,
     /// 在对话面板里切换了模型：工作区据此同步并保存设置
     ModelChanged { model: String, models: Vec<String> },
+    /// 在对话面板里切换了 Claude Code 的会话模式（只发常用的、值得记住的）：工作区据此保存设置（#9）
+    ModeChanged { mode: String },
     /// 检查点回退：按计划还原 / 删除这些文件（路径相对项目根）
     Restore(Vec<(String, crate::checkpoint::Action)>),
 }
@@ -122,6 +124,8 @@ pub struct AgentPanel {
     always_allow: bool,
     /// 模型选择器是否展开，以及键盘选中的项
     model_menu: bool,
+    /// Claude Code 会话模式的选择浮层（#9）
+    mode_menu: bool,
     model_sel: usize,
     /// 正在确认回退的那条用户消息；以及已经回退过的（只用来显示「已恢复」）
     restoring: Option<u64>,
@@ -146,13 +150,13 @@ impl AgentPanel {
         let sub = cx.subscribe(&composer, |this, _, ev: &EditorEvent, cx| match ev {
             EditorEvent::Submit => this.send(cx),
             EditorEvent::Changed => { this.update_mention(cx); this.acp_prewarm(cx); }
-            EditorEvent::Cancel => { if this.restoring.is_some() { this.cancel_restore(cx); } else if this.model_menu { this.close_model_menu(cx); } else if this.awaiting.is_some() || this.acp_perm_pending() { this.decide(Decision::Deny, cx); } else if this.cancel.is_some() { this.stop(cx); } }
+            EditorEvent::Cancel => { if this.restoring.is_some() { this.cancel_restore(cx); } else if this.model_menu { this.close_model_menu(cx); } else if this.mode_menu { this.mode_menu = false; cx.notify(); } else if this.awaiting.is_some() || this.acp_perm_pending() { this.decide(Decision::Deny, cx); } else if this.cancel.is_some() { this.stop(cx); } }
             _ => {}
         });
         let threads = load_threads();
         let active = 0;
         let next_id = threads.iter().flat_map(|t| t.messages.iter().map(|m| m.id)).max().unwrap_or(0) + 1;
-        Self { workspace, composer, threads, active, cancel: None, msgs: ListState::new(0, ListAlignment::Top, px(500.)), msgs_key: None, stick: true, files: vec![], symbols: vec![], sym_cache: Default::default(), active_file: None, dropped: vec![], extra: vec![], mention: None, menu: false, settings, next_id, rounds: 0, expanded: HashSet::new(), hl_cache: Default::default(), rules_file: None, rules_root: None, awaiting: None, running: None, always_allow: false, model_menu: false, model_sel: 0, restoring: None, restored: HashSet::new(), acp: None, acp_epoch: 0, _sub: sub }
+        Self { workspace, composer, threads, active, cancel: None, msgs: ListState::new(0, ListAlignment::Top, px(500.)), msgs_key: None, stick: true, files: vec![], symbols: vec![], sym_cache: Default::default(), active_file: None, dropped: vec![], extra: vec![], mention: None, menu: false, settings, next_id, rounds: 0, expanded: HashSet::new(), hl_cache: Default::default(), rules_file: None, rules_root: None, awaiting: None, running: None, always_allow: false, model_menu: false, mode_menu: false, model_sel: 0, restoring: None, restored: HashSet::new(), acp: None, acp_epoch: 0, _sub: sub }
     }
 
     /// 项目文件列表更新了：记下来，并在后台线程里（增量）重建符号索引
@@ -668,6 +672,7 @@ impl AgentPanel {
 
     /// 切换 / 新建 / 删除对话前，先结束还在等确认或运行中的命令，避免确认卡片留在看不见的对话里
     fn abort_pending(&mut self, cx: &mut Context<Self>) {
+        self.mode_menu = false;
         if self.awaiting.is_some() || self.running.is_some() || self.acp.is_some() { self.stop(cx); }
         self.acp_reset();
         // 每个对话一个 ACP 会话，进程刚被关掉：稍后给最终选中的那个对话预热（#8），别让下一条消息从头等
@@ -812,6 +817,49 @@ impl AgentPanel {
             .on_click(cx.listener(|this, _, _, cx| this.toggle_model_menu(cx)))
             .child(div().max_w(px(150.)).truncate().child(name))
             .when(!mock, |d| d.child(icon("chevron_down", 12., faint)))
+    }
+
+    /// 打开 / 关闭模式浮层（chip 点击和命令面板共用）；没有可选的模式就不开
+    pub fn toggle_mode_menu(&mut self, cx: &mut Context<Self>) {
+        self.model_menu = false;
+        self.mode_menu = !self.mode_menu && self.acp.as_ref().map(|a| a.modes.is_some()).unwrap_or(false);
+        cx.notify();
+    }
+
+    /// 输入框右下角的模式 chip（Claude Code 后端、会话建好且 Agent 声明了模式时才有）：当前模式名，点击展开选择（#9）
+    fn mode_chip(&self, t: &crate::theme::Theme, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let m = self.acp.as_ref().and_then(|a| a.modes.as_ref())?;
+        let name = m.available.iter().find(|x| x.id == m.current).map(|x| crate::acp::mode_label(&x.id, &x.name)).unwrap_or_else(|| m.current.clone());
+        // 颜色提示风险：自动接受编辑 = 强调色，计划 = 黄，跳过所有确认 = 红，其余灰
+        let col = match m.current.as_str() { "acceptEdits" | "auto" => t.accent, "plan" => t.modified, "bypassPermissions" => t.del, _ => t.dim };
+        let (hover, text) = (t.hover, t.text);
+        Some(div().id("mode-chip").flex().items_center().gap(px(4.)).h(px(26.)).px(px(8.)).rounded(px(8.)).cursor_pointer().text_size(px(12.)).text_color(col)
+            .hover(move |s| s.bg(hover).text_color(text))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_mode_menu(cx)))
+            .child(div().max_w(px(110.)).truncate().child(name)))
+    }
+
+    /// 模式选择浮层：每项一行名称 + 说明，当前项有对勾；底部提示 Shift+Tab
+    fn mode_menu_view(&self, t: &crate::theme::Theme, cx: &mut Context<Self>) -> Div {
+        let (items, current) = self.acp.as_ref().and_then(|a| a.modes.as_ref()).map(|m| (m.available.clone(), m.current.clone())).unwrap_or_default();
+        div().absolute().right(px(0.)).bottom_full().mb(px(8.)).w(px(300.)).p(px(5.)).rounded(px(12.)).bg(t.elev).border_1().border_color(t.border_strong)
+            .shadow(vec![BoxShadow { color: hsla(0., 0., 0., 0.4), offset: point(px(0.), px(10.)), blur_radius: px(30.), spread_radius: px(0.) }])
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| { this.mode_menu = false; cx.notify(); }))
+            .child(div().px(px(9.)).pt(px(4.)).pb(px(5.)).text_size(px(11.)).text_color(t.faint).child("权限模式"))
+            .children(items.into_iter().enumerate().map(|(i, m)| {
+                let on = m.id == current;
+                let id = m.id.clone();
+                let danger = m.id == "bypassPermissions";
+                div().id(("mode-opt", i)).flex().items_start().gap(px(8.)).px(px(9.)).py(px(6.)).rounded(px(8.)).cursor_pointer()
+                    .when(on, |d| d.bg(t.accent_soft)).hover(|s| s.bg(t.hover))
+                    .on_click(cx.listener(move |this, _, _, cx| this.acp_choose_mode(&id, cx)))
+                    .child(div().flex_none().w(px(14.)).pt(px(2.)).child(if on { icon("check", 13., t.accent).into_any_element() } else { div().into_any_element() }))
+                    .child(div().flex_1().min_w_0().flex().flex_col().gap(px(1.))
+                        .child(div().text_size(px(13.)).text_color(if danger { t.del } else if on { t.text } else { t.dim }).child(crate::acp::mode_label(&m.id, &m.name)))
+                        .child(div().text_size(px(11.5)).text_color(t.faint).child(crate::acp::mode_hint(&m.id, &m.description))))
+            }))
+            .child(div().mt(px(4.)).pt(px(5.)).pb(px(3.)).px(px(9.)).border_t_1().border_color(t.border).text_size(px(11.)).text_color(t.faint).child("⇧Tab 在输入框里切换（不含「跳过所有确认」）"))
     }
 
     /// 模型选择器浮层：当前项有对勾，键盘选中项高亮；底部可去设置页管理 Key
@@ -992,6 +1040,7 @@ impl Render for AgentPanel {
                 if this.awaiting.is_some() || this.acp_perm_pending() { this.decide(Decision::Once, cx); } else { cx.propagate(); }
             }))
             .on_action(cx.listener(|this, _: &crate::actions::Enter, _, cx| if this.restoring.is_some() { this.confirm_restore(cx) } else if this.model_menu { this.choose_model(this.model_sel, cx) } else { this.pick_mention(cx) }))
+            .on_action(cx.listener(|this, _: &crate::actions::Outdent, _, cx| this.acp_cycle_mode(cx)))
             .on_action(cx.listener(|this, _: &crate::actions::Tab, _, cx| if this.model_menu { this.choose_model(this.model_sel, cx) } else { this.pick_mention(cx) }))
             .child(
                 div().h(px(44.)).flex_none().px(px(12.)).flex().items_center().gap(px(6.)).border_b_1().border_color(t.border)
@@ -1052,6 +1101,7 @@ impl Render for AgentPanel {
                             ))
                             .when_some(self.rules_file.clone(), |d, f| d.child(div().id("rules-tag").px(px(6.)).py(px(1.)).rounded(px(5.)).bg(t.press).text_color(t.dim).child(format!("规则 · {f}"))))
                             .child(div().flex_1())
+                            .children(self.mode_chip(&t, cx))
                             .child(self.model_chip(&t, cx))
                             .child(if streaming {
                                 div().id("stop").size(px(28.)).rounded(px(9.)).flex().items_center().justify_center().bg(t.press).cursor_pointer().child(icon("stop", 14., t.text))
@@ -1062,7 +1112,8 @@ impl Render for AgentPanel {
                             }),
                     )
                     // 最后绘制，才能盖在输入框文字上面；贴着输入框上沿，向上展开
-                    .when(self.model_menu, |d| d.child(self.model_menu_view(&t, cx))),
+                    .when(self.model_menu, |d| d.child(self.model_menu_view(&t, cx)))
+                    .when(self.mode_menu && self.acp.as_ref().map(|a| a.modes.is_some()).unwrap_or(false), |d| d.child(self.mode_menu_view(&t, cx))),
             )
             .when(self.menu, |d| d.child(
                 div().absolute().inset_0().id("thread-scrim").on_click(cx.listener(|this, _, _, cx| { this.menu = false; cx.notify(); })).child(
