@@ -45,6 +45,8 @@ pub(super) struct AcpState {
     term_waits: HashMap<String, Vec<Value>>,
     /// 会话模式（#9）：Agent 在建会话 / 恢复会话的结果里声明；以及最近一次切换请求（id + 切换前的状态，失败时回滚）
     pub(super) modes: Option<acp::Modes>,
+    /// Agent 声明的斜杠命令 / skill（#10）：建会话后推一次
+    pub(super) commands: Vec<acp::Command>,
     mode_req: Option<(u64, acp::Modes)>,
     events: async_channel::Sender<Event>,
 }
@@ -67,7 +69,7 @@ impl AgentPanel {
         self.acp_epoch += 1;
         let epoch = self.acp_epoch;
         handle.send(acp::initialize(1));
-        self.acp = Some(AcpState { handle, root, epoch, next_rpc: 3, init_id: 1, new_id: 0, session: None, can_load: false, loading: None, prompt_id: None, ignored: HashSet::new(), queued: None, cur: None, tools: HashMap::new(), perms: Default::default(), terms: Terminals::default(), term_waits: HashMap::new(), modes: None, mode_req: None, events: tx2 });
+        self.acp = Some(AcpState { handle, root, epoch, next_rpc: 3, init_id: 1, new_id: 0, session: None, can_load: false, loading: None, prompt_id: None, ignored: HashSet::new(), queued: None, cur: None, tools: HashMap::new(), perms: Default::default(), terms: Terminals::default(), term_waits: HashMap::new(), modes: None, commands: vec![], mode_req: None, events: tx2 });
         cx.spawn(async move |this, cx| {
             while let Ok(ev) = rx.recv().await {
                 if this.update(cx, |p, cx| p.on_acp(epoch, ev, cx)).is_err() { break; }
@@ -265,7 +267,7 @@ impl AgentPanel {
 
     fn acp_update(&mut self, u: Update, cx: &mut Context<Self>) {
         // 恢复会话时 Agent 会把历史重放一遍：界面上已经有了，忽略
-        if self.acp.as_ref().map(|a| a.loading.is_some()).unwrap_or(false) { return; }
+        if self.acp.as_ref().map(|a| a.loading.is_some()).unwrap_or(false) && !matches!(u, Update::Commands(_) | Update::Mode(_)) { return; }
         match u {
             Update::Text(t) => {
                 let id = self.acp_target(true);
@@ -290,6 +292,10 @@ impl AgentPanel {
                 let id = format!("thought:{mid}");
                 let prev = self.threads[self.active].messages.iter().flat_map(|m| m.calls.iter()).find(|c| c.id == id).and_then(|c| c.input["text"].as_str().map(str::to_string)).unwrap_or_default();
                 self.acp_set_call(id, "acp:thought".into(), json!({"text": format!("{prev}{t}")}), Some(String::new()));
+            }
+            Update::Commands(c) => {
+                if let Some(a) = self.acp.as_mut() { a.commands = c; }
+                self.update_mention(cx); // 用户可能已经敲了 `/`，列表刚到
             }
             Update::Mode(id) => { if let Some(m) = self.acp.as_mut().and_then(|a| a.modes.as_mut()) { m.current = id; } }
             Update::Other => return,

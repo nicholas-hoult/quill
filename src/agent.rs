@@ -150,7 +150,7 @@ impl AgentPanel {
         let sub = cx.subscribe(&composer, |this, _, ev: &EditorEvent, cx| match ev {
             EditorEvent::Submit => this.send(cx),
             EditorEvent::Changed => { this.update_mention(cx); this.acp_prewarm(cx); }
-            EditorEvent::Cancel => { if this.restoring.is_some() { this.cancel_restore(cx); } else if this.model_menu { this.close_model_menu(cx); } else if this.mode_menu { this.mode_menu = false; cx.notify(); } else if this.awaiting.is_some() || this.acp_perm_pending() { this.decide(Decision::Deny, cx); } else if this.cancel.is_some() { this.stop(cx); } }
+            EditorEvent::Cancel => { if this.restoring.is_some() { this.cancel_restore(cx); } else if this.model_menu { this.close_model_menu(cx); } else if this.mode_menu { this.mode_menu = false; cx.notify(); } else if this.mention.is_some() { this.mention = None; this.composer.update(cx, |c, _| c.intercept = false); cx.notify(); } else if this.awaiting.is_some() || this.acp_perm_pending() { this.decide(Decision::Deny, cx); } else if this.cancel.is_some() { this.stop(cx); } }
             _ => {}
         });
         let threads = load_threads();
@@ -387,6 +387,15 @@ impl AgentPanel {
 
     fn update_mention(&mut self, cx: &mut Context<Self>) {
         let (text, cur) = { let c = self.composer.read(cx); (c.text(), c.cursor()) };
+        // 行首的 `/`：Claude Code 的斜杠命令（#10）；否则看光标前有没有 `@` 引用
+        let cmds: Option<Vec<Cand>> = crate::acp::command_query(&text, cur).zip(self.acp.as_ref()).map(|(q, a)| crate::acp::filter_commands(&a.commands, q, 8).into_iter().map(Cand::Command).collect());
+        if let Some(items) = cmds {
+            self.mention = Some(Mention { items, sel: 0 }).filter(|m| !m.items.is_empty());
+            let open = self.mention.is_some();
+            self.composer.update(cx, |c, _| c.intercept = open);
+            cx.notify();
+            return;
+        }
         let before = &text[..cur.min(text.len())];
         let q = before.rfind('@').and_then(|i| {
             let prev_ok = i == 0 || !before[..i].chars().last().map(|c| c.is_ascii_alphanumeric() || c == '_' || c == '@').unwrap_or(false);
@@ -402,6 +411,14 @@ impl AgentPanel {
     fn pick_mention(&mut self, cx: &mut Context<Self>) {
         let Some(m) = self.mention.take() else { return };
         let Some(cand) = m.items.get(m.sel).cloned() else { return };
+        if let Cand::Command(c) = &cand {
+            // 斜杠命令：把行首的 `/词` 换成 `/名字 `
+            let text = self.composer.read(cx).text();
+            let (new, pos) = crate::acp::apply_command(&text, &c.name);
+            self.composer.update(cx, |e, cx| { e.set_text(&new, cx); e.move_to(pos, cx); e.intercept = false; });
+            cx.notify();
+            return;
+        }
         let ins = cand.insert_text();
         let (text, cur) = { let c = self.composer.read(cx); (c.text(), c.cursor()) };
         if let Some(i) = text[..cur.min(text.len())].rfind('@') {
@@ -444,13 +461,15 @@ impl AgentPanel {
         if self.cancel.is_some() || self.awaiting.is_some() { return; }
         let text = self.composer.read(cx).text().trim().to_string();
         if text.is_empty() { return; }
-        let atts = self.attachments(&text);
+        // 斜杠命令（#10）：原样发出，不附当前文件 / 引用，否则它们会被当成命令的参数
+        let slash = self.settings.provider == "claude-code" && crate::acp::is_slash_command(&text, self.acp.as_ref().map(|a| a.commands.as_slice()).unwrap_or(&[]));
+        let atts = if slash { vec![] } else { self.attachments(&text) };
         let ws = self.workspace.clone();
         let files: Vec<(String, String)> = atts.iter().filter_map(|rel| {
             let t = ws.update(cx, |w, cx| w.file_text_rel(rel, cx)).ok().flatten()?;
             Some((rel.clone(), t))
         }).collect();
-        let (extra_blocks, extra_refs, urls) = self.collect_refs(&text, cx);
+        let (extra_blocks, extra_refs, urls) = if slash { (vec![], vec![], vec![]) } else { self.collect_refs(&text, cx) };
         let mut blocks: Vec<CtxBlock> = files.iter().map(|(p, c)| CtxBlock::File { path: p.clone(), content: c.clone() }).collect();
         blocks.extend(extra_blocks);
         let mut refs: Vec<String> = files.iter().map(|f| f.0.clone()).collect();
@@ -1084,10 +1103,12 @@ impl Render for AgentPanel {
                             .children(items.into_iter().enumerate().map(|(i, c)| {
                                 let label = c.label();
                                 let tag_col = match c.tag() { "符号" => t.accent, "对话" => t.modified, "网页" => t.add, _ => t.faint };
+                                let detail = c.detail();
                                 div().flex().items_center().gap(px(8.)).px(px(9.)).py(px(5.)).rounded(px(7.)).text_size(px(12.)).text_color(if i == sel { t.text } else { t.dim })
                                     .when(i == sel, |d| d.bg(t.accent_soft))
                                     .child(div().flex_none().w(px(28.)).text_size(px(10.5)).text_color(tag_col).child(c.tag()))
-                                    .child(div().flex_1().min_w_0().truncate().font_family(MONO_FONT).child(label))
+                                    .child(if detail.is_some() { div().flex_none().max_w(px(170.)).truncate().font_family(MONO_FONT).child(label) } else { div().flex_1().min_w_0().truncate().font_family(MONO_FONT).child(label) })
+                                    .when_some(detail, |d, s| d.child(div().flex_1().min_w_0().truncate().text_size(px(11.5)).text_color(t.faint).child(s)))
                             })),
                     ))
                     .when(!atts.is_empty(), |d| d.child(div().flex().flex_wrap().gap(px(5.)).px(px(10.)).pt(px(9.)).children(atts.iter().map(|a| chip(a, cx)))))

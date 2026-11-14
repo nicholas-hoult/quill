@@ -33,6 +33,73 @@ pub fn supports_load(init_result: &Value) -> bool {
     init_result["agentCapabilities"]["loadSession"].as_bool() == Some(true)
 }
 
+/// Agent 声明的一条斜杠命令（#10）。`hint` 是参数提示，如 `[issue description]`
+#[derive(Debug, Clone, PartialEq)]
+pub struct Command { pub name: String, pub description: String, pub hint: Option<String> }
+
+/// `available_commands_update` 里的 `availableCommands`；没有名字的条目丢掉
+pub fn parse_commands(update: &Value) -> Vec<Command> {
+    update.get("availableCommands").and_then(|a| a.as_array()).map(|a| a.iter().filter_map(|c| Some(Command {
+        name: s(c, "name").filter(|n| !n.is_empty())?,
+        description: s(c, "description").unwrap_or_default(),
+        hint: c.get("input").and_then(|i| s(i, "hint")),
+    })).collect()).unwrap_or_default()
+}
+
+/// 输入框文字是否在输入斜杠命令的名字：必须以 `/` 开头（句中的斜杠是路径 / 除号），
+/// 光标前、斜杠后到光标之间没有空白（有空白说明在写参数）。返回光标前的查询词
+pub fn command_query(text: &str, cursor: usize) -> Option<&str> {
+    if !text.starts_with('/') || cursor < 1 { return None; }
+    let q = text.get(1..cursor)?;
+    (!q.chars().any(char::is_whitespace)).then_some(q)
+}
+
+/// 描述末尾带括号（`(user)` / `(claude.ai sync)` 等）的是用户 / 外部来的 skill，没有的是内置或自带命令
+fn is_builtin(c: &Command) -> bool {
+    let d = c.description.trim_end();
+    !(d.ends_with(')') && d.contains('('))
+}
+
+/// 无输入时优先列出的常用命令（按这个顺序）
+const COMMON_COMMANDS: [&str; 9] = ["compact", "context", "model", "init", "usage", "config", "effort", "code-review", "security-review"];
+
+/// 候选：无输入时常用内置 → 其他内置 → skill；有输入时前缀匹配在前，内置在 skill 前，其余按模糊匹配分数
+pub fn filter_commands(cmds: &[Command], q: &str, limit: usize) -> Vec<Command> {
+    let prio = |c: &Command| COMMON_COMMANDS.iter().position(|n| *n == c.name).unwrap_or(usize::MAX);
+    let mut hits: Vec<((bool, bool, usize, i64), &Command)> = cmds.iter().enumerate().filter_map(|(i, c)| {
+        if q.is_empty() { return Some(((false, !is_builtin(c), prio(c), i as i64), c)); }
+        let (score, _) = crate::fuzzy::fuzzy_match(q, &c.name)?;
+        let prefix = c.name.to_lowercase().starts_with(&q.to_lowercase());
+        Some(((!prefix, !is_builtin(c), prio(c), if prefix { i as i64 } else { -((score * 1000.0) as i64) }), c))
+    }).collect();
+    hits.sort_by_key(|(k, _)| *k);
+    hits.into_iter().take(limit).map(|(_, c)| c.clone()).collect()
+}
+
+/// 选中命令后输入框的新文字和光标位置：第一个词整个换成 `/名字`，后面的参数保留，名字后补一个空格
+pub fn apply_command(text: &str, name: &str) -> (String, usize) {
+    let end = text.find(char::is_whitespace).unwrap_or(text.len());
+    let new = format!("/{name} {}", text[end..].trim_start());
+    (new, name.len() + 2)
+}
+
+/// 这条消息是不是斜杠命令：以 `/` 开头、第一个词像命令名（不含 `/`），命令列表已知时还要在列表里。
+/// 是的话要**原样发出**，不能附当前文件 / 引用，否则它们会被当成命令的参数。
+/// 列表还没到（刚启动就敲）时像命令名就按命令处理：宁可不附文件
+pub fn is_slash_command(text: &str, cmds: &[Command]) -> bool {
+    let Some(rest) = text.strip_prefix('/') else { return false };
+    let Some(token) = rest.split_whitespace().next() else { return false };
+    if rest.starts_with(char::is_whitespace) || !token.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | ':' | '.')) { return false; }
+    cmds.is_empty() || cmds.iter().any(|c| c.name == token)
+}
+
+/// 说明压成一行并截断到 `max` 个字符（超出补「…」）
+pub fn short_description(desc: &str, max: usize) -> String {
+    let one: String = desc.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one.chars().count() <= max { return one; }
+    format!("{}…", one.chars().take(max.saturating_sub(1)).collect::<String>())
+}
+
 /// 切换会话模式（`session/set_mode`）；响应是空对象
 pub fn set_mode(id: u64, session_id: &str, mode_id: &str) -> String {
     json!({"jsonrpc":"2.0","id":id,"method":"session/set_mode","params":{"sessionId":session_id,"modeId":mode_id}}).to_string()
@@ -186,6 +253,8 @@ pub enum Update {
     Plan(Vec<PlanEntry>),
     /// Agent 自己切换了会话模式（如退出计划模式）：新的 modeId（#9）
     Mode(String),
+    /// Agent 声明的可用命令（斜杠命令 / skill）（#10）
+    Commands(Vec<Command>),
     Other,
 }
 
@@ -277,6 +346,7 @@ fn update_of(u: &Value) -> Update {
                 text: s(e, "content").unwrap_or_default(),
                 status: status_of(e.get("status").and_then(|x| x.as_str()).unwrap_or("pending")),
             }).collect()).unwrap_or_default()),
+        Some("available_commands_update") => Update::Commands(parse_commands(u)),
         Some("current_mode_update") => s(u, "currentModeId").map(Update::Mode).unwrap_or(Update::Other),
         _ => Update::Other,
     }
@@ -1161,5 +1231,113 @@ mod tests {
         assert_eq!(mode_to_apply("gone", &m), None);
         // 不该记的模式即使被写进了设置文件也不补发
         assert_eq!(mode_to_apply("bypassPermissions", &m), None);
+    }
+
+    // ---------- 斜杠命令（#10）----------
+    // 为什么单独测：命令列表来自适配器，skill 多到上百条。过滤排序错了 `/compact` 会被一堆 skill 淹没；
+    // 「是不是命令」判错了，要么命令被附上整份当前文件（成了命令参数），要么路径被当成命令吞掉引用。
+
+    fn cmd(name: &str, desc: &str, hint: Option<&str>) -> Command {
+        Command { name: name.into(), description: desc.into(), hint: hint.map(str::to_string) }
+    }
+
+    fn fixture() -> Vec<Command> {
+        vec![
+            cmd("lark-im", "飞书即时通讯：收发消息和管理群聊 (user)", None),
+            cmd("design", "Design skill", Some("consent | revoke")),
+            cmd("code-review", "Review the current diff", Some("[low|medium|high] [--fix]")),
+            cmd("compact", "Clear conversation history but keep a summary in context", Some("[instructions]")),
+            cmd("context", "Show current context usage", None),
+            cmd("lark-calendar", "飞书日历 (user)", None),
+            cmd("anthropic-skills:deep-research", "Research (claude.ai sync)", None),
+            cmd("model", "Set the AI model", None),
+        ]
+    }
+
+    fn names(v: &[Command]) -> Vec<&str> { v.iter().map(|c| c.name.as_str()).collect() }
+
+    #[test]
+    fn 解析命令列表() {
+        let u = parse_line(r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"available_commands_update","availableCommands":[
+            {"name":"compact","description":"压缩","input":{"hint":"[instructions]"}},
+            {"name":"context","description":"用量","input":null},
+            {"description":"没有名字的丢掉"},
+            {"name":"x"}]}}}"#);
+        let Incoming::Update(Update::Commands(c)) = u else { panic!("{u:?}") };
+        assert_eq!(c, vec![cmd("compact", "压缩", Some("[instructions]")), cmd("context", "用量", None), cmd("x", "", None)]);
+    }
+
+    #[test]
+    fn 只有行首的斜杠才是命令查询() {
+        assert_eq!(command_query("/", 1), Some(""));
+        assert_eq!(command_query("/com", 4), Some("com"));
+        assert_eq!(command_query("/compact", 4), Some("com")); // 光标在词中间：按光标前的字
+        // 已经敲了空格 = 在写参数
+        assert_eq!(command_query("/compact 保留", 9), None);
+        // 句中的斜杠是路径 / 除号
+        assert_eq!(command_query("看看 /compact", 10), None);
+        assert_eq!(command_query("", 0), None);
+        // 光标在斜杠前
+        assert_eq!(command_query("/compact", 0), None);
+        // 光标落在多字节字符中间（不应 panic）
+        assert_eq!(command_query("/中文", 2), None);
+    }
+
+    #[test]
+    fn 无输入时先列常用内置命令再列其他内置最后是_skill() {
+        let r = filter_commands(&fixture(), "", 8);
+        assert_eq!(names(&r), ["compact", "context", "model", "code-review", "design", "lark-im", "lark-calendar", "anthropic-skills:deep-research"]);
+    }
+
+    #[test]
+    fn 过滤时前缀匹配在前内置在_skill_前() {
+        let r = filter_commands(&fixture(), "co", 8);
+        // compact / context / code-review 都以 co 开头；内置先于 skill
+        assert_eq!(&names(&r)[..3], ["compact", "context", "code-review"]);
+        let r = filter_commands(&fixture(), "lark", 8);
+        assert_eq!(names(&r), ["lark-im", "lark-calendar"]);
+        // 不匹配就是空
+        assert!(filter_commands(&fixture(), "zzzz", 8).is_empty());
+    }
+
+    #[test]
+    fn 过滤受数量限制() {
+        assert_eq!(filter_commands(&fixture(), "", 3).len(), 3);
+    }
+
+    #[test]
+    fn 选中后补成斜杠加名字加空格() {
+        assert_eq!(apply_command("/co", "compact"), ("/compact ".to_string(), 9));
+        // 第一个词整个替换（光标在词中间也一样），后面的参数保留
+        assert_eq!(apply_command("/compact 保留", "context"), ("/context 保留".to_string(), 9));
+        assert_eq!(apply_command("/co   保留", "compact"), ("/compact 保留".to_string(), 9));
+        // 名字里带冒号的 skill
+        assert_eq!(apply_command("/", "anthropic-skills:deep-research"), ("/anthropic-skills:deep-research ".to_string(), 32));
+    }
+
+    #[test]
+    fn 是不是要按命令原样发送() {
+        let c = fixture();
+        assert!(is_slash_command("/compact", &c));
+        assert!(is_slash_command("/compact 保留接口说明", &c));
+        assert!(is_slash_command("/anthropic-skills:deep-research 话题", &c));
+        // 不在列表里：普通消息（可能是随手写的 /foo）
+        assert!(!is_slash_command("/foo", &c));
+        // 路径不是命令
+        assert!(!is_slash_command("/Users/me/x.rs 这个文件", &c));
+        assert!(!is_slash_command("/Users/me/x.rs 这个文件", &[]));
+        // 不以斜杠开头
+        assert!(!is_slash_command("请 /compact", &c));
+        assert!(!is_slash_command("", &c));
+        // 命令列表还没到（刚启动就敲）：像命令名就按命令处理，宁可不附文件
+        assert!(is_slash_command("/compact", &[]));
+        assert!(!is_slash_command("/", &[]));
+    }
+
+    #[test]
+    fn 说明压成一行并截断() {
+        assert_eq!(short_description("第一行\n第二行", 20), "第一行 第二行");
+        assert_eq!(short_description("abcdefghij", 5), "abcd…");
+        assert_eq!(short_description("  前后空白  ", 20), "前后空白");
     }
 }

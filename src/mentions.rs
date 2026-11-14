@@ -71,6 +71,8 @@ pub enum Cand {
     Symbol(SymRef),
     Thread(String),
     Url(String),
+    /// Claude Code 的斜杠命令 / skill（#10）
+    Command(crate::acp::Command),
 }
 
 impl Cand {
@@ -81,11 +83,12 @@ impl Cand {
             Cand::Symbol(s) => format!("{}#{}", s.path, s.name),
             Cand::Thread(t) => format!("{THREAD_OPEN}{t}]"),
             Cand::Url(u) => u.clone(),
+            Cand::Command(c) => c.name.clone(),
         }
     }
     /// 菜单里的类型标签
     pub fn tag(&self) -> &'static str {
-        match self { Cand::File(_) => "文件", Cand::Symbol(_) => "符号", Cand::Thread(_) => "对话", Cand::Url(_) => "网页" }
+        match self { Cand::File(_) => "文件", Cand::Symbol(_) => "符号", Cand::Thread(_) => "对话", Cand::Url(_) => "网页", Cand::Command(_) => "命令" }
     }
     /// 菜单里显示的主文字
     pub fn label(&self) -> String {
@@ -94,7 +97,12 @@ impl Cand {
             Cand::Symbol(s) => format!("{}  {}", s.name, s.path),
             Cand::Thread(t) => t.clone(),
             Cand::Url(u) => u.clone(),
+            Cand::Command(c) => format!("/{}", c.name),
         }
+    }
+    /// 菜单里主文字后面的一行淡色说明（目前只有命令有）
+    pub fn detail(&self) -> Option<String> {
+        match self { Cand::Command(c) => Some(crate::acp::short_description(&c.description, 80)), _ => None }
     }
 }
 
