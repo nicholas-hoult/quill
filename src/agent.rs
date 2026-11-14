@@ -32,6 +32,8 @@ pub enum AgentEvent {
     ModelChanged { model: String, models: Vec<String> },
     /// 在对话面板里切换了 Claude Code 的会话模式（只发常用的、值得记住的）：工作区据此保存设置（#9）
     ModeChanged { mode: String },
+    /// Claude Code 的模型 / 思考强度选择变了，要存设置（#13）
+    ConfigSaved { model: String, effort: String },
     /// 面板想给用户一条提示（如贴的图片太大）：工作区显示 toast
     Toast { text: String, error: bool },
     /// 检查点回退：按计划还原 / 删除这些文件（路径相对项目根）
@@ -128,6 +130,9 @@ pub struct AgentPanel {
     model_menu: bool,
     /// Claude Code 会话模式的选择浮层（#9）
     mode_menu: bool,
+    /// Claude Code 的模型 / 思考强度浮层（#13）
+    config_menu: bool,
+    config_sel: usize,
     /// 输入框里贴好、还没发送的图片；点发送时移到 `outgoing_images`，由 `acp_send` 带上（#12）
     images: Vec<Arc<Image>>,
     outgoing_images: Vec<Arc<Image>>,
@@ -158,13 +163,13 @@ impl AgentPanel {
         let sub = cx.subscribe(&composer, |this, _, ev: &EditorEvent, cx| match ev {
             EditorEvent::Submit => this.send(cx),
             EditorEvent::Changed => { this.update_mention(cx); this.acp_prewarm(cx); }
-            EditorEvent::Cancel => { if this.restoring.is_some() { this.cancel_restore(cx); } else if this.model_menu { this.close_model_menu(cx); } else if this.mode_menu { this.mode_menu = false; cx.notify(); } else if this.mention.is_some() { this.mention = None; this.composer.update(cx, |c, _| c.intercept = false); cx.notify(); } else if this.awaiting.is_some() || this.acp_perm_pending() { this.decide(Decision::Deny, cx); } else if this.cancel.is_some() { this.stop(cx); } }
+            EditorEvent::Cancel => { if this.restoring.is_some() { this.cancel_restore(cx); } else if this.model_menu { this.close_model_menu(cx); } else if this.config_menu { this.close_config_menu(cx); } else if this.mode_menu { this.mode_menu = false; cx.notify(); } else if this.mention.is_some() { this.mention = None; this.composer.update(cx, |c, _| c.intercept = false); cx.notify(); } else if this.awaiting.is_some() || this.acp_perm_pending() { this.decide(Decision::Deny, cx); } else if this.cancel.is_some() { this.stop(cx); } }
             _ => {}
         });
         let threads = load_threads();
         let active = 0;
         let next_id = threads.iter().flat_map(|t| t.messages.iter().map(|m| m.id)).max().unwrap_or(0) + 1;
-        Self { workspace, composer, threads, active, cancel: None, msgs: ListState::new(0, ListAlignment::Top, px(500.)), msgs_key: None, stick: true, files: vec![], symbols: vec![], sym_cache: Default::default(), active_file: None, dropped: vec![], extra: vec![], mention: None, menu: false, settings, next_id, rounds: 0, expanded: HashSet::new(), hl_cache: Default::default(), rules_file: None, rules_root: None, awaiting: None, running: None, always_allow: false, model_menu: false, mode_menu: false, images: vec![], outgoing_images: vec![], last_stream_paint: None, stream_flush: false, model_sel: 0, restoring: None, restored: HashSet::new(), acp: None, acp_epoch: 0, _sub: sub }
+        Self { workspace, composer, threads, active, cancel: None, msgs: ListState::new(0, ListAlignment::Top, px(500.)), msgs_key: None, stick: true, files: vec![], symbols: vec![], sym_cache: Default::default(), active_file: None, dropped: vec![], extra: vec![], mention: None, menu: false, settings, next_id, rounds: 0, expanded: HashSet::new(), hl_cache: Default::default(), rules_file: None, rules_root: None, awaiting: None, running: None, always_allow: false, model_menu: false, mode_menu: false, config_menu: false, config_sel: 0, images: vec![], outgoing_images: vec![], last_stream_paint: None, stream_flush: false, model_sel: 0, restoring: None, restored: HashSet::new(), acp: None, acp_epoch: 0, _sub: sub }
     }
 
     /// 项目文件列表更新了：记下来，并在后台线程里（增量）重建符号索引
@@ -328,6 +333,7 @@ impl AgentPanel {
 
     /// 打开 / 关闭模型选择器。演示模式没有可选的模型，直接带去设置页填 Key。
     pub fn toggle_model_menu(&mut self, cx: &mut Context<Self>) {
+        if self.settings.provider == "claude-code" { self.toggle_config_menu(cx); return; }
         if self.model_menu { self.close_model_menu(cx); return; }
         let choices = self.model_choices();
         if choices.is_empty() { cx.emit(AgentEvent::OpenSettings); return; }
@@ -715,6 +721,7 @@ impl AgentPanel {
     /// 切换 / 新建 / 删除对话前，先结束还在等确认或运行中的命令，避免确认卡片留在看不见的对话里
     fn abort_pending(&mut self, cx: &mut Context<Self>) {
         self.mode_menu = false;
+        if self.config_menu { self.close_config_menu(cx); }
         if self.awaiting.is_some() || self.running.is_some() || self.acp.is_some() { self.stop(cx); }
         self.acp_reset();
         // 每个对话一个 ACP 会话，进程刚被关掉：稍后给最终选中的那个对话预热（#8），别让下一条消息从头等
@@ -852,18 +859,79 @@ impl AgentPanel {
     fn model_chip(&self, t: &crate::theme::Theme, cx: &mut Context<Self>) -> Stateful<Div> {
         let cc = self.settings.provider == "claude-code";
         let mock = self.settings.provider == "mock" || cc;
-        let name = if cc { "Claude Code".to_string() } else if mock { "演示模式".to_string() } else { crate::models::label(&self.settings.model) };
+        let has_cfg = cc && self.acp.as_ref().map(|a| !a.config.is_empty()).unwrap_or(false);
+        let name = if cc { self.acp.as_ref().and_then(|a| crate::acp::model_option(&a.config)).map(crate::acp::config_label).unwrap_or_else(|| "Claude Code".to_string()) } else if mock { "演示模式".to_string() } else { crate::models::label(&self.settings.model) };
         let (hover, dim, faint, text) = (t.hover, t.dim, t.faint, t.text);
         div().id("model-chip").flex().items_center().gap(px(4.)).h(px(26.)).px(px(8.)).mr(px(4.)).rounded(px(8.)).cursor_pointer().text_size(px(12.)).text_color(dim)
             .hover(move |s| s.bg(hover).text_color(text))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_model_menu(cx)))
             .child(div().max_w(px(150.)).truncate().child(name))
-            .when(!mock, |d| d.child(icon("chevron_down", 12., faint)))
+            .when(!mock || has_cfg, |d| d.child(icon("chevron_down", 12., faint)))
+    }
+
+    /// 打开 / 关闭 Claude Code 的模型 / 思考强度浮层；会话还没建好（Agent 没声明配置）就不开（#13）
+    pub fn toggle_config_menu(&mut self, cx: &mut Context<Self>) {
+        if self.model_menu { self.close_model_menu(cx); }
+        self.mode_menu = false;
+        self.config_menu = !self.config_menu && self.acp.as_ref().map(|a| !a.config.is_empty()).unwrap_or(false);
+        if self.config_menu { self.config_sel = self.acp.as_ref().map(|a| crate::acp::config_flat_current(&a.config)).unwrap_or(0); self.mention = None; }
+        let open = self.config_menu;
+        self.composer.update(cx, |c, _| c.intercept = open);
+        cx.notify();
+    }
+
+    fn close_config_menu(&mut self, cx: &mut Context<Self>) {
+        self.config_menu = false;
+        self.composer.update(cx, |c, _| c.intercept = false);
+        cx.notify();
+    }
+
+    fn move_config_sel(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let n = self.acp.as_ref().map(|a| crate::acp::config_flat(&a.config).len()).unwrap_or(0);
+        if n == 0 { return; }
+        self.config_sel = (self.config_sel as isize + delta).rem_euclid(n as isize) as usize;
+        cx.notify();
+    }
+
+    fn choose_config_sel(&mut self, cx: &mut Context<Self>) {
+        let pick = self.acp.as_ref().and_then(|a| crate::acp::config_flat(&a.config).get(self.config_sel).cloned());
+        self.close_config_menu(cx);
+        if let Some((id, v)) = pick { self.acp_choose_config(&id, &v, cx); }
+    }
+
+    /// 模型 / 思考强度浮层：按类别分段（只列模型和强度），每项一行，当前项有对勾，选中立即生效
+    fn config_menu_view(&self, t: &crate::theme::Theme, cx: &mut Context<Self>) -> Div {
+        let sections: Vec<crate::acp::ConfigOption> = self.acp.as_ref().map(|a| a.config.iter().filter(|o| o.category == "model" || o.category == "thought_level").cloned().collect()).unwrap_or_default();
+        let sel = self.config_sel;
+        let mut flat_i = 0usize;
+        div().absolute().right(px(0.)).bottom_full().mb(px(8.)).w(px(300.)).p(px(5.)).rounded(px(12.)).bg(t.elev).border_1().border_color(t.border_strong)
+            .shadow(vec![BoxShadow { color: hsla(0., 0., 0., 0.4), offset: point(px(0.), px(10.)), blur_radius: px(30.), spread_radius: px(0.) }])
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_config_menu(cx)))
+            .children(sections.into_iter().enumerate().map(|(si, o)| {
+                let cat = o.category.clone();
+                div().flex().flex_col()
+                    .when(si > 0, |d| d.mt(px(4.)).pt(px(4.)).border_t_1().border_color(t.border))
+                    .child(div().px(px(9.)).pt(px(4.)).pb(px(5.)).text_size(px(11.)).text_color(t.faint).child(crate::acp::config_title(&o.category, &o.name)))
+                    .children(o.choices.iter().enumerate().map(|(i, c)| {
+                        let on = c.value == o.current;
+                        let focused = flat_i == sel;
+                        flat_i += 1;
+                        let (cid, val) = (o.id.clone(), c.value.clone());
+                        div().id(("cfg-opt", si * 100 + i)).flex().items_center().gap(px(8.)).min_h(px(30.)).px(px(9.)).rounded(px(8.)).cursor_pointer().text_size(px(13.))
+                            .text_color(if on || focused { t.text } else { t.dim }).when(focused, |d| d.bg(t.accent_soft)).hover(|s| s.bg(t.hover))
+                            .on_click(cx.listener(move |this, _, _, cx| { this.close_config_menu(cx); this.acp_choose_config(&cid, &val, cx); }))
+                            .child(div().flex_none().w(px(14.)).child(if on { icon("check", 13., t.accent).into_any_element() } else { div().into_any_element() }))
+                            .child(div().flex_none().child(crate::acp::choice_label(&cat, c)))
+                            .child(div().flex_1().min_w_0().truncate().text_size(px(11.5)).text_color(t.faint).child(c.description.clone()))
+                    }))
+            }))
     }
 
     /// 打开 / 关闭模式浮层（chip 点击和命令面板共用）；没有可选的模式就不开
     pub fn toggle_mode_menu(&mut self, cx: &mut Context<Self>) {
-        self.model_menu = false;
+        if self.model_menu { self.close_model_menu(cx); }
+        if self.config_menu { self.close_config_menu(cx); }
         self.mode_menu = !self.mode_menu && self.acp.as_ref().map(|a| a.modes.is_some()).unwrap_or(false);
         cx.notify();
     }
@@ -1077,16 +1145,16 @@ impl Render for AgentPanel {
             .flex_col()
             .relative()
             .bg(t.panel)
-            .on_action(cx.listener(|this, _: &crate::actions::MoveUp, _, cx| { if this.model_menu { this.move_model_sel(-1, cx); } else if let Some(m) = &mut this.mention { m.sel = (m.sel + m.items.len() - 1) % m.items.len(); cx.notify(); } }))
-            .on_action(cx.listener(|this, _: &crate::actions::MoveDown, _, cx| { if this.model_menu { this.move_model_sel(1, cx); } else if let Some(m) = &mut this.mention { m.sel = (m.sel + 1) % m.items.len(); cx.notify(); } }))
+            .on_action(cx.listener(|this, _: &crate::actions::MoveUp, _, cx| { if this.config_menu { this.move_config_sel(-1, cx); } else if this.model_menu { this.move_model_sel(-1, cx); } else if let Some(m) = &mut this.mention { m.sel = (m.sel + m.items.len() - 1) % m.items.len(); cx.notify(); } }))
+            .on_action(cx.listener(|this, _: &crate::actions::MoveDown, _, cx| { if this.config_menu { this.move_config_sel(1, cx); } else if this.model_menu { this.move_model_sel(1, cx); } else if let Some(m) = &mut this.mention { m.sel = (m.sel + 1) % m.items.len(); cx.notify(); } }))
             .on_action(cx.listener(|this, _: &crate::actions::AcceptReview, _, cx| {
                 // ⌘↵：有命令在等确认就允许运行；否则交给后面的处理者（接受审阅）
                 if this.awaiting.is_some() || this.acp_perm_pending() { this.decide(Decision::Once, cx); } else { cx.propagate(); }
             }))
-            .on_action(cx.listener(|this, _: &crate::actions::Enter, _, cx| if this.restoring.is_some() { this.confirm_restore(cx) } else if this.model_menu { this.choose_model(this.model_sel, cx) } else { this.pick_mention(cx) }))
+            .on_action(cx.listener(|this, _: &crate::actions::Enter, _, cx| if this.restoring.is_some() { this.confirm_restore(cx) } else if this.config_menu { this.choose_config_sel(cx) } else if this.model_menu { this.choose_model(this.model_sel, cx) } else { this.pick_mention(cx) }))
             .on_action(cx.listener(|this, _: &crate::actions::Outdent, _, cx| this.acp_cycle_mode(cx)))
             .on_action(cx.listener(|this, _: &crate::actions::Paste, _, cx| this.paste_image(cx)))
-            .on_action(cx.listener(|this, _: &crate::actions::Tab, _, cx| if this.model_menu { this.choose_model(this.model_sel, cx) } else { this.pick_mention(cx) }))
+            .on_action(cx.listener(|this, _: &crate::actions::Tab, _, cx| if this.config_menu { this.choose_config_sel(cx) } else if this.model_menu { this.choose_model(this.model_sel, cx) } else { this.pick_mention(cx) }))
             .child(
                 div().h(px(44.)).flex_none().px(px(12.)).flex().items_center().gap(px(6.)).border_b_1().border_color(t.border)
                     .child(
@@ -1169,6 +1237,7 @@ impl Render for AgentPanel {
                     )
                     // 最后绘制，才能盖在输入框文字上面；贴着输入框上沿，向上展开
                     .when(self.model_menu, |d| d.child(self.model_menu_view(&t, cx)))
+                    .when(self.config_menu && self.settings.provider == "claude-code", |d| d.child(self.config_menu_view(&t, cx)))
                     .when(self.mode_menu && self.acp.as_ref().map(|a| a.modes.is_some()).unwrap_or(false), |d| d.child(self.mode_menu_view(&t, cx))),
             )
             .when(self.menu, |d| d.child(

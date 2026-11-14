@@ -124,6 +124,86 @@ pub fn parse_modes(result: &Value) -> Option<Modes> {
     Some(Modes { current: s(m, "currentModeId").unwrap_or_default(), available })
 }
 
+/// 切换会话配置（`session/set_config_option`）；响应里的 `configOptions` 是切换后的完整状态
+pub fn set_config_option(id: u64, session_id: &str, config_id: &str, value: &str) -> String {
+    json!({"jsonrpc":"2.0","id":id,"method":"session/set_config_option","params":{"sessionId":session_id,"configId":config_id,"value":value}}).to_string()
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfigChoice { pub value: String, pub name: String, pub description: String }
+
+/// Agent 声明的一项下拉配置（#13）：模型、思考强度等。`category` 是语义类别（model / thought_level / mode…），Quill 按它而不是 id 认
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfigOption { pub id: String, pub name: String, pub category: String, pub current: String, pub choices: Vec<ConfigChoice> }
+
+/// 取 `configOptions`（`session/new` 结果、`set_config_option` 响应、`config_option_update` 通知里都是这个形状）；只收下拉类，选项分组会拍平，缺 id / value 的跳过
+pub fn parse_config_options(v: &Value) -> Vec<ConfigOption> {
+    fn flat(opts: &[Value], out: &mut Vec<ConfigChoice>) {
+        for o in opts {
+            if let Some(inner) = o.get("options").and_then(|x| x.as_array()) { flat(inner, out); continue; }
+            if let Some(value) = s(o, "value") { out.push(ConfigChoice { value, name: s(o, "name").unwrap_or_default(), description: s(o, "description").unwrap_or_default() }); }
+        }
+    }
+    let Some(arr) = v.get("configOptions").and_then(|x| x.as_array()) else { return vec![] };
+    arr.iter().filter_map(|o| {
+        if s(o, "type").as_deref() != Some("select") { return None; }
+        let mut choices = vec![];
+        flat(o.get("options")?.as_array()?, &mut choices);
+        Some(ConfigOption { id: s(o, "id")?, name: s(o, "name").unwrap_or_default(), category: s(o, "category").unwrap_or_default(), current: s(o, "currentValue").unwrap_or_default(), choices })
+    }).collect()
+}
+
+pub fn model_option(o: &[ConfigOption]) -> Option<&ConfigOption> { o.iter().find(|x| x.category == "model") }
+pub fn effort_option(o: &[ConfigOption]) -> Option<&ConfigOption> { o.iter().find(|x| x.category == "thought_level") }
+
+/// 乐观更新：把某项的当前值改成 `value`（不在可选里就不改）
+pub fn with_current(o: &[ConfigOption], config_id: &str, value: &str) -> Vec<ConfigOption> {
+    o.iter().map(|x| {
+        let mut x = x.clone();
+        if x.id == config_id && x.choices.iter().any(|c| c.value == value) { x.current = value.to_string(); }
+        x
+    }).collect()
+}
+
+/// chip / 菜单上显示的当前值：选项名；当前是「default」且有说明时用说明（它才是真正在用的模型，如「Opus 5.5」）；去掉「(recommended)」后缀；值不在选项里显示原值
+pub fn config_label(o: &ConfigOption) -> String {
+    let Some(c) = o.choices.iter().find(|c| c.value == o.current) else { return o.current.clone() };
+    let name = if c.value == "default" && !c.description.is_empty() { c.description.as_str() } else { c.name.as_str() };
+    name.trim_end_matches("(recommended)").trim().to_string()
+}
+
+/// 配置项的小标题（菜单分段用）：已知类别用中文，其余用 Agent 给的名字
+pub fn config_title(category: &str, name: &str) -> String {
+    match category { "model" => "模型", "thought_level" => "思考强度", _ => return name.to_string() }.to_string()
+}
+
+/// 配置选项的显示名：思考强度档位翻成中文；「Default (recommended)」→「默认（推荐）」；其余用 Agent 给的名字
+pub fn choice_label(category: &str, c: &ConfigChoice) -> String {
+    if c.value == "default" { return if c.name.contains("recommended") { "默认（推荐）" } else { "默认" }.to_string(); }
+    if category == "thought_level" {
+        match c.value.as_str() { "low" => return "低".into(), "medium" => return "中".into(), "high" => return "高".into(), "xhigh" => return "超高".into(), "max" => return "最高".into(), _ => {} }
+    }
+    c.name.clone()
+}
+
+/// 浮层里按顺序排的所有可选项（配置项 id, 值）：先模型后强度，供键盘 ↑↓ 选
+pub fn config_flat(o: &[ConfigOption]) -> Vec<(String, String)> {
+    o.iter().filter(|x| x.category == "model" || x.category == "thought_level")
+        .flat_map(|x| x.choices.iter().map(move |c| (x.id.clone(), c.value.clone()))).collect()
+}
+
+/// 打开浮层时默认高亮哪一项：当前模型；没有模型项就第一项
+pub fn config_flat_current(o: &[ConfigOption]) -> usize {
+    let flat = config_flat(o);
+    model_option(o).and_then(|m| flat.iter().position(|(id, v)| *id == m.id && *v == m.current)).unwrap_or(0)
+}
+
+/// 会话建好后要不要补发 `session/set_config_option`：记住的值存在、和当前不同、且在 Agent 这次声明的可选里
+pub fn config_to_apply(pref: &str, o: &ConfigOption) -> Option<String> {
+    if pref.is_empty() || pref == o.current || !o.choices.iter().any(|c| c.value == pref) { return None; }
+    Some(pref.to_string())
+}
+
 /// 模式的显示名：已知 id 用中文，未知的用 Agent 给的名字
 pub fn mode_label(id: &str, name: &str) -> String {
     match id {
@@ -293,6 +373,8 @@ pub enum Update {
     Mode(String),
     /// Agent 声明的可用命令（斜杠命令 / skill）（#10）
     Commands(Vec<Command>),
+    /// Agent 推送的配置选项完整状态（模型 / 思考强度，#13）
+    Config(Vec<ConfigOption>),
     Other,
 }
 
@@ -385,6 +467,7 @@ fn update_of(u: &Value) -> Update {
                 status: status_of(e.get("status").and_then(|x| x.as_str()).unwrap_or("pending")),
             }).collect()).unwrap_or_default()),
         Some("available_commands_update") => Update::Commands(parse_commands(u)),
+        Some("config_option_update") => Update::Config(parse_config_options(u)),
         Some("current_mode_update") => s(u, "currentModeId").map(Update::Mode).unwrap_or(Update::Other),
         _ => Update::Other,
     }
@@ -1201,6 +1284,122 @@ mod tests {
         assert_eq!(m["id"], 7);
         assert_eq!(m["params"]["sessionId"], "sess-1");
         assert_eq!(m["params"]["modeId"], "plan");
+    }
+
+    // —— 配置选项（#13）：模型 / 思考强度由适配器在 configOptions 里声明 ——
+    // 为什么单独测：解析错了 chip 上显示的模型名和真实在用的不一致；补发规则错了会把用户记住的选择顶掉或发出非法值导致报错。
+
+    fn real_config() -> Value {
+        v(r#"{"sessionId":"s","configOptions":[
+            {"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"default","options":[{"value":"default","name":"Manual"}]},
+            {"id":"model","name":"Model","description":"AI model to use","category":"model","type":"select","currentValue":"opus","options":[
+                {"value":"default","name":"Default (recommended)","description":"Opus 5.5"},
+                {"value":"opus","name":"Opus 5.5","description":"For complex work"},
+                {"value":"sonnet","name":"Sonnet 5.5"},
+                {"value":"haiku","name":"Haiku 5.5"}]},
+            {"id":"effort","name":"Effort","category":"thought_level","type":"select","currentValue":"default","options":[
+                {"value":"default","name":"Default"},{"value":"low","name":"Low"},{"value":"high","name":"High"}]},
+            {"id":"fast","name":"Fast","type":"boolean","currentValue":false}]}"#)
+    }
+
+    #[test]
+    fn 解析配置选项_只收下拉类() {
+        let o = parse_config_options(&real_config());
+        assert_eq!(o.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), ["mode", "model", "effort"]);
+        let m = model_option(&o).unwrap();
+        assert_eq!((m.current.as_str(), m.choices.len()), ("opus", 4));
+        assert_eq!(m.choices[0].description, "Opus 5.5");
+        assert_eq!(effort_option(&o).unwrap().choices.len(), 3);
+    }
+
+    #[test]
+    fn 解析配置选项_分组会拍平_缺字段的跳过() {
+        let r = v(r#"{"configOptions":[
+            {"id":"model","category":"model","type":"select","currentValue":"a","options":[
+                {"group":"g1","name":"组一","options":[{"value":"a","name":"A"},{"name":"没有 value"}]},
+                {"value":"b","name":"B"}]},
+            {"category":"thought_level","type":"select","currentValue":"x","options":[]}]}"#);
+        let o = parse_config_options(&r);
+        assert_eq!(o.len(), 1, "没有 id 的整项跳过");
+        assert_eq!(o[0].choices.iter().map(|c| c.value.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        assert!(parse_config_options(&v(r#"{"sessionId":"s"}"#)).is_empty());
+    }
+
+    #[test]
+    fn 切换配置请求() {
+        let m = v(&set_config_option(9, "sess-1", "model", "haiku"));
+        assert_eq!(m["method"], "session/set_config_option");
+        assert_eq!((m["id"].as_u64(), m["params"]["sessionId"].as_str()), (Some(9), Some("sess-1")));
+        assert_eq!((m["params"]["configId"].as_str(), m["params"]["value"].as_str()), (Some("model"), Some("haiku")));
+    }
+
+    #[test]
+    fn agent_推送配置变化() {
+        let t = parse_line(r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"config_option_update","configOptions":[
+            {"id":"model","category":"model","type":"select","currentValue":"haiku","options":[{"value":"haiku","name":"Haiku 5.5"}]}]}}}"#);
+        let Incoming::Update(Update::Config(o)) = t else { panic!("{t:?}") };
+        assert_eq!(model_option(&o).unwrap().current, "haiku");
+    }
+
+    #[test]
+    fn 乐观更新当前值() {
+        let o = parse_config_options(&real_config());
+        let n = with_current(&o, "model", "haiku");
+        assert_eq!(model_option(&n).unwrap().current, "haiku");
+        assert_eq!(effort_option(&n).unwrap().current, "default", "别的项不动");
+        assert_eq!(with_current(&o, "model", "不存在"), o, "不在可选里就不改");
+        assert_eq!(with_current(&o, "nope", "x"), o);
+    }
+
+    #[test]
+    fn 模型显示名() {
+        let o = parse_config_options(&real_config());
+        assert_eq!(config_label(model_option(&o).unwrap()), "Opus 5.5");
+        // 当前是 default：用它的说明（真正会用的模型），而不是「Default (recommended)」
+        let d = with_current(&o, "model", "default");
+        assert_eq!(config_label(model_option(&d).unwrap()), "Opus 5.5");
+        // default 但没有说明：去掉「(recommended)」
+        let mut e = model_option(&o).unwrap().clone();
+        e.current = "default".into();
+        e.choices[0].description.clear();
+        assert_eq!(config_label(&e), "Default");
+        // 当前值不在选项里：显示原值
+        e.current = "claude-x".into();
+        assert_eq!(config_label(&e), "claude-x");
+    }
+
+    #[test]
+    fn 会话建好后补发记住的配置() {
+        let o = parse_config_options(&real_config());
+        let m = model_option(&o).unwrap();
+        assert_eq!(config_to_apply("haiku", m), Some("haiku".into()));
+        assert_eq!(config_to_apply("opus", m), None, "和当前相同不用发");
+        assert_eq!(config_to_apply("", m), None, "没记过");
+        assert_eq!(config_to_apply("gpt", m), None, "不在可选里（Agent 换了模型列表）不发，免得报错");
+    }
+
+    #[test]
+    fn 菜单里的中文名() {
+        assert_eq!(config_title("model", "Model"), "模型");
+        assert_eq!(config_title("thought_level", "Effort"), "思考强度");
+        assert_eq!(config_title("other", "Agent"), "Agent", "不认识的类别用 Agent 给的名字");
+        let c = |v: &str, n: &str| ConfigChoice { value: v.into(), name: n.into(), description: String::new() };
+        assert_eq!(choice_label("thought_level", &c("high", "High")), "高");
+        assert_eq!(choice_label("thought_level", &c("xhigh", "Xhigh")), "超高");
+        assert_eq!(choice_label("thought_level", &c("default", "Default")), "默认");
+        assert_eq!(choice_label("thought_level", &c("weird", "Weird")), "Weird", "不认识的强度用原名");
+        assert_eq!(choice_label("model", &c("opus", "Opus 5.5")), "Opus 5.5");
+        assert_eq!(choice_label("model", &c("default", "Default (recommended)")), "默认（推荐）");
+    }
+
+    #[test]
+    fn 浮层的扁平项_只含模型和强度() {
+        let o = parse_config_options(&real_config());
+        let f = config_flat(&o);
+        assert_eq!(f.len(), 4 + 3, "模式（#9 另有菜单）和 fast 不在里面");
+        assert_eq!(f[0], ("model".to_string(), "default".to_string()));
+        assert_eq!(f[4], ("effort".to_string(), "default".to_string()));
+        assert_eq!(config_flat_current(&o), 1, "默认选中当前模型 opus");
     }
 
     #[test]

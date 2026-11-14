@@ -50,6 +50,9 @@ pub(super) struct AcpState {
     /// Agent 声明的斜杠命令 / skill（#10）：建会话后推一次
     pub(super) commands: Vec<acp::Command>,
     mode_req: Option<(u64, acp::Modes)>,
+    /// 模型 / 思考强度等配置选项（#13）；在途的切换请求（id → 切换前的状态，失败时回滚）
+    pub(super) config: Vec<acp::ConfigOption>,
+    config_reqs: HashMap<u64, Vec<acp::ConfigOption>>,
     events: async_channel::Sender<Event>,
 }
 
@@ -71,7 +74,7 @@ impl AgentPanel {
         self.acp_epoch += 1;
         let epoch = self.acp_epoch;
         handle.send(acp::initialize(1));
-        self.acp = Some(AcpState { handle, root, epoch, next_rpc: 3, init_id: 1, new_id: 0, session: None, can_load: false, loading: None, prompt_id: None, ignored: HashSet::new(), queued: None, queued_images: vec![], cur: None, tools: HashMap::new(), perms: Default::default(), terms: Terminals::default(), term_waits: HashMap::new(), modes: None, commands: vec![], mode_req: None, events: tx2 });
+        self.acp = Some(AcpState { handle, root, epoch, next_rpc: 3, init_id: 1, new_id: 0, session: None, can_load: false, loading: None, prompt_id: None, ignored: HashSet::new(), queued: None, queued_images: vec![], cur: None, tools: HashMap::new(), perms: Default::default(), terms: Terminals::default(), term_waits: HashMap::new(), modes: None, commands: vec![], mode_req: None, config: vec![], config_reqs: HashMap::new(), events: tx2 });
         cx.spawn(async move |this, cx| {
             while let Ok(ev) = rx.recv().await {
                 if this.update(cx, |p, cx| p.on_acp(epoch, ev, cx)).is_err() { break; }
@@ -210,6 +213,7 @@ impl AgentPanel {
     fn acp_response(&mut self, id: u64, result: Result<Value, String>, cx: &mut Context<Self>) {
         let stored = self.threads[self.active].acp_session.clone();
         let pref_mode = self.settings.acp_mode.clone();
+        let (pref_model, pref_effort) = (self.settings.acp_model.clone(), self.settings.acp_effort.clone());
         let Some(a) = self.acp.as_mut() else { return };
         if a.ignored.remove(&id) { if a.prompt_id == Some(id) { a.prompt_id = None; } self.acp_flush(); return; }
         if id == a.init_id {
@@ -231,7 +235,7 @@ impl AgentPanel {
         } else if id == a.new_id {
             if let Some(sid) = a.loading.take() {
                 match result {
-                    Ok(v) => { a.session = Some(sid); apply_session_modes(a, &v, &pref_mode); self.acp_flush(); }
+                    Ok(v) => { a.session = Some(sid); apply_session_modes(a, &v, &pref_mode); apply_session_config(a, &v, &pref_model, &pref_effort); self.acp_flush(); }
                     Err(_) => {
                         // 恢复失败（会话已被清理 / 换了项目）：退回新建会话，并忘掉旧的 ID
                         let nid = a.next_rpc;
@@ -248,7 +252,7 @@ impl AgentPanel {
                 Ok(v) => match v["sessionId"].as_str() {
                     Some(s) => {
                         a.session = Some(s.to_string());
-                        apply_session_modes(a, &v, &pref_mode);
+                        apply_session_modes(a, &v, &pref_mode); apply_session_config(a, &v, &pref_model, &pref_effort);
                         self.threads[self.active].acp_session = Some(s.to_string());
                         self.save();
                         self.acp_flush();
@@ -257,6 +261,13 @@ impl AgentPanel {
                 },
                 Err(e) => self.acp_fail_or_drop(format!("创建会话失败：{e}"), cx),
             }
+        } else if let Some(prev) = a.config_reqs.remove(&id) {
+            // 切换模型 / 强度：成功以 Agent 返回的完整状态为准（换模型后强度选项会重建），失败退回切换前
+            match result {
+                Ok(v) => { let o = acp::parse_config_options(&v); if !o.is_empty() { a.config = o; } }
+                Err(_) => a.config = prev,
+            }
+            cx.notify();
         } else if a.mode_req.as_ref().map(|r| r.0) == Some(id) {
             // 切换模式失败：界面退回切换前的状态
             if let (Err(_), Some((_, prev))) = (&result, a.mode_req.take()) { a.modes = Some(prev); cx.notify(); } else { a.mode_req = None; }
@@ -271,7 +282,7 @@ impl AgentPanel {
 
     fn acp_update(&mut self, u: Update, cx: &mut Context<Self>) {
         // 恢复会话时 Agent 会把历史重放一遍：界面上已经有了，忽略
-        if self.acp.as_ref().map(|a| a.loading.is_some()).unwrap_or(false) && !matches!(u, Update::Commands(_) | Update::Mode(_)) { return; }
+        if self.acp.as_ref().map(|a| a.loading.is_some()).unwrap_or(false) && !matches!(u, Update::Commands(_) | Update::Mode(_) | Update::Config(_)) { return; }
         let chunk = matches!(u, Update::Text(_) | Update::Thought(_));
         match u {
             Update::Text(t) => {
@@ -302,6 +313,7 @@ impl AgentPanel {
                 if let Some(a) = self.acp.as_mut() { a.commands = c; }
                 self.update_mention(cx); // 用户可能已经敲了 `/`，列表刚到
             }
+            Update::Config(o) => { if let Some(a) = self.acp.as_mut() { if !o.is_empty() { a.config = o; } } }
             Update::Mode(id) => { if let Some(m) = self.acp.as_mut().and_then(|a| a.modes.as_mut()) { m.current = id; } }
             Update::Other => return,
         }
@@ -584,7 +596,43 @@ fn apply_session_modes(a: &mut AcpState, result: &Value, pref: &str) {
     m.current = id;
 }
 
+/// 发一次 `session/set_config_option`，界面立即更新（记下切换前的状态供失败回滚）
+fn send_config(a: &mut AcpState, config_id: &str, value: &str) {
+    let Some(sid) = a.session.clone() else { return };
+    let rid = a.next_rpc;
+    a.next_rpc += 1;
+    a.handle.send(acp::set_config_option(rid, &sid, config_id, value));
+    a.config_reqs.insert(rid, a.config.clone());
+    a.config = acp::with_current(&a.config, config_id, value);
+}
+
+/// 会话建好 / 恢复好后：记下 Agent 声明的配置；用户记住的模型 / 强度和当前不同就补发（#13）
+fn apply_session_config(a: &mut AcpState, result: &Value, pref_model: &str, pref_effort: &str) {
+    a.config = acp::parse_config_options(result);
+    let todo: Vec<(String, String)> = [(acp::model_option(&a.config), pref_model), (acp::effort_option(&a.config), pref_effort)].into_iter()
+        .filter_map(|(o, pref)| { let o = o?; Some((o.id.clone(), acp::config_to_apply(pref, o)?)) }).collect();
+    for (id, v) in todo { send_config(a, &id, &v); }
+}
+
 impl AgentPanel {
+    /// 选模型 / 强度：立即生效并记进设置（#13）
+    pub(super) fn acp_choose_config(&mut self, config_id: &str, value: &str, cx: &mut Context<Self>) {
+        if let Some(a) = self.acp.as_mut() {
+            let cat = a.config.iter().find(|o| o.id == config_id).map(|o| o.category.clone()).unwrap_or_default();
+            let valid = a.config.iter().any(|o| o.id == config_id && o.current != value && o.choices.iter().any(|c| c.value == value));
+            if valid {
+                send_config(a, config_id, value);
+                match cat.as_str() {
+                    "model" => self.settings.acp_model = value.to_string(),
+                    "thought_level" => self.settings.acp_effort = value.to_string(),
+                    _ => {}
+                }
+                cx.emit(AgentEvent::ConfigSaved { model: self.settings.acp_model.clone(), effort: self.settings.acp_effort.clone() });
+            }
+        }
+        cx.notify();
+    }
+
     /// 切换会话模式：界面立即更新，响应报错再退回；常用模式记进设置（#9）
     pub(super) fn acp_choose_mode(&mut self, id: &str, cx: &mut Context<Self>) {
         self.mode_menu = false;
