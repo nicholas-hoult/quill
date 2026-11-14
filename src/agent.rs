@@ -760,6 +760,7 @@ impl AgentPanel {
                 Block::Bullet(s) => div().flex().gap(px(8.)).pl(px(4.)).child(div().flex_none().text_color(t.faint).child("•")).child(div().flex_1().min_w_0().child(inline(&s))),
                 Block::Numbered(n, s) => div().flex().gap(px(8.)).pl(px(2.)).child(div().flex_none().text_color(t.faint).child(n)).child(div().flex_1().min_w_0().child(inline(&s))),
                 Block::Paragraph(s) => div().child(inline(&s)),
+                Block::Table { header, aligns, rows } => crate::ui::md_table(&header, &aligns, &rows, &inline, cx),
             });
         }
         col

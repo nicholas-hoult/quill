@@ -70,6 +70,8 @@ cargo build --release    # 发布构建（首次很慢）
 
 **斜杠命令（#10）**：适配器建会话后推一次 `available_commands_update`（本机 100 条：内置 + 用户 skill），存进 `AcpState.commands`（恢复会话期间也要收，不能被「忽略重放」吞掉）。输入框以 `/` 开头、光标还在第一个词里时（`acp::command_query`）复用 `@` 的候选弹窗（`Cand::Command`），`filter_commands`：无输入先列常用内置（compact / context / model…）再其他内置最后 skill；有输入前缀匹配在前、内置在 skill 前。选中补成 `/名字 `（`apply_command`）。**发送时按命令原样发出，不附当前文件 / @ 引用**（`is_slash_command`，否则 `/compact` 会变成 `/compact` + 整份文件当参数；命令列表还没到时像命令名就按命令处理）。命令本身不用 Quill 执行，文本发给适配器即可（`/context` 本地命令 1s 返回，不耗模型）。模拟 Agent：`MOCK_NO_COMMANDS`。
 
+**Markdown 表格（#11）**：`md::parse_blocks` 识别 GFM 表格（`Block::Table`，表头 + 列数相同的分隔行才算，流式输出时写到一半仍是段落），`ui::md_table` 渲染，聊天 `render_text` 和悬停卡片 `ui::md_text` 共用；列宽 = `col_weights`（内容长度的相对权重，flex-grow 取权重、basis 为 0），每列最小宽度 = `col_min_chars`（最长不可拆词，防止 `~330` 被拆成两行）。
+
 **绕过 npx（#8）**：默认命令 `npx -y …@0.94.0` 每次启动都要先跑一遍 npm，实测握手 11.7s，直接运行缓存里的入口 3.4s（同负载）。`acp_client::default_command` 先在 `~/.npm/_npx/*/node_modules` 里找版本正好是 `ADAPTER_VERSION` 且入口在的适配器（`cached_adapter`，版本不同不顶替），找到就直接跑（单引号包路径），找不到回退 npx（它会下载并缓存，之后走直接路径）。设置里填了自定义命令则一律用用户的。建会话那几秒是 Claude Code 自己加载用户配置（hooks / 插件 / MCP），Quill 管不了，靠预热藏起来。
 验证：`QUILL_ACP="python3 private/probes/mock_acp.py"` 用模拟 Agent（消息含 `[acp-tool]` 走 读文件 → 计划 → 权限 → 写文件；`[acp-cancel]` 等取消；`[acp-die]` 崩溃）；测试用的 HOME 里要放 `settings.json`，`provider` 写 `claude-code`。注意 Rust 2024 里 `gen` 是保留字。
 

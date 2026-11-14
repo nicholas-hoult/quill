@@ -57,7 +57,31 @@ pub fn btn(id: impl Into<ElementId>, label: &str, primary: bool, cx: &App) -> St
     }
 }
 
-/// 轻量 Markdown 渲染（段落 / 列表 / 行内代码 / 粗体），悬停卡片等处使用。
+/// 表格：圆角边框、表头加粗带底色、行间细线；列宽按内容长度的相对权重分配（`md::col_weights`），单元格内文字换行
+pub fn md_table(header: &[String], aligns: &[crate::md::Align], rows: &[Vec<String>], inline: &dyn Fn(&str) -> StyledText, cx: &App) -> Div {
+    use crate::md::Align;
+    let t = cx.theme();
+    let weights = crate::md::col_weights(header, rows);
+    let mins = crate::md::col_min_chars(header, rows);
+    let row = |cells: &[String], head: bool| -> Div {
+        let mut r = div().flex().w_full().when(head, |d| d.bg(t.hover).font_weight(FontWeight::BOLD));
+        for (i, c) in cells.iter().enumerate() {
+            let mut cell = div().min_w(px(mins[i] as f32 * 7.0 + 16.)).px(px(8.)).py(px(4.)).text_size(px(12.5));
+            cell = match aligns.get(i) { Some(Align::Center) => cell.text_center(), Some(Align::Right) => cell.text_right(), _ => cell.text_left() };
+            // flex-grow 取权重，basis 为 0：列宽之比 = 内容长度之比
+            cell.style().flex_grow = Some(weights[i]);
+            cell.style().flex_shrink = Some(1.);
+            cell.style().flex_basis = Some(relative(0.).into());
+            r = r.child(cell.child(inline(c)));
+        }
+        r
+    };
+    let mut tbl = div().flex().flex_col().w_full().rounded(px(8.)).border_1().border_color(t.border).overflow_hidden().child(row(header, true));
+    for r in rows { tbl = tbl.child(row(r, false).border_t_1().border_color(t.border)); }
+    tbl
+}
+
+/// 轻量 Markdown 渲染（段落 / 列表 / 表格 / 行内代码 / 粗体），悬停卡片等处使用。
 pub fn md_text(text: &str, cx: &App) -> Div {
     use crate::md::{self, Block};
     let t = cx.theme();
@@ -76,6 +100,7 @@ pub fn md_text(text: &str, cx: &App) -> Div {
             Block::Bullet(s) => div().flex().gap(px(6.)).pl(px(2.)).child(div().flex_none().text_color(t.faint).child("•")).child(div().flex_1().min_w_0().child(inline(&s))),
             Block::Numbered(n, s) => div().flex().gap(px(6.)).child(div().flex_none().text_color(t.faint).child(n)).child(div().flex_1().min_w_0().child(inline(&s))),
             Block::Paragraph(s) => div().child(inline(&s)),
+            Block::Table { header, aligns, rows } => md_table(&header, &aligns, &rows, &inline, cx),
         });
     }
     col
